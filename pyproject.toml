@@ -1,1 +1,24 @@
-$*
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ultron"
+version = "0.1.0"
+description = "Ultron - Local-first AI assistant"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "rich>=13.0",
+    "typer>=0.12",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+ultron = "ultron.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ultron"]

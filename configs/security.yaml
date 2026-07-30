@@ -1,1 +1,43 @@
-$*
+# Security policies and risk tiers for tool execution and system actions
+
+risk_tiers:
+  low:
+    description: "Read-only actions, safe local lookups, and basic utility tool usage"
+    require_approval: false
+    allowed_tools:
+      - "read_file"
+      - "web_search"
+      - "get_time"
+      - "view_ui"
+
+  medium:
+    description: "File modifications, local network requests, or minor configuration changes"
+    require_approval: true
+    allowed_tools:
+      - "write_file"
+      - "http_request"
+      - "create_dir"
+
+  high:
+    description: "System commands, process spawning, file system deletion, or administrative operations"
+    require_approval: true
+    allowed_tools:
+      - "run_command"
+      - "delete_file"
+      - "install_packages"
+
+default_policies:
+  strict:
+    max_allowed_risk: "low"
+    auto_approve_threshold: "none"
+    log_actions: true
+
+  interactive:
+    max_allowed_risk: "high"
+    auto_approve_threshold: "low"
+    log_actions: true
+
+  permissive:
+    max_allowed_risk: "high"
+    auto_approve_threshold: "medium"
+    log_actions: true

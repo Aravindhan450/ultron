@@ -1,1 +1,26 @@
-$*
+# Configuration for local LLM runtimes
+
+ollama:
+  enabled: true
+  base_url: "http://localhost:11434"
+  default_model: "llama3"
+  available_models:
+    - name: "llama3"
+      context_length: 8192
+    - name: "mistral"
+      context_length: 8192
+    - name: "phi3"
+      context_length: 4096
+
+mlx:
+  enabled: false
+  default_model: "mlx-community/Meta-Llama-3-8B-Instruct-4bit"
+  available_models:
+    - name: "mlx-community/Meta-Llama-3-8B-Instruct-4bit"
+      context_length: 8192
+
+llama_cpp:
+  enabled: false
+  model_path: "models/meta-llama-3-8b-instruct.Q4_K_M.gguf"
+  context_length: 8192
+  n_gpu_layers: -1  # Offload all layers to GPU by default if supported
