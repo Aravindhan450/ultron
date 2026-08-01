@@ -94,7 +94,7 @@ def print_startup_banner(console):
     console.print(f" [bold magenta]Model:[/bold magenta] [cyan]{settings.model}[/cyan]")
     console.print(f" [bold magenta]Directory:[/bold magenta] [dim]{short_cwd}[/dim]")
     console.print(Rule(style="dim cyan"))
-    console.print("[dim]Type 'exit' or 'quit' to end the chat.[/dim]\n")
+    console.print("[dim]Type '/exit' or '/quit' to end the chat.[/dim]\n")
 
 def print_help_table(console):
     """
@@ -169,6 +169,59 @@ def summarize_pytest_output(raw_output: str) -> str:
     except Exception:
         return raw_output
 
+def summarize_lint_output(raw_output: str) -> str:
+    """
+    Parses ruff's --output-format=concise output and groups issues by filename.
+
+    Concise format is one line per issue:
+      src/foo.py:12:4: F401 'os' imported but unused
+
+    We parse each line with a regex, bucket issues by file, and return a
+    tidy grouped summary.  This avoids dumping a wall of text at the user
+    for large codebases while still preserving every issue's line number
+    and error code.
+
+    Falls back to raw_output if anything unexpected happens during parsing.
+    """
+    import re
+    try:
+        # ruff exits 0 with no output or an "All checks passed" line on success
+        if not raw_output or not raw_output.strip():
+            return "No issues found! ✅"
+        if "All checks passed" in raw_output:
+            return "No issues found! ✅"
+
+        # Match ruff concise format: file:line:col: CODE message
+        issue_pattern = re.compile(
+            r'^(?P<file>[^:]+):(?P<line>\d+):\d+:\s+(?P<code>\S+)\s+(?P<msg>.+)$',
+            re.MULTILINE
+        )
+        matches = list(issue_pattern.finditer(raw_output))
+
+        if not matches:
+            # Output exists but doesn't match the expected format — show raw
+            return raw_output
+
+        # Group issues by filename, preserving order of first appearance
+        files: dict[str, list[str]] = {}
+        for m in matches:
+            fname = m.group("file")
+            entry = f"  Line {m.group('line')}: {m.group('code')} {m.group('msg')}"
+            files.setdefault(fname, []).append(entry)
+
+        total_issues = len(matches)
+        total_files = len(files)
+        header = f"Lint Results: {total_issues} issue{'s' if total_issues != 1 else ''} found across {total_files} file{'s' if total_files != 1 else ''}"
+
+        summary_lines = [header]
+        for fname, issues in files.items():
+            summary_lines.append(f"\n{fname}:")
+            summary_lines.extend(issues)
+
+        return "\n".join(summary_lines)
+    except Exception:
+        return raw_output
+
 async def async_chat():
     """
     Asynchronous runner for the interactive chat session.
@@ -206,7 +259,7 @@ async def async_chat():
                 continue
 
             # Plain exit/quit fallback or slash command handling
-            if trimmed_input.lower() in ("exit", "quit"):
+            if trimmed_input.lower() in ("/exit", "/quit", "exit", "quit"):
                 console.print("[bold yellow]Goodbye.[/bold yellow]")
                 break
 
@@ -255,9 +308,14 @@ async def async_chat():
                         run_cmd_func = get_tool("run_command")
                         result = run_cmd_func(action.target) if run_cmd_func else "Error: Tool 'run_command' not found."
                         
-                        # Summarize output if command is pytest
+                        # Route output through the appropriate summarizer based on the
+                        # confirmed command.  Each summarizer converts raw terminal noise
+                        # into a clean, human-readable panel — consistent pattern for all.
                         if action.target.startswith("pytest"):
                             result = summarize_pytest_output(result)
+                        elif action.target.startswith("ruff check"):
+                            result = summarize_lint_output(result)
+                        # git log, git commit, custom commands, etc. pass through unchanged
 
                     elif action.action_type == "overwrite_file":
                         write_func = get_tool("write_file")

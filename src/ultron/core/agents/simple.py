@@ -191,6 +191,30 @@ def detect_git_intent(user_input: str) -> str | None:
 
     return None
 
+def detect_lint_intent(user_input: str) -> bool:
+    """
+    Detects if the user wants to lint / check their code for issues.
+
+    Returns True if matched, otherwise False.
+
+    Design note: Like git and test commands, linting is just a shell command
+    under the hood.  Detecting it explicitly here (rather than letting it fall
+    through to detect_command_intent) means we can map casual phrases like
+    "check my code" to the correct ruff invocation without the user needing
+    to remember the exact CLI syntax.
+    """
+    pattern = (
+        r'\b('
+        r'check\s+(?:my\s+)?code'
+        r'|lint(?:\s+my\s+code)?'
+        r'|run\s+linter'
+        r'|find\s+issues'
+        r'|check\s+for\s+errors'
+        r'|run\s+ruff'
+        r')\b'
+    )
+    return bool(re.search(pattern, user_input, re.IGNORECASE))
+
 def detect_multistep_intent(user_input: str) -> bool:
     """
     Heuristic detector for compound / multi-step requests.
@@ -512,6 +536,23 @@ class SimpleAgent(BaseAgent):
                 pending_action=PendingAction(
                     action_type="run_command",
                     target=detected_git_cmd
+                )
+            )
+
+        # --- Step 4.75: Pre-detection of lint / code-check intent ---
+        # Placed BEFORE the generic command detector so casual phrases like
+        # "check my code" or "find issues" map to the correct ruff invocation
+        # rather than being passed literally to the shell (where they'd fail).
+        # --output-format=concise produces one issue-per-line output that
+        # summarize_lint_output() in main.py can parse reliably.
+        if detect_lint_intent(user_input):
+            ruff_cmd = "ruff check . --output-format=concise"
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=f"Lint check requested: '{ruff_cmd}'",
+                pending_action=PendingAction(
+                    action_type="run_command",
+                    target=ruff_cmd
                 )
             )
 
