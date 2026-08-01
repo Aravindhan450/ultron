@@ -62,5 +62,32 @@ def clear_all_memories() -> str:
     except Exception as e:
         return f"Error clearing memories: {str(e)}"
 
+def search_memories(keyword: str) -> list[str]:
+    """
+    Returns facts from the database that contain the given keyword (case-insensitive).
+
+    Uses SQL LIKE with wildcards so partial matches work — e.g. searching "FastAPI"
+    will match "I use FastAPI for my projects."
+
+    Returning only matching facts (rather than all facts) is the key accuracy
+    improvement: the AI never sees unrelated memories, which was causing it to
+    mention or conflate irrelevant stored facts in its answers.
+    """
+    try:
+        with sqlite3.connect(MEMORY_DB_PATH) as conn:
+            cursor = conn.cursor()
+            # The % wildcards on both sides make this a substring match,
+            # and LIKE is case-insensitive by default in SQLite for ASCII text.
+            cursor.execute(
+                "SELECT fact FROM memories WHERE fact LIKE ? ORDER BY created_at ASC",
+                (f"%{keyword}%",)
+            )
+            rows = cursor.fetchall()
+            return [row[0] for row in rows]
+    except Exception:
+        # Return empty list on any DB error — the caller treats this the same
+        # as "no results found".
+        return []
+
 # Automatically initialize database when module is first imported
 init_memory_db()
