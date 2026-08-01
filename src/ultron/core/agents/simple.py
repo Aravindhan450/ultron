@@ -143,6 +143,54 @@ def detect_test_intent(user_input: str) -> bool:
     pattern = r'\b(run\s+tests?|run\s+the\s+tests?|test\s+my\s+code|run\s+pytest)\b'
     return bool(re.search(pattern, user_input, re.IGNORECASE))
 
+def detect_git_intent(user_input: str) -> str | None:
+    """
+    Maps common natural-language Git phrases to the actual git command to run.
+
+    Returns the ready-to-execute command string if matched, otherwise None.
+
+    Design note: Git commands are plain shell commands, so we reuse the
+    existing run_command tool and PendingAction confirmation flow without
+    any new infrastructure.  This detector is placed BEFORE the generic
+    detect_command_intent so that phrases like "show diff" are caught here
+    rather than being passed literally to the shell as `diff`.
+
+    Commit phrasing optionally accepts a quoted message, e.g.:
+      "commit this \"fixed login bug\""  ->  git add -A && git commit -m "fixed login bug"
+      "commit changes"                   ->  git add -A && git commit -m "Update via Ultron"
+    """
+    text = user_input.strip()
+
+    # --- git status ---
+    if re.search(r'\b(what\s+changed|show\s+changes|git\s+status)\b', text, re.IGNORECASE):
+        return "git status"
+
+    # --- git diff ---
+    if re.search(
+        r'\b(show\s+(?:me\s+the\s+)?diff|what(?:\'s|\s+is)\s+different|git\s+diff)\b',
+        text, re.IGNORECASE
+    ):
+        return "git diff"
+
+    # --- git log ---
+    if re.search(r'\b(git\s+log|show\s+commit\s+history|recent\s+commits)\b', text, re.IGNORECASE):
+        return "git log --oneline -10"
+
+    # --- git commit ---
+    # Match "commit changes" or "commit this", optionally with a quoted message.
+    commit_match = re.search(
+        r'\bcommit\s+(?:changes|this)\b(?:.*?"(?P<msg>[^"]+)")?',
+        text, re.IGNORECASE
+    )
+    if commit_match:
+        msg = commit_match.group("msg")
+        # Use the user's quoted message if provided; otherwise fall back to a
+        # sensible default so the automated commit is clearly identifiable in history.
+        commit_msg = msg.strip() if msg else "Update via Ultron"
+        return f'git add -A && git commit -m "{commit_msg}"'
+
+    return None
+
 def detect_multistep_intent(user_input: str) -> bool:
     """
     Heuristic detector for compound / multi-step requests.
@@ -447,6 +495,23 @@ class SimpleAgent(BaseAgent):
                 pending_action=PendingAction(
                     action_type="run_command",
                     target="pytest -v"
+                )
+            )
+
+        # --- Step 4.5: Pre-detection of git intent ---
+        # Placed BEFORE the generic command detector so natural phrases like
+        # "show diff" or "commit changes" are mapped to proper git commands
+        # rather than being passed literally to the shell.
+        # Zero new infrastructure: reuses the same PendingAction / run_command
+        # confirmation flow already used for all other shell commands.
+        detected_git_cmd = detect_git_intent(user_input)
+        if detected_git_cmd:
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=f"Git command requested: '{detected_git_cmd}'",
+                pending_action=PendingAction(
+                    action_type="run_command",
+                    target=detected_git_cmd
                 )
             )
 
