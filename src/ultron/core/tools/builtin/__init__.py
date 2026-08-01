@@ -1,1 +1,3 @@
-$*
+"""
+Builtin tools initialization.
+"""

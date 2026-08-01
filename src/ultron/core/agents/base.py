@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import Any
 from ultron.core.engine.base import BaseEngine
+from ultron.core.types import ChatMessage
 
 class BaseAgent(ABC):
     """
@@ -11,7 +11,7 @@ class BaseAgent(ABC):
         self.engine = engine
 
     @abstractmethod
-    async def run(self, user_input: str, history: list[dict[str, Any]] | None = None) -> str:
+    async def run(self, user_input: str, history: list[ChatMessage] | None = None) -> ChatMessage:
         """
         Execute the agent logic given user input and conversation history.
         """
