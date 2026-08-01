@@ -141,6 +141,34 @@ def handle_slash_command(cmd: str, console, history: list) -> tuple[bool, bool]:
     console.print(f"[bold yellow]Unknown command:[/bold yellow] [cyan]{cmd}[/cyan]. Type [bold cyan]/help[/bold cyan] to see available commands.\n")
     return True, False
 
+def summarize_pytest_output(raw_output: str) -> str:
+    """
+    Parses raw pytest -v output and summarizes test counts and failed test names.
+    If parsing fails, returns raw_output as fallback.
+    """
+    import re
+    try:
+        passed_count = len(re.findall(r'\bPASSED\b', raw_output))
+        failed_tests = re.findall(r'^(.*?)\s+FAILED\b', raw_output, flags=re.MULTILINE)
+        failed_count = len(failed_tests)
+
+        if passed_count == 0 and failed_count == 0:
+            return raw_output
+
+        if failed_count == 0:
+            return f"All {passed_count} tests passed! ✅\n\n[dim]# Note: Run again with --raw to see full output[/dim]"
+
+        summary_lines = [f"Test Results: {passed_count} passed, {failed_count} failed\n\nFailed tests:"]
+        for test in failed_tests:
+            # Clean up test path/name
+            clean_test = test.strip().split()[-1] if test.strip() else test.strip()
+            summary_lines.append(f"  - {clean_test}")
+
+        summary_lines.append("\n[dim]# Note: Run again with --raw to see full output[/dim]")
+        return "\n".join(summary_lines)
+    except Exception:
+        return raw_output
+
 async def async_chat():
     """
     Asynchronous runner for the interactive chat session.
@@ -226,6 +254,11 @@ async def async_chat():
                     if action.action_type == "run_command":
                         run_cmd_func = get_tool("run_command")
                         result = run_cmd_func(action.target) if run_cmd_func else "Error: Tool 'run_command' not found."
+                        
+                        # Summarize output if command is pytest
+                        if action.target.startswith("pytest"):
+                            result = summarize_pytest_output(result)
+
                     elif action.action_type == "overwrite_file":
                         write_func = get_tool("write_file")
                         result = write_func(action.target, action.content or "", overwrite=True) if write_func else "Error: Tool 'write_file' not found."

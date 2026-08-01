@@ -1,1 +1,66 @@
-$*
+import sqlite3
+from ultron.core.tools.paths import ALLOWED_BASE_DIR
+
+# Path to the SQLite database file inside the project root folder
+MEMORY_DB_PATH = ALLOWED_BASE_DIR / ".ultron_memory.db"
+
+def init_memory_db() -> None:
+    """
+    Initializes the SQLite database and creates the 'memories' table if it does not already exist.
+    """
+    try:
+        with sqlite3.connect(MEMORY_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fact TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+    except Exception as e:
+        # Print warning to console if DB initialization fails
+        print(f"Warning: Failed to initialize memory DB: {e}")
+
+def add_memory(fact: str) -> str:
+    """
+    Inserts a new memory fact into the database.
+    """
+    try:
+        with sqlite3.connect(MEMORY_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO memories (fact) VALUES (?)", (fact,))
+            conn.commit()
+        return f"Remembered: {fact}"
+    except Exception as e:
+        return f"Error storing memory: {str(e)}"
+
+def get_all_memories() -> list[str]:
+    """
+    Retrieves all stored facts from the database ordered by creation date (oldest first).
+    """
+    try:
+        with sqlite3.connect(MEMORY_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT fact FROM memories ORDER BY created_at ASC")
+            rows = cursor.fetchall()
+            return [row[0] for row in rows]
+    except Exception:
+        return []
+
+def clear_all_memories() -> str:
+    """
+    Deletes all stored facts from the database.
+    """
+    try:
+        with sqlite3.connect(MEMORY_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM memories")
+            conn.commit()
+        return "All memories cleared successfully."
+    except Exception as e:
+        return f"Error clearing memories: {str(e)}"
+
+# Automatically initialize database when module is first imported
+init_memory_db()

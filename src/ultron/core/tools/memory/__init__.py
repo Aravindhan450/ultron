@@ -1,1 +1,1 @@
-$*
+"""Memory package initialization."""

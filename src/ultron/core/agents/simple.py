@@ -1,4 +1,6 @@
 import re
+import json
+import asyncio
 from ultron.core.agents.base import BaseAgent
 from ultron.core.types import ChatMessage, Role, PendingAction, history_to_openai_format
 
@@ -72,6 +74,125 @@ def detect_command_intent(user_input: str) -> str | None:
         return match.group("command").strip()
     return None
 
+def detect_remember_intent(user_input: str) -> str | None:
+    """
+    Detects if the user input requests remembering a fact (e.g. "remember that ...", "remember ...").
+    Returns the extracted fact string if matched, otherwise None.
+    """
+    pattern = r'^\s*(?:please\s+)?remember\s+(?:that\s+)?(?P<fact>.+)\s*$'
+    match = re.search(pattern, user_input, re.IGNORECASE)
+    if match:
+        return match.group("fact").strip()
+    return None
+
+def detect_test_intent(user_input: str) -> bool:
+    """
+    Detects if the user input requests running tests (e.g. "run tests", "test my code").
+    Returns True if matched, otherwise False.
+    """
+    pattern = r'\b(run\s+tests?|run\s+the\s+tests?|test\s+my\s+code|run\s+pytest)\b'
+    return bool(re.search(pattern, user_input, re.IGNORECASE))
+
+def detect_multistep_intent(user_input: str) -> bool:
+    """
+    Heuristic detector for compound / multi-step requests.
+
+    Returns True if the user input looks like it contains more than one
+    distinct action (e.g. "read X, then write Y, then run Z").  We look for
+    coordinating conjunctions and sequencing keywords that typically glue
+    multiple imperatives together.
+
+    This is intentionally broad — false positives are harmless because
+    plan_task() will still produce a sensible (possibly single-step) plan,
+    and the user must confirm before anything runs.
+    """
+    # Words / phrases that commonly connect sequential steps
+    sequence_markers = [
+        r'\bthen\b',
+        r'\bafter\s+that\b',
+        r'\bafterwards\b',
+        r'\bnext\b',
+        r'\bfollowed\s+by\b',
+        r'\band\s+then\b',
+        r'\balso\b',
+        r'\bfinally\b',
+        r'\blast(?:ly)?\b',
+    ]
+    # Must mention at least two action verbs to qualify as multi-step
+    action_verbs = [
+        r'\bread\b', r'\bopen\b', r'\bshow\b',
+        r'\bwrite\b', r'\bcreate\b', r'\bsave\b',
+        r'\brun\b', r'\bexecute\b', r'\btest\b',
+        r'\bremember\b',
+    ]
+
+    has_sequence = any(
+        re.search(m, user_input, re.IGNORECASE) for m in sequence_markers
+    )
+    if not has_sequence:
+        return False
+
+    verb_hits = sum(
+        1 for v in action_verbs
+        if re.search(v, user_input, re.IGNORECASE)
+    )
+    return verb_hits >= 2
+
+
+async def plan_task(user_input: str, engine) -> list[dict] | None:
+    """
+    Asks the LLM to decompose a compound user request into an ordered list
+    of structured action steps.
+
+    Supported action types: read_file, write_file, run_command, add_memory.
+
+    Returns a list of dicts on success, or None if the LLM response cannot
+    be parsed as valid JSON.
+    """
+    planning_prompt = (
+        "You are a task-planning assistant.\n"
+        "Break the following user request into a list of simple steps.\n"
+        "Only use these action types: read_file, write_file, run_command, add_memory.\n"
+        "Respond with ONLY a JSON array — no other text, no markdown fences.\n"
+        "Use exactly these formats for each action type:\n"
+        '  {"action": "read_file",   "filename": "..."}\n'
+        '  {"action": "write_file",  "filename": "...", "content": "..."}\n'
+        '  {"action": "run_command", "command": "..."}\n'
+        '  {"action": "add_memory",  "fact": "..."}\n'
+        "\n"
+        f"User request: {user_input}"
+    )
+
+    try:
+        raw = await engine.generate([{"role": "user", "content": planning_prompt}])
+    except Exception as exc:
+        return None  # Engine error — fall back silently
+
+    # Strip markdown code fences if the model wrapped its answer
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r'^```[\w]*\n?', '', raw)
+        raw = re.sub(r'\n?```$', '', raw)
+        raw = raw.strip()
+
+    try:
+        steps = json.loads(raw)
+    except json.JSONDecodeError:
+        return None  # Unparseable — fall back to normal flow
+
+    if not isinstance(steps, list):
+        return None
+
+    # Validate that every step has a recognised action key
+    valid_actions = {"read_file", "write_file", "run_command", "add_memory"}
+    cleaned: list[dict] = []
+    for step in steps:
+        if isinstance(step, dict) and step.get("action") in valid_actions:
+            cleaned.append(step)
+
+    return cleaned if cleaned else None
+
+
 class SimpleAgent(BaseAgent):
     """
     A simple agent that passes user input and history directly to the engine.
@@ -134,7 +255,62 @@ class SimpleAgent(BaseAgent):
 
             return ChatMessage(role=Role.ASSISTANT, content=tool_result)
 
-        # --- Step 3: Pre-detection of command-runner intent ---
+        # --- Step 3: Pre-detection of remember-memory intent ---
+        detected_fact = detect_remember_intent(user_input)
+        if detected_fact:
+            add_memory_func = get_tool("add_memory")
+            if add_memory_func:
+                tool_result = add_memory_func(detected_fact)
+            else:
+                tool_result = "Error: Tool 'add_memory' not found in registry."
+            return ChatMessage(role=Role.ASSISTANT, content=str(tool_result))
+
+        # --- Step 3.5: Pre-detection of multi-step / compound intent ---
+        # This runs BEFORE the single-intent detectors so that requests like
+        # "read X then write Y" are planned as a unit rather than matched by
+        # the first matching single detector.
+        if detect_multistep_intent(user_input):
+            steps = await plan_task(user_input, self.engine)
+            if steps:
+                # Build a human-readable summary of the planned steps
+                step_lines = []
+                for i, step in enumerate(steps, start=1):
+                    action = step.get("action", "?")
+                    if action == "read_file":
+                        step_lines.append(f"{i}. Read file: {step.get('filename', '?')}")
+                    elif action == "write_file":
+                        step_lines.append(f"{i}. Write file: {step.get('filename', '?')}")
+                    elif action == "run_command":
+                        step_lines.append(f"{i}. Run command: {step.get('command', '?')}")
+                    elif action == "add_memory":
+                        step_lines.append(f"{i}. Remember: {step.get('fact', '?')}")
+                    else:
+                        step_lines.append(f"{i}. {action}")
+
+                plan_summary = "\n".join(step_lines)
+                return ChatMessage(
+                    role=Role.ASSISTANT,
+                    content=(
+                        f"I've broken your request into {len(steps)} step(s):\n"
+                        f"{plan_summary}\n\n"
+                        "(Task execution from plans is coming soon — "
+                        "for now you can run each step individually.)"
+                    )
+                )
+            # If plan_task returns None, fall through to normal detection
+
+        # --- Step 4: Pre-detection of test-runner intent ---
+        if detect_test_intent(user_input):
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content="Test execution requested: 'pytest -v'",
+                pending_action=PendingAction(
+                    action_type="run_command",
+                    target="pytest -v"
+                )
+            )
+
+        # --- Step 5: Pre-detection of command-runner intent ---
         detected_command = detect_command_intent(user_input)
         if detected_command:
             return ChatMessage(
@@ -146,7 +322,7 @@ class SimpleAgent(BaseAgent):
                 )
             )
 
-        # --- Step 4: LLM Engine Fallback ---
+        # --- Step 6: LLM Engine Fallback ---
         # Create a copy of the history list to avoid editing the original list
         messages = list(history) if history else []
         
@@ -165,8 +341,21 @@ class SimpleAgent(BaseAgent):
             "If you do need to read a file, respond with exactly this format on its own line:\n"
             "TOOL_CALL: read_file: <file_path>"
         )
+
+        # Retrieve all stored long-term memory facts from SQLite database
+        from ultron.core.tools.memory.sqlite import get_all_memories
+        stored_memories = get_all_memories()
         
-        # Append the tool instruction to the existing SYSTEM message if present,
+        # If any memories exist, inject them into the system prompt context as bullet points
+        if stored_memories:
+            memory_bullets = "\n".join(f"- {fact}" for fact in stored_memories)
+            memory_context = (
+                f"Here is some context you should remember about this user and project:\n"
+                f"{memory_bullets}"
+            )
+            tool_instruction = f"{tool_instruction}\n\n{memory_context}"
+        
+        # Append the tool instruction and memory context to the existing SYSTEM message if present,
         # otherwise insert a new SYSTEM message at the start of the list.
         if messages and messages[0].role == Role.SYSTEM:
             messages[0] = ChatMessage(
