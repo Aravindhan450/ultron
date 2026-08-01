@@ -196,6 +196,44 @@ async def async_chat():
             with console.status("[dim]Thinking...[/dim]"):
                 response_msg = await agent.run(user_input, truncated_history)
                 
+            # If the response requests interactive user confirmation via pending_action
+            if response_msg.pending_action:
+                import questionary
+                from ultron.core.tools.registry import get_tool
+
+                action = response_msg.pending_action
+                if action.action_type == "run_command":
+                    console.print(Panel(
+                        f"Action: Execute terminal command\n[bold yellow]{action.target}[/bold yellow]",
+                        title="Confirmation Required",
+                        border_style="yellow",
+                        padding=(0, 1)
+                    ))
+                elif action.action_type == "overwrite_file":
+                    console.print(Panel(
+                        f"Action: Overwrite existing file\nTarget: [bold yellow]{action.target}[/bold yellow]",
+                        title="Confirmation Required",
+                        border_style="yellow",
+                        padding=(0, 1)
+                    ))
+
+                choice = await questionary.select(
+                    "Do you want to allow this action?",
+                    choices=["Yes, allow", "No, don't allow"]
+                ).ask_async()
+
+                if choice == "Yes, allow":
+                    if action.action_type == "run_command":
+                        run_cmd_func = get_tool("run_command")
+                        result = run_cmd_func(action.target) if run_cmd_func else "Error: Tool 'run_command' not found."
+                    elif action.action_type == "overwrite_file":
+                        write_func = get_tool("write_file")
+                        result = write_func(action.target, action.content or "", overwrite=True) if write_func else "Error: Tool 'write_file' not found."
+                    
+                    response_msg = ChatMessage(role=Role.ASSISTANT, content=result)
+                else:
+                    response_msg = ChatMessage(role=Role.ASSISTANT, content="Action cancelled by user.")
+
             # Render Ultron AI response panel
             console.print(Panel(response_msg.content, title="Ultron", border_style="bold #ff6600", padding=(0, 1)))
             console.print()

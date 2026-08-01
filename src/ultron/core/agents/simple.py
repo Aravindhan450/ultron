@@ -1,6 +1,6 @@
 import re
 from ultron.core.agents.base import BaseAgent
-from ultron.core.types import ChatMessage, Role, history_to_openai_format
+from ultron.core.types import ChatMessage, Role, PendingAction, history_to_openai_format
 
 def detect_file_read_intent(user_input: str) -> str | None:
     """
@@ -61,47 +61,32 @@ def detect_file_write_intent(user_input: str) -> tuple[str, str] | None:
 
     return None
 
+def detect_command_intent(user_input: str) -> str | None:
+    """
+    Detects if the user input requests running a command (e.g., "run <command>" or "execute <command>").
+    Returns the extracted command string if matched, otherwise None.
+    """
+    pattern = r'^\s*(?:run|execute)\s+(?P<command>.+)\s*$'
+    match = re.search(pattern, user_input, re.IGNORECASE)
+    if match:
+        return match.group("command").strip()
+    return None
+
 class SimpleAgent(BaseAgent):
     """
     A simple agent that passes user input and history directly to the engine.
     """
 
-    def __init__(self, engine):
-        super().__init__(engine)
-        # Multi-step state tracking: holds (filename, content) when a write requires confirmation
-        self._pending_write: tuple[str, str] | None = None
-
     async def run(self, user_input: str, history: list[ChatMessage] | None = None) -> ChatMessage:
         """
-        Runs the agent conversation step and handles tool execution if requested by the AI.
+        Runs the agent conversation step and handles tool execution or interactive confirmation signaling.
+        
+        Design Choice:
+        Rather than holding multi-turn state (like _pending_write or _pending_command) and matching
+        text confirmation responses, we attach a `pending_action` payload to the ChatMessage.
+        This signals `main.py` to prompt the user immediately with an interactive `questionary` menu.
         """
         from ultron.core.tools.registry import get_tool
-
-        # --- Multi-Step Confirmation Handling ---
-        # Check if the user is confirming a pending overwrite attempt ("yes overwrite <filename>")
-        overwrite_match = re.search(r'^\s*yes\s+overwrite\s+([\w./-]+\.[a-zA-Z0-9]+)\s*$', user_input, re.IGNORECASE)
-        if overwrite_match:
-            target_filename = overwrite_match.group(1).strip()
-            if self._pending_write and self._pending_write[0].lower() == target_filename.lower():
-                pending_filename, pending_content = self._pending_write
-                self._pending_write = None  # Clear pending state after handling confirmation
-                
-                write_file_func = get_tool("write_file")
-                if write_file_func:
-                    result = write_file_func(pending_filename, pending_content, overwrite=True)
-                else:
-                    result = "Error: Tool 'write_file' not found in registry."
-
-                return ChatMessage(role=Role.ASSISTANT, content=result)
-            else:
-                self._pending_write = None
-                return ChatMessage(
-                    role=Role.ASSISTANT,
-                    content=f"No pending overwrite found for '{target_filename}'."
-                )
-
-        # Clear any pending write state if the user sends anything other than an overwrite confirmation
-        self._pending_write = None
 
         # --- Step 1: Pre-detection of file-reading intent ---
         detected_filename = detect_file_read_intent(user_input)
@@ -135,24 +120,33 @@ class SimpleAgent(BaseAgent):
             else:
                 tool_result = "Error: Tool 'write_file' not found in registry."
 
-            # Multi-step confirmation flow:
-            # If the file already exists, we do NOT overwrite it silently.
-            # Instead, store the (filename, content) pair in self._pending_write and ask the user to confirm.
+            # If the file already exists, signal main.py that interactive confirmation is needed
             if "already exists" in str(tool_result):
-                self._pending_write = (filename, content)
                 return ChatMessage(
                     role=Role.ASSISTANT,
-                    content=(
-                        f"The file '{filename}' already exists. "
-                        f"Reply with 'yes overwrite {filename}' if you want me to replace it, "
-                        f"or choose a different filename."
+                    content=f"File '{filename}' already exists and requires confirmation to overwrite.",
+                    pending_action=PendingAction(
+                        action_type="overwrite_file",
+                        target=filename,
+                        content=content
                     )
                 )
 
-            # Return success or any other error (e.g., access denied outside project folder) directly
             return ChatMessage(role=Role.ASSISTANT, content=tool_result)
 
-        # --- Step 3: LLM Engine Fallback ---
+        # --- Step 3: Pre-detection of command-runner intent ---
+        detected_command = detect_command_intent(user_input)
+        if detected_command:
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=f"Command execution requested: '{detected_command}'",
+                pending_action=PendingAction(
+                    action_type="run_command",
+                    target=detected_command
+                )
+            )
+
+        # --- Step 4: LLM Engine Fallback ---
         # Create a copy of the history list to avoid editing the original list
         messages = list(history) if history else []
         

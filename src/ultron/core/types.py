@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 class Role(str, Enum):
@@ -12,6 +12,18 @@ class Role(str, Enum):
     ASSISTANT = "assistant"
     TOOL = "tool"
 
+class PendingAction(BaseModel):
+    """
+    Represents an action requiring user interactive confirmation (e.g. running a command or overwriting a file).
+    
+    Design Choice:
+    Instead of string matching on user messages back-and-forth, we attach a `pending_action` object to ChatMessage.
+    This clearly signals to the CLI interface (main.py) that interactive confirmation via questionary is required.
+    """
+    action_type: Literal["run_command", "overwrite_file"]
+    target: str          # The command string OR the filename to write to
+    content: str | None = None  # Content to write if action_type is "overwrite_file"
+
 class ChatMessage(BaseModel):
     """
     Represents a structured chat message for the Ultron assistant.
@@ -20,6 +32,7 @@ class ChatMessage(BaseModel):
     content: str
     name: str | None = None
     tool_call_id: str | None = None
+    pending_action: PendingAction | None = None  # Optional interactive confirmation request payload
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_openai_format(self) -> dict[str, Any]:
