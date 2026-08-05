@@ -74,27 +74,29 @@ def print_startup_banner(console):
         except ValueError:
             short_cwd = str(cwd)
 
-    # Gradient-styled ASCII art banner for ULTRON (red to orange to purple gradient)
+    # Block-letter ULTRON wordmark — spacing preserved exactly as specified.
     logo_lines = [
-        "█    █  █    ████████ ██████  ██████  █    █",
-        "█    █  █       ██    █    █  █    █  ██   █",
-        "█    █  █       ██    ██████  █    █  █ █  █",
-        "█    █  █       ██    █  █    █    █  █  █ █",
-        " ████   ██████  ██    █   █   ██████  █   ██",
+        "     ██╗   ██╗██╗  ████████╗██████╗  ██████╗ ███╗   ██╗",
+        "     ██║   ██║██║  ╚══██╔══╝██╔══██╗██╔═══██╗████╗  ██║",
+        "     ██║   ██║██║     ██║   ██████╔╝██║   ██║██╔██╗ ██║",
+        "     ██║   ██║██║     ██║   ██╔══██╗██║   ██║██║╚██╗██║",
+        "     ╚██████╔╝███████╗██║   ██║  ██║╚██████╔╝██║ ╚████║",
+        "      ╚═════╝ ╚══════╝╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝",
     ]
 
-    colors = ["#ff3333", "#ff6600", "#ff9900", "#cc33ff", "#9933ff"]
-    
+    colors = ["#ffcc00", "#ff9500", "#ff5500", "#ff5500", "#ff2200", "#cc0000"]
+
     console.print()
     for line, color in zip(logo_lines, colors):
         console.print(Text(line, style=f"bold {color}"))
     console.print()
 
     # Active info block
-    console.print(f" [bold magenta]Model:[/bold magenta] [cyan]{settings.model}[/cyan]")
-    console.print(f" [bold magenta]Directory:[/bold magenta] [dim]{short_cwd}[/dim]")
-    console.print(Rule(style="dim cyan"))
+    console.print(f" [bold #ff9500]Model:[/bold #ff9500] [bold #ffcc00]{settings.model}[/bold #ffcc00]")
+    console.print(f" [bold #ff9500]Directory:[/bold #ff9500] [dim]{short_cwd}[/dim]")
+    console.print(Rule(style="#ff5500"))
     console.print("[dim]Type '/exit' or '/quit' to end the chat.[/dim]\n")
+
 
 def print_help_table(console):
     """
@@ -102,18 +104,19 @@ def print_help_table(console):
     """
     from rich.table import Table
 
-    table = Table(title="Available Commands", show_header=True, header_style="bold magenta")
-    table.add_column("Command", style="cyan", width=12)
+    table = Table(title="Available Commands", show_header=True, header_style="bold #ff9500")
+    table.add_column("Command", style="bold #ffcc00", width=12)
     table.add_column("Description", style="white")
 
     table.add_row("/help", "Show this help table of available commands.")
+    table.add_row("/model", "Select an available LLM model interactively.")
     table.add_row("/clear", "Reset conversation history to start fresh.")
     table.add_row("/exit, /quit", "Exit the chat session.")
 
     console.print(table)
     console.print()
 
-def handle_slash_command(cmd: str, console, history: list) -> tuple[bool, bool]:
+async def handle_slash_command(cmd: str, console, history: list, agent=None) -> tuple[bool, bool]:
     """
     Handles slash commands entered by the user.
 
@@ -123,12 +126,38 @@ def handle_slash_command(cmd: str, console, history: list) -> tuple[bool, bool]:
         - should_exit: True if the slash command requested exiting the chat loop.
     """
     clean_cmd = cmd.strip().lower()
-    
+
     if clean_cmd in ("/exit", "/quit"):
         return True, True
 
     if clean_cmd == "/help":
         print_help_table(console)
+        return True, False
+
+    if clean_cmd == "/model":
+        import questionary
+        from ultron.core.config import settings
+
+        models: list[str] = []
+        if agent and hasattr(agent, "engine") and hasattr(agent.engine, "list_models"):
+            models = await agent.engine.list_models()
+
+        if not models:
+            console.print("[bold red]No local models found or failed to fetch model list from Ollama.[/bold red]\n")
+            return True, False
+
+        selected_model = await questionary.select(
+            "Select model:",
+            choices=models,
+            default=settings.model if settings.model in models else models[0],
+        ).ask_async()
+
+        if selected_model:
+            settings.model = selected_model
+            if agent and hasattr(agent, "engine"):
+                agent.engine.default_model = selected_model
+            console.print(f"[bold green]Selected model:[/bold green] [cyan]{selected_model}[/cyan]\n")
+
         return True, False
 
     if clean_cmd == "/clear":
@@ -227,13 +256,14 @@ async def async_chat():
     Asynchronous runner for the interactive chat session.
     """
     from ultron.core.agents import get_agent
-    from rich.prompt import Prompt
     from rich.console import Console
     from rich.panel import Panel
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.formatted_text import HTML
 
     console = Console()
     print_startup_banner(console)
-    
+
     try:
         agent = get_agent("simple")
     except Exception as e:
@@ -242,17 +272,20 @@ async def async_chat():
         return
 
     logger.debug("Initializing chat session with SimpleAgent...")
-    
+
     from ultron.core.types import ChatMessage, Role, truncate_history
 
     # Initialize history with a single system prompt message
     history: list[ChatMessage] = [
         ChatMessage(role=Role.SYSTEM, content="You are Ultron, a helpful local AI assistant.")
     ]
-    
+
+    session = PromptSession()
+
     while True:
         try:
-            user_input = Prompt.ask("[bold blue]You[/bold blue]")
+            # Use prompt_toolkit session for full readline/arrow key support
+            user_input = await session.prompt_async(HTML("<b><blue>You</blue></b>: "))
             trimmed_input = user_input.strip()
 
             if not trimmed_input:
@@ -264,7 +297,7 @@ async def async_chat():
                 break
 
             if trimmed_input.startswith("/"):
-                handled, should_exit = handle_slash_command(trimmed_input, console, history)
+                handled, should_exit = await handle_slash_command(trimmed_input, console, history, agent=agent)
                 if should_exit:
                     console.print("[bold yellow]Goodbye.[/bold yellow]")
                     break
@@ -283,18 +316,43 @@ async def async_chat():
                 from ultron.core.tools.registry import get_tool
 
                 action = response_msg.pending_action
+
+                # Show a confirmation panel describing the action BEFORE asking.
+                # Each action type gets its own panel text so the user knows
+                # exactly what will happen if they choose "Yes, allow".
                 if action.action_type == "run_command":
                     console.print(Panel(
-                        f"Action: Execute terminal command\n[bold yellow]{action.target}[/bold yellow]",
+                        f"Action: Execute terminal command\n[bold #ffcc00]{action.target}[/bold #ffcc00]",
                         title="Confirmation Required",
-                        border_style="yellow",
+                        border_style="#ff9500",
+                        padding=(0, 1)
+                    ))
+                elif action.action_type == "read_file":
+                    # Reading exposes file contents — confirm before proceeding
+                    console.print(Panel(
+                        f"Action: Read file\nTarget: [bold #ffcc00]{action.target}[/bold #ffcc00]",
+                        title="Confirmation Required",
+                        border_style="#ff9500",
+                        padding=(0, 1)
+                    ))
+                elif action.action_type == "write_file":
+                    # Creating a new file — show a content preview so the user
+                    # can verify what will be written before committing
+                    preview = (action.content or "")[:100]
+                    preview_str = preview + ("…" if len(action.content or "") > 100 else "")
+                    console.print(Panel(
+                        f"Action: Create new file\n"
+                        f"Target: [bold #ffcc00]{action.target}[/bold #ffcc00]\n"
+                        f"Content preview: [dim]{preview_str}[/dim]",
+                        title="Confirmation Required",
+                        border_style="#ff9500",
                         padding=(0, 1)
                     ))
                 elif action.action_type == "overwrite_file":
                     console.print(Panel(
-                        f"Action: Overwrite existing file\nTarget: [bold yellow]{action.target}[/bold yellow]",
+                        f"Action: Overwrite existing file\nTarget: [bold #ffcc00]{action.target}[/bold #ffcc00]",
                         title="Confirmation Required",
-                        border_style="yellow",
+                        border_style="#ff9500",
                         padding=(0, 1)
                     ))
 
@@ -305,28 +363,51 @@ async def async_chat():
 
                 if choice == "Yes, allow":
                     if action.action_type == "run_command":
-                        run_cmd_func = get_tool("run_command")
-                        result = run_cmd_func(action.target) if run_cmd_func else "Error: Tool 'run_command' not found."
-                        
-                        # Route output through the appropriate summarizer based on the
-                        # confirmed command.  Each summarizer converts raw terminal noise
-                        # into a clean, human-readable panel — consistent pattern for all.
-                        if action.target.startswith("pytest"):
-                            result = summarize_pytest_output(result)
-                        elif action.target.startswith("ruff check"):
-                            result = summarize_lint_output(result)
-                        # git log, git commit, custom commands, etc. pass through unchanged
+                        if action.target.startswith("http_request:"):
+                            # Parse target format: "http_request:<METHOD>:<URL>[:<BODY>]"
+                            parts = action.target.split(":", 3)
+                            method = parts[1]
+                            url = parts[2]
+                            body = parts[3] if len(parts) > 3 else None
+                            http_tool = get_tool("make_http_request")
+                            result = http_tool(method, url, body) if http_tool else "Error: Tool 'make_http_request' not found."
+                        else:
+                            run_cmd_func = get_tool("run_command")
+                            result = run_cmd_func(action.target) if run_cmd_func else "Error: Tool 'run_command' not found."
+
+                            # Route output through the appropriate summarizer based on the
+                            # confirmed command.  Each summarizer converts raw terminal noise
+                            # into a clean, human-readable panel — consistent pattern for all.
+                            if action.target.startswith("pytest"):
+                                result = summarize_pytest_output(result)
+                            elif action.target.startswith("ruff check"):
+                                result = summarize_lint_output(result)
+                            # git log, git commit, custom commands, etc. pass through unchanged
+
+                    elif action.action_type == "read_file":
+                        # Execute the actual file read now that the user has confirmed
+                        read_func = get_tool("read_file")
+                        raw = read_func(action.target) if read_func else "Error: Tool 'read_file' not found."
+                        if str(raw).startswith("Error"):
+                            result = f"Sorry, I could not find or read the file '{action.target}'."
+                        else:
+                            result = f"Here are the contents of '{action.target}':\n\n{raw}"
+
+                    elif action.action_type == "write_file":
+                        # Execute the new-file write now that the user has confirmed
+                        write_func = get_tool("write_file")
+                        result = write_func(action.target, action.content or "", overwrite=False) if write_func else "Error: Tool 'write_file' not found."
 
                     elif action.action_type == "overwrite_file":
                         write_func = get_tool("write_file")
                         result = write_func(action.target, action.content or "", overwrite=True) if write_func else "Error: Tool 'write_file' not found."
-                    
+
                     response_msg = ChatMessage(role=Role.ASSISTANT, content=result)
                 else:
                     response_msg = ChatMessage(role=Role.ASSISTANT, content="Action cancelled by user.")
 
             # Render Ultron AI response panel
-            console.print(Panel(response_msg.content, title="Ultron", border_style="bold #ff6600", padding=(0, 1)))
+            console.print(Panel(response_msg.content, title="Ultron", border_style="bold #ff5500", padding=(0, 1)))
             console.print()
             
             # Append both the user message and assistant response to full history

@@ -15,6 +15,20 @@ class OllamaEngine(BaseEngine):
         self.base_url = base_url.rstrip("/")
         self.default_model = default_model
 
+    async def list_models(self) -> list[str]:
+        """
+        Fetch available local model names from Ollama.
+        """
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.get(f"{self.base_url}/api/tags", timeout=5.0)
+                if resp.status_code == 200:
+                    tags = resp.json()
+                    return [m["name"] for m in tags.get("models", [])]
+            except Exception as e:
+                logger.error(f"Failed to fetch model list from Ollama: {e}")
+        return []
+
     async def _handle_http_error(self, e: httpx.HTTPStatusError, model: str) -> None:
         """
         Helper method to provide context-rich error messages for HTTP status failures.

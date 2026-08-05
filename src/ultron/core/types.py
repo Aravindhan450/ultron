@@ -20,9 +20,9 @@ class PendingAction(BaseModel):
     Instead of string matching on user messages back-and-forth, we attach a `pending_action` object to ChatMessage.
     This clearly signals to the CLI interface (main.py) that interactive confirmation via questionary is required.
     """
-    action_type: Literal["run_command", "overwrite_file"]
-    target: str          # The command string OR the filename to write to
-    content: str | None = None  # Content to write if action_type is "overwrite_file"
+    action_type: Literal["run_command", "overwrite_file", "read_file", "write_file"]
+    target: str          # The command string OR the filename to read/write
+    content: str | None = None  # Content to write if action_type is "write_file" or "overwrite_file"
 
 class ChatMessage(BaseModel):
     """
