@@ -23,3 +23,32 @@ class Settings(BaseSettings):
 
 # Global settings singleton
 settings = Settings()
+
+
+def update_env_file(key: str, value: str) -> None:
+    """
+    Updates or creates a key=value pair in the project's .env file on disk
+    so configuration changes persist across CLI session restarts.
+    """
+    env_path = Path.cwd() / ".env"
+    key_prefix = f"{key}="
+
+    if env_path.exists():
+        content = env_path.read_text(encoding="utf-8")
+        lines = content.splitlines()
+        updated = False
+        new_lines = []
+        for line in lines:
+            if line.strip().startswith(key_prefix):
+                new_lines.append(f"{key}={value}")
+                updated = True
+            else:
+                new_lines.append(line)
+        if not updated:
+            new_lines.append(f"{key}={value}")
+        env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    else:
+        env_path.write_text(f"{key}={value}\n", encoding="utf-8")
+
+
+_update_env_file = update_env_file

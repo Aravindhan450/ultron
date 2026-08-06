@@ -13,6 +13,14 @@ logger = get_logger("ultron.agents.simple")
 # command string, fact, topic, bool) or None/False if no match.
 # ---------------------------------------------------------------------------
 
+def detect_greeting_intent(user_input: str) -> bool:
+    """
+    Detects if the user input is a simple conversational greeting (e.g. "hi", "hello", "hey", "hii", "greetings").
+    Returns True if matched, otherwise False.
+    """
+    pattern = r'^\s*(?:hi+|hello+|hey+|greetings|good\s+(?:morning|afternoon|evening)|sup|yo)\s*[!.]*\s*$'
+    return bool(re.search(pattern, user_input, re.IGNORECASE))
+
 def detect_file_read_intent(user_input: str) -> str | None:
     """
     Detects if the user input contains a common file-reading pattern using regex.
@@ -47,28 +55,64 @@ def detect_file_write_intent(user_input: str) -> tuple[str, str] | None:
     Detects if the user input contains a common file-writing pattern using regex.
     Returns a tuple of (filename, content) if matched, otherwise None.
 
-    Additional phrasings can be added to the pattern list below in the future.
+    Supported phrasings:
+      - "write <content> to <filename>"
+      - "save <content> to <filename>"
+      - "create [a] file <filename> with <content>"
+      - "create [a] [new] file named/called <filename> [and put/with <content> [inside/in it]]"
+      - "make [a] file named/called <filename> [and put/with <content>]"
     """
     filename_pattern = r'[\w./-]+\.[a-zA-Z0-9]+'
 
-    patterns = [
-        # Match: "write <content> to <filename>"
+    # Helper: strip wrapping quotes from a string
+    def _strip_quotes(s: str) -> str:
+        s = s.strip()
+        if len(s) >= 2 and s[0] in ('"', "'") and s[-1] == s[0]:
+            return s[1:-1]
+        return s
+
+    # --- Pattern group 1: verb + content + "to" + filename ---
+    to_patterns = [
         rf'^\s*write\s+(?P<content>.+?)\s+to\s+(?P<filename>{filename_pattern})\s*$',
-        # Match: "create a file <filename> with <content>" or "create file <filename> with <content>"
-        rf'^\s*create\s+(?:a\s+)?file\s+(?P<filename>{filename_pattern})\s+with\s+(?P<content>.+?)\s*$',
-        # Match: "save <content> to <filename>"
         rf'^\s*save\s+(?P<content>.+?)\s+to\s+(?P<filename>{filename_pattern})\s*$',
     ]
-
-    for pattern in patterns:
+    for pattern in to_patterns:
         match = re.search(pattern, user_input, re.IGNORECASE | re.DOTALL)
         if match:
-            filename = match.group("filename").strip()
-            content = match.group("content").strip()
-            # Remove wrapping quotes around content if present (e.g., 'hello' or "hello")
-            if (content.startswith('"') and content.endswith('"')) or (content.startswith("'") and content.endswith("'")):
-                content = content[1:-1]
-            return filename, content
+            return match.group("filename").strip(), _strip_quotes(match.group("content"))
+
+    # --- Pattern group 2: "create [a] file <filename> with <content>" ---
+    m = re.search(
+        rf'^\s*create\s+(?:a\s+)?file\s+(?P<filename>{filename_pattern})\s+with\s+(?P<content>.+?)\s*$',
+        user_input, re.IGNORECASE | re.DOTALL
+    )
+    if m:
+        return m.group("filename").strip(), _strip_quotes(m.group("content"))
+
+    # --- Pattern group 3: "create/make [a/an] [new] file named/called <filename>" ---
+    # Filename must end with a recognised extension.
+    m = re.search(
+        rf'(?:create|make)\s+(?:a\s+|an\s+)?(?:new\s+)?file\s+(?:named|called)\s+(?P<filename>{filename_pattern})',
+        user_input, re.IGNORECASE
+    )
+    if m:
+        filename = m.group("filename").strip()
+        # Try to extract quoted content anywhere after the filename
+        content_match = re.search(r'["\'](.+?)["\']', user_input[m.end():])
+        content = content_match.group(1).strip() if content_match else ""
+        return filename, content
+
+    # --- Pattern group 4: "make/create <filename>" with optional content ---
+    # Fallback: bare filename anywhere preceded by "create" or "make"
+    m = re.search(
+        rf'(?:create|make)\s+(?P<filename>{filename_pattern})',
+        user_input, re.IGNORECASE
+    )
+    if m:
+        filename = m.group("filename").strip()
+        content_match = re.search(r'["\'](.+?)["\']', user_input[m.end():])
+        content = content_match.group(1).strip() if content_match else ""
+        return filename, content
 
     return None
 
@@ -474,6 +518,16 @@ async def execute_plan(steps: list[dict]) -> list[str]:
 # index of "what Ultron can do" rather than a wall of nested if-blocks.
 # ---------------------------------------------------------------------------
 
+def handle_greeting() -> ChatMessage:
+    """
+    Returns a friendly conversational greeting response without executing
+    any tools or querying the database.
+    """
+    return ChatMessage(
+        role=Role.ASSISTANT,
+        content="Hello! How can I help you today?"
+    )
+
 def handle_file_read(filename: str) -> ChatMessage:
     """
     Signals main.py to show an interactive confirmation before reading a file.
@@ -490,32 +544,36 @@ def handle_file_read(filename: str) -> ChatMessage:
         )
     )
 
-def handle_file_write(filename: str, content: str) -> ChatMessage:
+def handle_file_write(filename: str, content: str, user_input: str = "") -> ChatMessage:
     """
     Signals main.py to show an interactive confirmation before writing a file.
 
-    Two sub-cases, both go through confirmation:
-      - New file  → action_type="write_file"   (handled in main.py, overwrite=False)
-      - Existing  → action_type="overwrite_file" (existing flow, unchanged)
-
-    We detect which case applies by attempting the write with overwrite=False
-    first.  If it reports "already exists", we switch to the overwrite flow.
-    This keeps the single-responsibility boundary intact: simple.py decides
-    WHAT to do, main.py handles HOW to confirm and execute it.
+    Flow & Rules:
+    0. Guard: Reject blank filenames immediately.
+    1. Smart Hint: If user used "overwrite", "replace", or "force", emit 'overwrite_file'.
+    2. Existence Check: Use os.path.exists() — NOT write_file() — to detect if the file
+       already exists. The old probe called write_file() which had the side-effect of
+       creating the file before the user confirmed, causing "already exists" on approval.
     """
-    from ultron.core.tools.registry import get_tool
-    func = get_tool("write_file")
+    import os
 
-    # Probe whether the file already exists without writing anything.
-    # write_file(..., overwrite=False) returns an error string if the file
-    # exists, so we can branch on that without a separate filesystem check.
-    probe = func(filename, content, overwrite=False) if func else ""
-
-    if "already exists" in str(probe):
-        # File exists — send to the existing overwrite-confirmation flow
+    # Guard 0: blank filename — fail fast before any filesystem access
+    if not filename or not filename.strip():
         return ChatMessage(
             role=Role.ASSISTANT,
-            content=f"File '{filename}' already exists and requires confirmation to overwrite.",
+            content="Sorry, I couldn't determine the file name from your request. "
+                    "Please specify a filename with an extension, e.g. 'notes.txt'.",
+        )
+
+    # Resolve to absolute path the same way file_writer.py does
+    abs_path = filename if os.path.isabs(filename) else os.path.join(os.getcwd(), filename)
+
+    # Smart hint: user explicitly requested overwrite
+    has_force_hint = bool(re.search(r'\b(overwrite|replace|force)\b', user_input, re.IGNORECASE))
+    if has_force_hint:
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=f"File '{filename}' will be overwritten as requested.",
             pending_action=PendingAction(
                 action_type="overwrite_file",
                 target=filename,
@@ -523,8 +581,19 @@ def handle_file_write(filename: str, content: str) -> ChatMessage:
             )
         )
 
-    # New file — signal main.py to confirm before creating it.
-    # The file has NOT been written yet; main.py will call write_file on "Yes".
+    # Non-destructive existence check — no write happens here
+    if os.path.exists(abs_path) and not os.path.isdir(abs_path):
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=f"File '{filename}' already exists. Do you want to overwrite it?",
+            pending_action=PendingAction(
+                action_type="overwrite_file",
+                target=filename,
+                content=content
+            )
+        )
+
+    # New file — signal main.py to confirm creation
     return ChatMessage(
         role=Role.ASSISTANT,
         content=f"File create requested: '{filename}'",
@@ -718,8 +787,10 @@ async def handle_llm_fallback(
         "Available Tools:\n"
         f"{tools_json_str}\n\n"
         "INSTRUCTIONS:\n"
-        "When the user asks you to perform an action that matches one of your available tools, "
-        "respond ONLY with a JSON tool call block matching this structure:\n"
+        "1. ONLY use a tool if the user explicitly requests a specific action that requires it "
+        "(such as reading/writing a file, running a shell command, searching stored memories, or making an HTTP request).\n"
+        "2. Do NOT call memory tools (like get_all_memories or search_memories) for general chit-chat, greetings, or conversational queries. Memory tools must ONLY be called when the user explicitly asks what is remembered or saved.\n"
+        "3. When invoking a tool, respond ONLY with a JSON tool call block:\n"
         "```json\n"
         "{\n"
         '  "tool": "<tool_name>",\n'
@@ -727,7 +798,7 @@ async def handle_llm_fallback(
         "}\n"
         "```\n"
         "Do NOT include any extra conversational text before or after the JSON block when calling a tool.\n"
-        "If no tool is needed for the user's message, answer directly in natural conversational text."
+        "4. If no tool is explicitly needed for the user's message, answer directly in natural conversational text."
     )
 
     # Create a copy of the history list to avoid mutating original
@@ -774,15 +845,7 @@ async def handle_llm_fallback(
                 elif tool_name == "write_file":
                     fname = arguments.get("filename", "")
                     content = arguments.get("content", "")
-                    return ChatMessage(
-                        role=Role.ASSISTANT,
-                        content=f"File create requested: '{fname}'",
-                        pending_action=PendingAction(
-                            action_type="write_file",
-                            target=fname,
-                            content=content
-                        )
-                    )
+                    return handle_file_write(fname, content, user_input=user_input)
 
                 # Direct execution for read-only tools or non-destructive operations
                 try:
@@ -814,6 +877,59 @@ async def handle_llm_fallback(
 
 
 # ---------------------------------------------------------------------------
+# AI Intent Classifier
+# ---------------------------------------------------------------------------
+
+async def classify_intent(user_input: str, engine) -> str:
+    """
+    Classifies user intent into a specific category using the AI engine.
+
+    Design rationale:
+    This two-stage approach (AI classifies broadly, code extracts precisely) avoids
+    trusting the AI to accurately pull out exact values like filenames or URLs, which
+    we know from earlier testing is unreliable — the AI is only asked the much easier
+    question of "which general category," not "give me the precise details."
+    """
+    valid_categories = {
+        "read_file",
+        "write_file",
+        "run_command",
+        "http_request",
+        "git",
+        "run_tests",
+        "lint",
+        "remember",
+        "memory_question",
+        "none",
+    }
+
+    prompt = (
+        "Classify the following user message into EXACTLY ONE of these categories:\n\n"
+        "- read_file: user wants to view or read the contents of a file, e.g. 'read main.py', 'show me config.json'\n"
+        "- write_file: user wants to create, save, or write content to a file, e.g. 'write hello to test.txt', 'save this note in info.md'\n"
+        "- run_command: user wants to execute a shell command, e.g. 'run ls', 'execute pwd'\n"
+        "- http_request: user wants to send an HTTP request or fetch a URL, e.g. 'fetch https://api.com', 'post to http://localhost:8000'\n"
+        "- git: user wants to perform git operations like status, diff, log, or commit, e.g. 'check git status', 'show diff'\n"
+        "- run_tests: user wants to run unit tests or pytest, e.g. 'test my code', 'run pytest'\n"
+        "- lint: user wants to lint or check code quality, e.g. 'check for errors', 'run linter'\n"
+        "- remember: user wants Ultron to store or remember a fact, e.g. 'remember that key is 123', 'please remember I like Python'\n"
+        "- memory_question: user asks what facts or information Ultron remembers, e.g. 'what do you know about databases', 'what did I tell you about FastAPI'\n"
+        "- none: none of the above categories apply\n\n"
+        f"User message: {user_input}\n\n"
+        "Respond with ONLY the single category word, nothing else. If none of these clearly apply, respond with 'none'."
+    )
+
+    try:
+        raw_response = await engine.generate([{"role": "user", "content": prompt}])
+        category = raw_response.strip().lower()
+        if category in valid_categories:
+            return category
+        return "none"
+    except Exception:
+        return "none"
+
+
+# ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
 
@@ -842,6 +958,10 @@ class SimpleAgent(BaseAgent):
         if detect_multistep_intent(user_input):
             return await handle_multistep(user_input, self.engine)
 
+        # Step 0.5: greeting intent — fast-path conversational response bypassing tools/LLM
+        if detect_greeting_intent(user_input):
+            return handle_greeting()
+
         # Step 1: file-read intent
         filename = detect_file_read_intent(user_input)
         if filename:
@@ -850,7 +970,7 @@ class SimpleAgent(BaseAgent):
         # Step 2: file-write intent
         write_match = detect_file_write_intent(user_input)
         if write_match:
-            return handle_file_write(*write_match)
+            return handle_file_write(write_match[0], write_match[1], user_input=user_input)
 
         # Step 3: store a memory fact
         fact = detect_remember_intent(user_input)
@@ -888,5 +1008,67 @@ class SimpleAgent(BaseAgent):
         if command:
             return handle_command(command)
 
+        # Step 5.5: AI Intent Classification Fallback
+        # This two-stage approach (AI classifies broadly, code extracts precisely) avoids
+        # trusting the AI to accurately pull out exact values like filenames or URLs, which
+        # we know from earlier testing is unreliable — the AI is only asked the much easier
+        # question of "which general category," not "give me the precise details."
+        category = await classify_intent(user_input, self.engine)
+
+        if category != "none":
+            if category == "read_file":
+                re_filename = detect_file_read_intent(user_input)
+                if re_filename:
+                    return handle_file_read(re_filename)
+                return ChatMessage(
+                    role=Role.ASSISTANT,
+                    content="It sounds like you want to read a file — which file?"
+                )
+
+            elif category == "write_file":
+                re_write_match = detect_file_write_intent(user_input)
+                if re_write_match:
+                    return handle_file_write(re_write_match[0], re_write_match[1], user_input=user_input)
+                return ChatMessage(
+                    role=Role.ASSISTANT,
+                    content="It sounds like you want to write a file — which file and what content?"
+                )
+
+            elif category == "run_command":
+                re_command = detect_command_intent(user_input)
+                if re_command:
+                    return handle_command(re_command)
+                return ChatMessage(
+                    role=Role.ASSISTANT,
+                    content="It sounds like you want to run a command — which command?"
+                )
+
+            elif category == "http_request":
+                re_http_match = detect_http_intent(user_input)
+                if re_http_match:
+                    return handle_http(*re_http_match)
+
+            elif category == "git":
+                re_git_cmd = detect_git_intent(user_input)
+                if re_git_cmd:
+                    return handle_git(re_git_cmd)
+
+            elif category == "run_tests":
+                return handle_test()
+
+            elif category == "lint":
+                return handle_lint()
+
+            elif category == "remember":
+                re_fact = detect_remember_intent(user_input)
+                if re_fact:
+                    return handle_remember(re_fact)
+
+            elif category == "memory_question":
+                re_topic = detect_memory_question(user_input)
+                if re_topic:
+                    return handle_memory_question(re_topic)
+
         # Step 6: nothing matched — fall through to the LLM
         return await handle_llm_fallback(user_input, history or [], self.engine)
+

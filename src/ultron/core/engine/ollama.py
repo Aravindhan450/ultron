@@ -15,6 +15,18 @@ class OllamaEngine(BaseEngine):
         self.base_url = base_url.rstrip("/")
         self.default_model = default_model
 
+    @property
+    def model(self) -> str:
+        return self.default_model
+
+    @model.setter
+    def model(self, new_model: str) -> None:
+        self.default_model = new_model
+
+    def set_model(self, new_model: str) -> None:
+        """Dynamically update the active model for LLM generation requests."""
+        self.default_model = new_model
+
     async def list_models(self) -> list[str]:
         """
         Fetch available local model names from Ollama.

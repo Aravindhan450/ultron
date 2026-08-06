@@ -3,6 +3,9 @@ import typer
 from ultron import __version__
 from ultron.core.config import settings
 from ultron.core.logging import get_logger
+from ultron.ui.theme import UI, console
+from ultron.ui.layout import build_header, build_status_bar, build_layout
+
 
 logger = get_logger("ultron.cli")
 
@@ -53,70 +56,62 @@ def run():
     except KeyboardInterrupt:
         logger.info("Ultron is stopping. Goodbye.")
 
-def print_startup_banner(console):
-    """
-    Prints a polished CLI startup banner including an ASCII art logo,
-    active AI model configuration, current working directory, and a divider line.
-    """
+def _short_cwd() -> str:
+    """Return CWD with home folder replaced by ~ for compact display."""
     from pathlib import Path
-    from rich.rule import Rule
-    from rich.text import Text
-    from ultron.core.config import settings
-
-    # Shorten CWD to use ~ if under home folder
     cwd = Path.cwd()
     try:
-        short_cwd = f"~/{cwd.relative_to(Path.home())}" if cwd.is_relative_to(Path.home()) else str(cwd)
-    except AttributeError:
-        # Fallback for Python < 3.9 if needed
+        return f"~/{cwd.relative_to(Path.home())}" if cwd.is_relative_to(Path.home()) else str(cwd)
+    except (AttributeError, ValueError):
         try:
-            short_cwd = f"~/{cwd.relative_to(Path.home())}"
+            return f"~/{cwd.relative_to(Path.home())}"
         except ValueError:
-            short_cwd = str(cwd)
+            return str(cwd)
 
-    # Block-letter ULTRON wordmark — spacing preserved exactly as specified.
-    logo_lines = [
-        "     ██╗   ██╗██╗  ████████╗██████╗  ██████╗ ███╗   ██╗",
-        "     ██║   ██║██║  ╚══██╔══╝██╔══██╗██╔═══██╗████╗  ██║",
-        "     ██║   ██║██║     ██║   ██████╔╝██║   ██║██╔██╗ ██║",
-        "     ██║   ██║██║     ██║   ██╔══██╗██║   ██║██║╚██╗██║",
-        "     ╚██████╔╝███████╗██║   ██║  ██║╚██████╔╝██║ ╚████║",
-        "      ╚═════╝ ╚══════╝╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝",
-    ]
 
-    colors = ["#ffcc00", "#ff9500", "#ff5500", "#ff5500", "#ff2200", "#cc0000"]
+def print_banner(model_name: str) -> None:
+    """
+    Draws the Molten Core ASCII logo banner and metadata dynamically
+    evaluating the given model_name.
+    """
+    from ultron.ui.theme import UI
+    UI.render_banner(model=model_name, cwd_short=_short_cwd())
 
-    console.print()
-    for line, color in zip(logo_lines, colors):
-        console.print(Text(line, style=f"bold {color}"))
-    console.print()
 
-    # Active info block
-    console.print(f" [bold #ff9500]Model:[/bold #ff9500] [bold #ffcc00]{settings.model}[/bold #ffcc00]")
-    console.print(f" [bold #ff9500]Directory:[/bold #ff9500] [dim]{short_cwd}[/dim]")
-    console.print(Rule(style="#ff5500"))
-    console.print("[dim]Type '/exit' or '/quit' to end the chat.[/dim]\n")
+def render_status_bar(model_name: str, cwd_short: str = None) -> None:
+    """
+    Renders a compact single-line status bar for model_name.
+    """
+    from ultron.ui.theme import UI
+    UI.render_status_bar(model=model_name, cwd_short=cwd_short or _short_cwd())
+
+
+def render_screen(active_model: str) -> None:
+    """
+    Clears the terminal screen and draws the logo header banner for active_model.
+    """
+    console.clear()
+    print_banner(active_model)
 
 
 def print_help_table(console):
     """
     Prints a formatted table of available slash commands.
     """
-    from rich.table import Table
+    from ultron.ui.theme import UI
+    UI.render_help_table()
 
-    table = Table(title="Available Commands", show_header=True, header_style="bold #ff9500")
-    table.add_column("Command", style="bold #ffcc00", width=12)
-    table.add_column("Description", style="white")
 
-    table.add_row("/help", "Show this help table of available commands.")
-    table.add_row("/model", "Select an available LLM model interactively.")
-    table.add_row("/clear", "Reset conversation history to start fresh.")
-    table.add_row("/exit, /quit", "Exit the chat session.")
-
-    console.print(table)
-    console.print()
-
-async def handle_slash_command(cmd: str, console, history: list, agent=None) -> tuple[bool, bool]:
+async def handle_slash_command(
+    cmd: str,
+    console,
+    history: list,
+    agent=None,
+    session=None,
+    state=None,
+    live=None,
+    layout=None,
+) -> tuple[bool, bool]:
     """
     Handles slash commands entered by the user.
 
@@ -136,7 +131,9 @@ async def handle_slash_command(cmd: str, console, history: list, agent=None) -> 
 
     if clean_cmd == "/model":
         import questionary
-        from ultron.core.config import settings
+        from rich import box
+        from rich.panel import Panel
+        from ultron.core.config import settings, update_env_file
 
         models: list[str] = []
         if agent and hasattr(agent, "engine") and hasattr(agent.engine, "list_models"):
@@ -146,17 +143,40 @@ async def handle_slash_command(cmd: str, console, history: list, agent=None) -> 
             console.print("[bold red]No local models found or failed to fetch model list from Ollama.[/bold red]\n")
             return True, False
 
+        old_model = state.active_model if state else (getattr(session, "active_model", settings.model) if session else settings.model)
+
         selected_model = await questionary.select(
             "Select model:",
             choices=models,
-            default=settings.model if settings.model in models else models[0],
+            default=old_model if old_model in models else models[0],
         ).ask_async()
 
         if selected_model:
+            import os
+            if state:
+                state.active_model = selected_model
+            if session:
+                session.active_model = selected_model
             settings.model = selected_model
+            os.environ["ULTRON_MODEL"] = selected_model
             if agent and hasattr(agent, "engine"):
-                agent.engine.default_model = selected_model
-            console.print(f"[bold green]Selected model:[/bold green] [cyan]{selected_model}[/cyan]\n")
+                if hasattr(agent.engine, "set_model"):
+                    agent.engine.set_model(selected_model)
+                else:
+                    agent.engine.default_model = selected_model
+                    agent.engine.model = selected_model
+            update_env_file("ULTRON_MODEL", selected_model)
+            render_screen(selected_model)
+
+            console.print(
+                Panel(
+                    f"[bold green]✓ Switched model to '{selected_model}'[/bold green]\n"
+                    f"[dim]{old_model}[/] ➔ [bold magenta]{selected_model}[/]",
+                    box=box.ROUNDED,
+                    expand=False,
+                )
+            )
+            console.print()
 
         return True, False
 
@@ -164,6 +184,11 @@ async def handle_slash_command(cmd: str, console, history: list, agent=None) -> 
         from ultron.core.types import ChatMessage, Role
         history.clear()
         history.append(ChatMessage(role=Role.SYSTEM, content="You are Ultron, a helpful local AI assistant."))
+        if layout and state:
+            layout["header"].update(build_header(state))
+            layout["footer"].update(build_status_bar(state))
+            if live:
+                live.update(layout, refresh=True)
         console.print("[bold green]Conversation history cleared.[/bold green]\n")
         return True, False
 
@@ -253,16 +278,26 @@ def summarize_lint_output(raw_output: str) -> str:
 
 async def async_chat():
     """
-    Asynchronous runner for the interactive chat session.
+    Asynchronous runner for the interactive chat session powered by Rich Live & Layout.
     """
+    from ultron.core.state import CLIState
     from ultron.core.agents import get_agent
-    from rich.console import Console
-    from rich.panel import Panel
+    from ultron.ui.layout import build_header, build_status_bar, build_layout
+    from rich.live import Live
     from prompt_toolkit import PromptSession
     from prompt_toolkit.formatted_text import HTML
 
-    console = Console()
-    print_startup_banner(console)
+    state = CLIState(
+        active_model=settings.model,
+        current_dir=_short_cwd(),
+        version=f"v{__version__}",
+        status="Ready",
+    )
+
+    session = PromptSession()
+    session.active_model = state.active_model
+
+    layout = build_layout(state)
 
     try:
         agent = get_agent("simple")
@@ -275,96 +310,157 @@ async def async_chat():
 
     from ultron.core.types import ChatMessage, Role, truncate_history
 
-    # Initialize history with a single system prompt message
     history: list[ChatMessage] = [
         ChatMessage(role=Role.SYSTEM, content="You are Ultron, a helpful local AI assistant.")
     ]
 
-    session = PromptSession()
+    # Render the initial banner once at session start
+    print_banner(state.active_model)
 
     while True:
         try:
-            # Use prompt_toolkit session for full readline/arrow key support
-            user_input = await session.prompt_async(HTML("<b><blue>You</blue></b>: "))
+            state.status = "Ready"
+
+            user_input = await session.prompt_async(
+                HTML(f"<b><cyan>[{state.active_model}]</cyan> <blue>You</blue></b>: ")
+            )
             trimmed_input = user_input.strip()
 
             if not trimmed_input:
                 continue
 
-            # Plain exit/quit fallback or slash command handling
             if trimmed_input.lower() in ("/exit", "/quit", "exit", "quit"):
-                console.print("[bold yellow]Goodbye.[/bold yellow]")
+                UI.render_status("Goodbye.", status="info")
                 break
 
             if trimmed_input.startswith("/"):
-                handled, should_exit = await handle_slash_command(trimmed_input, console, history, agent=agent)
+                handled, should_exit = await handle_slash_command(
+                    trimmed_input,
+                    console,
+                    history,
+                    agent=agent,
+                    session=session,
+                    state=state,
+                )
                 if should_exit:
-                    console.print("[bold yellow]Goodbye.[/bold yellow]")
+                    UI.render_status("Goodbye.", status="info")
                     break
                 if handled:
                     continue
-                
-            # Truncate history before passing to agent
+
             truncated_history = truncate_history(history, max_messages=10)
-            
-            with console.status("[dim]Thinking...[/dim]"):
-                response_msg = await agent.run(user_input, truncated_history)
-                
-            # If the response requests interactive user confirmation via pending_action
+
+            import threading
+
+            def _listen_for_esc(cancel_evt: threading.Event):
+                import sys, tty, termios, select
+                if not sys.stdin.isatty():
+                    return
+                try:
+                    fd = sys.stdin.fileno()
+                    old_settings = termios.tcgetattr(fd)
+                except Exception:
+                    return
+                try:
+                    tty.setcbreak(fd)
+                    while not cancel_evt.is_set():
+                        r, _, _ = select.select([fd], [], [], 0.05)
+                        if r:
+                            ch = sys.stdin.read(1)
+                            if ch == "\x1b":
+                                r_next, _, _ = select.select([fd], [], [], 0.05)
+                                if not r_next:
+                                    cancel_evt.set()
+                                    break
+                                else:
+                                    sys.stdin.read(10)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    except Exception:
+                        pass
+
+            cancel_event = threading.Event()
+            esc_thread = threading.Thread(target=_listen_for_esc, args=(cancel_event,), daemon=True)
+            esc_thread.start()
+
+            agent_task = asyncio.create_task(agent.run(trimmed_input, truncated_history))
+
+            with console.status("[dim]Thinking... (Press Esc to cancel)[/dim]"):
+                while not agent_task.done():
+                    if cancel_event.is_set():
+                        agent_task.cancel()
+                        break
+                    await asyncio.sleep(0.05)
+
+            cancel_event.set()
+
+            if agent_task.cancelled():
+                state.status = "Ready"
+                UI.render_status("Task execution cancelled by Esc key.", status="warning")
+                continue
+
+            try:
+                response_msg = await agent_task
+            except asyncio.CancelledError:
+                state.status = "Ready"
+                UI.render_status("Task execution cancelled by Esc key.", status="warning")
+                continue
+
             if response_msg.pending_action:
                 import questionary
                 from ultron.core.tools.registry import get_tool
 
                 action = response_msg.pending_action
+                state.status = f"Executing Tool: {action.action_type}"
 
-                # Show a confirmation panel describing the action BEFORE asking.
-                # Each action type gets its own panel text so the user knows
-                # exactly what will happen if they choose "Yes, allow".
                 if action.action_type == "run_command":
-                    console.print(Panel(
-                        f"Action: Execute terminal command\n[bold #ffcc00]{action.target}[/bold #ffcc00]",
+                    UI.render_action_card(
                         title="Confirmation Required",
-                        border_style="#ff9500",
-                        padding=(0, 1)
-                    ))
+                        action="Execute terminal command",
+                        target=action.target,
+                    )
                 elif action.action_type == "read_file":
-                    # Reading exposes file contents — confirm before proceeding
-                    console.print(Panel(
-                        f"Action: Read file\nTarget: [bold #ffcc00]{action.target}[/bold #ffcc00]",
+                    UI.render_action_card(
                         title="Confirmation Required",
-                        border_style="#ff9500",
-                        padding=(0, 1)
-                    ))
+                        action="Read file",
+                        target=action.target,
+                    )
                 elif action.action_type == "write_file":
-                    # Creating a new file — show a content preview so the user
-                    # can verify what will be written before committing
-                    preview = (action.content or "")[:100]
-                    preview_str = preview + ("…" if len(action.content or "") > 100 else "")
-                    console.print(Panel(
-                        f"Action: Create new file\n"
-                        f"Target: [bold #ffcc00]{action.target}[/bold #ffcc00]\n"
-                        f"Content preview: [dim]{preview_str}[/dim]",
+                    preview = (action.content or "")[:120]
+                    if len(action.content or "") > 120:
+                        preview += "…"
+                    UI.render_action_card(
                         title="Confirmation Required",
-                        border_style="#ff9500",
-                        padding=(0, 1)
-                    ))
+                        action="Create new file",
+                        target=action.target,
+                        preview=preview,
+                    )
                 elif action.action_type == "overwrite_file":
-                    console.print(Panel(
-                        f"Action: Overwrite existing file\nTarget: [bold #ffcc00]{action.target}[/bold #ffcc00]",
+                    UI.render_action_card(
                         title="Confirmation Required",
-                        border_style="#ff9500",
-                        padding=(0, 1)
-                    ))
+                        action="Overwrite existing file",
+                        target=action.target,
+                    )
+                else:
+                    UI.render_action_card(
+                        title="Confirmation Required",
+                        action=action.action_type,
+                        target=action.target or "",
+                    )
 
                 choice = await questionary.select(
                     "Do you want to allow this action?",
-                    choices=["Yes, allow", "No, don't allow"]
+                    choices=["Yes, allow", "No, don't allow"],
                 ).ask_async()
+
+                result: str = "Error: Unknown action type."
 
                 if choice == "Yes, allow":
                     if action.action_type == "run_command":
                         if action.target.startswith("http_request:"):
-                            # Parse target format: "http_request:<METHOD>:<URL>[:<BODY>]"
                             parts = action.target.split(":", 3)
                             method = parts[1]
                             url = parts[2]
@@ -375,17 +471,12 @@ async def async_chat():
                             run_cmd_func = get_tool("run_command")
                             result = run_cmd_func(action.target) if run_cmd_func else "Error: Tool 'run_command' not found."
 
-                            # Route output through the appropriate summarizer based on the
-                            # confirmed command.  Each summarizer converts raw terminal noise
-                            # into a clean, human-readable panel — consistent pattern for all.
                             if action.target.startswith("pytest"):
                                 result = summarize_pytest_output(result)
                             elif action.target.startswith("ruff check"):
                                 result = summarize_lint_output(result)
-                            # git log, git commit, custom commands, etc. pass through unchanged
 
                     elif action.action_type == "read_file":
-                        # Execute the actual file read now that the user has confirmed
                         read_func = get_tool("read_file")
                         raw = read_func(action.target) if read_func else "Error: Tool 'read_file' not found."
                         if str(raw).startswith("Error"):
@@ -394,7 +485,6 @@ async def async_chat():
                             result = f"Here are the contents of '{action.target}':\n\n{raw}"
 
                     elif action.action_type == "write_file":
-                        # Execute the new-file write now that the user has confirmed
                         write_func = get_tool("write_file")
                         result = write_func(action.target, action.content or "", overwrite=False) if write_func else "Error: Tool 'write_file' not found."
 
@@ -402,24 +492,34 @@ async def async_chat():
                         write_func = get_tool("write_file")
                         result = write_func(action.target, action.content or "", overwrite=True) if write_func else "Error: Tool 'write_file' not found."
 
-                    response_msg = ChatMessage(role=Role.ASSISTANT, content=result)
-                else:
-                    response_msg = ChatMessage(role=Role.ASSISTANT, content="Action cancelled by user.")
+                    else:
+                        result = f"Error: Unrecognised action type '{action.action_type}'."
 
-            # Render Ultron AI response panel
-            console.print(Panel(response_msg.content, title="Ultron", border_style="bold #ff5500", padding=(0, 1)))
-            console.print()
-            
-            # Append both the user message and assistant response to full history
-            history.append(ChatMessage(role=Role.USER, content=user_input))
-            history.append(response_msg)
-            
+                else:
+                    result = "Action cancelled by user."
+
+                response_msg = ChatMessage(role=Role.ASSISTANT, content=result)
+
+            state.status = "Ready"
+
+            import re
+            tool_match = re.match(r"^Executed tool '(?:\[bold cyan\])?([^'\]]+)(?:\[/bold cyan\])?':\n\n(.*)$", response_msg.content, re.DOTALL)
+            if tool_match:
+                tool_name = tool_match.group(1)
+                tool_output = tool_match.group(2)
+                UI.render_tool_execution(tool_name, tool_output)
+            else:
+                UI.render_response(response_msg.content)
+
+            history.append(ChatMessage(role=Role.USER, content=trimmed_input))
+            history.append(ChatMessage(role=Role.ASSISTANT, content=response_msg.content))
+
         except KeyboardInterrupt:
-            console.print("\n[bold yellow]Chat interrupted. Goodbye.[/bold yellow]")
+            UI.render_status("Chat interrupted. Goodbye.", status="warning")
             break
         except Exception as e:
             logger.error(f"Error during chat execution: {e}")
-            console.print(f"[bold red]Error[/bold red]: {e}\n")
+            UI.render_error(str(e), title="Runtime Error")
 
 @app.command()
 def chat():
