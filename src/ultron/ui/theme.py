@@ -289,6 +289,7 @@ class UI:
         table.add_row("/help",          "Show this help table.")
         table.add_row("/model",         "Select an available LLM model interactively.")
         table.add_row("/clear",         "Reset conversation history to start fresh.")
+        table.add_row("/reload",        "Reload code changes without restarting (recreates the agent, clears history).")
         table.add_row("/exit, /quit",   "Exit the chat session.")
         table.add_row("Esc",            "Cancel current task execution while model is thinking.")
 

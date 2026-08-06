@@ -2,6 +2,26 @@ import json
 import httpx
 
 
+def check_url_safety(url: str) -> str | None:
+    """
+    Helper function to verify URL safety.
+
+    Safety Rule:
+    Only allows requests to localhost ("http://localhost", "http://127.0.0.1")
+    or encrypted endpoints ("https://"). Plain unencrypted "http://" to non-localhost
+    hosts is blocked to avoid accidentally exposing sensitive data to third parties.
+
+    Returns None if safe, or an error string if blocked.
+    """
+    clean_url = url.strip()
+    is_localhost = clean_url.startswith("http://localhost") or clean_url.startswith("http://127.0.0.1")
+    is_https = clean_url.startswith("https://")
+
+    if not (is_localhost or is_https):
+        return "Error: only localhost or https URLs are allowed."
+    return None
+
+
 def make_http_request(method: str, url: str, body: str | None = None) -> str:
     """
     Makes an HTTP request (GET, POST, PUT, DELETE) to a specified URL and
@@ -27,14 +47,9 @@ def make_http_request(method: str, url: str, body: str | None = None) -> str:
     clean_url = url.strip()
 
     # --- Safety Check ---
-    # We check if the URL starts with secure https or a local development address.
-    # Plain "http://" to an external IP/domain sends data unencrypted across the internet,
-    # so we prevent the tool from executing those requests.
-    is_localhost = clean_url.startswith("http://localhost") or clean_url.startswith("http://127.0.0.1")
-    is_https = clean_url.startswith("https://")
-
-    if not (is_localhost or is_https):
-        return "Error: only localhost or https URLs are allowed."
+    safety_error = check_url_safety(clean_url)
+    if safety_error:
+        return safety_error
 
     # Prepare request body/JSON payload if provided for POST or PUT
     json_data = None

@@ -13,6 +13,19 @@ logger = get_logger("ultron.agents.simple")
 # command string, fact, topic, bool) or None/False if no match.
 # ---------------------------------------------------------------------------
 
+def extract_any_filename(text: str) -> str | None:
+    """
+    Extracts ANY token matching a filename pattern (word chars, hyphens, slashes, ending with an extension)
+    from text without requiring specific verb patterns.
+
+    Safe to use AFTER intent classification has already confirmed a file action category.
+    """
+    filename_pattern = r'[\w./-]+\.[a-zA-Z0-9]+'
+    match = re.search(rf'\b({filename_pattern})\b', text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return None
+
 def detect_greeting_intent(user_input: str) -> bool:
     """
     Detects if the user input is a simple conversational greeting (e.g. "hi", "hello", "hey", "hii", "greetings").
@@ -268,6 +281,38 @@ def detect_lint_intent(user_input: str) -> bool:
     )
     return bool(re.search(pattern, user_input, re.IGNORECASE))
 
+def detect_web_search_intent(user_input: str) -> str | None:
+    """
+    Detects if the user wants to search the web for information using regex.
+    Matches phrases like "search for X", "look up X", "google X", "find info on X".
+
+    Returns the extracted search query string if matched, otherwise None.
+    """
+    pattern = r'^\s*(?:please\s+)?(?:search\s+(?:the\s+web\s+)?for|look\s+up|google|find\s+info\s+on|search\s+for)\s+(?P<query>.+)\s*$'
+    match = re.search(pattern, user_input, re.IGNORECASE)
+    if match:
+        return match.group("query").strip()
+    return None
+
+def detect_fetch_page_intent(user_input: str) -> str | None:
+    """
+    Detects if the user wants to fetch and read a web page URL.
+    Matches phrases like "fetch this page X", "get the content of X", "read this url X".
+
+    Returns the extracted URL if matched, otherwise None.
+    """
+    # Look for http:// or https:// URL in input preceded by fetch/read/get phrasing
+    url_pattern = r'https?://[^\s]+'
+    phrase_pattern = r'\b(?:fetch(?:\s+this\s+page)?|get(?:\s+the\s+content\s+of)?|read(?:\s+this\s+url)?|scrape)\b'
+
+    if re.search(phrase_pattern, user_input, re.IGNORECASE):
+        url_match = re.search(url_pattern, user_input, re.IGNORECASE)
+        if url_match:
+            raw_url = url_match.group(0)
+            return re.sub(r'[\.,;\)]+$', '', raw_url).strip()
+
+    return None
+
 def detect_http_intent(user_input: str) -> tuple[str, str, str | None] | None:
     """
     Detects HTTP request intents using regular expressions and body/method rules.
@@ -438,75 +483,129 @@ async def plan_task(user_input: str, engine) -> list[dict] | None:
     return cleaned if cleaned else None
 
 
+def is_step_failure(action: str, result: str) -> bool:
+    """
+    Determines whether an action step result represents a failure.
+
+    Design rationale:
+    `run_command` needs special handling because a "successful" shell execution
+    (no Python exception) can still represent a failed command via a non-zero exit
+    code (e.g. "Exit code: 1\nOutput:..."), which is different from an "Error: ..."
+    string returned when exceptions or missing tools occur.
+    """
+    res_str = str(result)
+    if action == "run_command":
+        if res_str.startswith("Error"):
+            return True
+        exit_code_match = re.search(r'Exit code:\s*(\d+)', res_str, re.IGNORECASE)
+        if exit_code_match and exit_code_match.group(1) != "0":
+            return True
+        return False
+
+    return res_str.startswith("Error")
+
+
 async def execute_plan(steps: list[dict]) -> list[str]:
     """
     Executes a list of structured action steps produced by plan_task().
 
     Design decisions:
-    - We stop on the FIRST error rather than continuing with subsequent steps.
-      This is an intentional predictability guarantee: if step 2 failed, the
-      user can be certain step 3 never touched anything.  Continuing past
-      errors would leave the workspace in an unpredictable intermediate state.
-    - Each individual tool call is wrapped in try/except so a Python exception
-      (e.g. from a broken tool) is caught and recorded as an "Error: ..." entry
-      rather than crashing the whole plan.
-    - write_file is called with overwrite=True because the user already committed
-      to this plan by making the request — we don't need a second confirmation.
+    - Retries: Only `run_command` and `make_http_request` steps get automatic retries
+      (up to 3 attempts with a 1-second pause between attempts) because network or
+      timing glitches can cause temporary failures. File writes, reads, and memory
+      mutations are NOT retried silently to prevent duplicate writes or corrupted state.
+    - We stop on the FIRST unresolvable error rather than continuing with subsequent steps.
+      This is an intentional predictability guarantee: if step 2 failed, the user can be
+      certain step 3 never touched anything.
     """
+    import time
     from ultron.core.tools.registry import get_tool
 
     results: list[str] = []
+    retryable_actions = {"run_command", "make_http_request"}
 
     for i, step in enumerate(steps, start=1):
         action = step.get("action", "")
         label = f"Step {i} ({action})"
 
-        try:
-            if action == "read_file":
-                func = get_tool("read_file")
-                if not func:
-                    result = "Error: Tool 'read_file' not found in registry."
-                else:
-                    result = func(step["filename"])
+        max_attempts = 3 if action in retryable_actions else 1
+        last_result = ""
+        attempts_used = 0
 
-            elif action == "write_file":
-                func = get_tool("write_file")
-                if not func:
-                    result = "Error: Tool 'write_file' not found in registry."
-                else:
-                    # overwrite=True: the user approved this plan, no second prompt needed
-                    result = func(step["filename"], step["content"], overwrite=True)
+        for attempt in range(1, max_attempts + 1):
+            attempts_used = attempt
+            try:
+                if action == "read_file":
+                    func = get_tool("read_file")
+                    if not func:
+                        result = "Error: Tool 'read_file' not found in registry."
+                    else:
+                        result = func(step["filename"])
 
-            elif action == "run_command":
-                func = get_tool("run_command")
-                if not func:
-                    result = "Error: Tool 'run_command' not found in registry."
-                else:
-                    result = func(step["command"])
+                elif action == "write_file":
+                    func = get_tool("write_file")
+                    if not func:
+                        result = "Error: Tool 'write_file' not found in registry."
+                    else:
+                        # overwrite=True: the user approved this plan, no second prompt needed
+                        result = func(step["filename"], step["content"], overwrite=True)
 
-            elif action == "add_memory":
-                func = get_tool("add_memory")
-                if not func:
-                    result = "Error: Tool 'add_memory' not found in registry."
-                else:
-                    result = func(step["fact"])
+                elif action == "run_command":
+                    func = get_tool("run_command")
+                    if not func:
+                        result = "Error: Tool 'run_command' not found in registry."
+                    else:
+                        result = func(step["command"])
 
+                elif action == "make_http_request":
+                    func = get_tool("make_http_request")
+                    if not func:
+                        result = "Error: Tool 'make_http_request' not found in registry."
+                    else:
+                        result = func(
+                            step.get("method", "GET"),
+                            step["url"],
+                            step.get("body")
+                        )
+
+                elif action == "add_memory":
+                    func = get_tool("add_memory")
+                    if not func:
+                        result = "Error: Tool 'add_memory' not found in registry."
+                    else:
+                        result = func(step["fact"])
+
+                else:
+                    result = f"Error: unknown action type '{action}'"
+
+            except Exception as exc:
+                result = f"Error: {exc}"
+
+            last_result = str(result)
+
+            # If step succeeded (not a failure), break retry loop
+            if not is_step_failure(action, last_result):
+                break
+
+            # If retrying, pause 1 second before the next attempt
+            if attempt < max_attempts:
+                time.sleep(1)
+
+        # Format output entry based on success/failure and attempt count
+        if is_step_failure(action, last_result):
+            if max_attempts > 1:
+                entry = f"{label}: FAILED after {attempts_used} attempts. Last error: {last_result}"
             else:
-                result = f"Error: unknown action type '{action}'"
-
-        except Exception as exc:
-            # Catch any unexpected exception from the tool itself and record it
-            # so the rest of our reporting logic can treat it uniformly.
-            result = f"Error: {exc}"
-
-        entry = f"{label}: {result}"
-        results.append(entry)
-
-        # Stop on first error — don't execute further steps.
-        # The user should be able to trust that if this step failed,
-        # nothing after it was touched.
-        if str(result).startswith("Error"):
+                entry = f"{label}: {last_result}"
+            results.append(entry)
+            # Stop on first error — don't execute further steps.
             break
+        else:
+            if attempts_used > 1:
+                entry = f"{label}: [succeeded after {attempts_used} attempts] {last_result}"
+            else:
+                entry = f"{label}: {last_result}"
+            results.append(entry)
 
     return results
 
@@ -895,6 +994,8 @@ async def classify_intent(user_input: str, engine) -> str:
         "write_file",
         "run_command",
         "http_request",
+        "web_search",
+        "fetch_page",
         "git",
         "run_tests",
         "lint",
@@ -905,10 +1006,12 @@ async def classify_intent(user_input: str, engine) -> str:
 
     prompt = (
         "Classify the following user message into EXACTLY ONE of these categories:\n\n"
-        "- read_file: user wants to view or read the contents of a file, e.g. 'read main.py', 'show me config.json'\n"
+        "- read_file: user wants to view or read the contents of a local file, e.g. 'read main.py', 'show me config.json'\n"
         "- write_file: user wants to create, save, or write content to a file, e.g. 'write hello to test.txt', 'save this note in info.md'\n"
         "- run_command: user wants to execute a shell command, e.g. 'run ls', 'execute pwd'\n"
-        "- http_request: user wants to send an HTTP request or fetch a URL, e.g. 'fetch https://api.com', 'post to http://localhost:8000'\n"
+        "- http_request: user wants to send an HTTP API request (GET/POST/PUT/DELETE), e.g. 'post to http://localhost:8000'\n"
+        "- web_search: user wants to search the web or google for online information, e.g. 'search for Python 3.12 release date', 'look up FastAPI docs'\n"
+        "- fetch_page: user wants to fetch or read text from a specific web page URL, e.g. 'fetch this page https://example.com', 'read URL https://docs.python.org'\n"
         "- git: user wants to perform git operations like status, diff, log, or commit, e.g. 'check git status', 'show diff'\n"
         "- run_tests: user wants to run unit tests or pytest, e.g. 'test my code', 'run pytest'\n"
         "- lint: user wants to lint or check code quality, e.g. 'check for errors', 'run linter'\n"
@@ -938,6 +1041,12 @@ class SimpleAgent(BaseAgent):
     A simple agent that passes user input and history directly to the engine.
     """
 
+    def __init__(self, engine):
+        super().__init__(engine)
+        # Short-term "memory" for clarifying questions.
+        # Stores {"category": <str>} when Ultron asks a clarifying question (e.g. "which file?").
+        self._pending_clarification: dict | None = None
+
     async def run(self, user_input: str, history: list[ChatMessage] | None = None) -> ChatMessage:
         """
         Routes user input to the correct handler in priority order.
@@ -952,6 +1061,37 @@ class SimpleAgent(BaseAgent):
         a `pending_action` payload to the ChatMessage.  This signals main.py to
         prompt the user immediately with an interactive questionary menu.
         """
+        # Step -1: Check for pending clarification response from previous turn.
+        # This creates a simple one-turn "memory" for clarifying questions, so replies
+        # like "test.txt" are understood as directly answering "which file?" instead
+        # of needing to independently match a full detection pattern on their own.
+        if self._pending_clarification:
+            pending = self._pending_clarification
+            self._pending_clarification = None  # Clear immediately to avoid stale state
+
+            cat = pending.get("category")
+            if cat == "read_file":
+                filename = detect_file_read_intent(user_input) or user_input.strip()
+                if filename:
+                    return handle_file_read(filename)
+
+            elif cat == "write_file":
+                write_match = detect_file_write_intent(user_input)
+                if write_match:
+                    return handle_file_write(write_match[0], write_match[1], user_input=user_input)
+                # Fallback: treat user_input as filename with empty content
+                target_file = user_input.strip()
+                if target_file:
+                    return handle_file_write(target_file, "", user_input=user_input)
+
+            elif cat == "run_command":
+                cmd = detect_command_intent(user_input) or user_input.strip()
+                if cmd:
+                    return handle_command(cmd)
+
+        # Clear any leftover pending state if execution reached here
+        self._pending_clarification = None
+
         # Step 0: compound / multi-step request — must run FIRST so that
         #         "write X then read Y" is handled as a unit and not partially
         #         matched by a single-action detector below.
@@ -1003,6 +1143,30 @@ class SimpleAgent(BaseAgent):
         if http_match:
             return handle_http(*http_match)
 
+        # Step 4.88: Web search intent — before generic command detector
+        search_query = detect_web_search_intent(user_input)
+        if search_query:
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=f"Web search requested: '{search_query}'",
+                pending_action=PendingAction(
+                    action_type="web_search",
+                    target=search_query
+                )
+            )
+
+        # Step 4.9: Fetch web page intent — before generic command detector
+        fetch_url = detect_fetch_page_intent(user_input)
+        if fetch_url:
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=f"Web page fetch requested: '{fetch_url}'",
+                pending_action=PendingAction(
+                    action_type="fetch_page",
+                    target=fetch_url
+                )
+            )
+
         # Step 5: generic shell command ("run X" / "execute X")
         command = detect_command_intent(user_input)
         if command:
@@ -1017,9 +1181,10 @@ class SimpleAgent(BaseAgent):
 
         if category != "none":
             if category == "read_file":
-                re_filename = detect_file_read_intent(user_input)
+                re_filename = detect_file_read_intent(user_input) or extract_any_filename(user_input)
                 if re_filename:
                     return handle_file_read(re_filename)
+                self._pending_clarification = {"category": category}
                 return ChatMessage(
                     role=Role.ASSISTANT,
                     content="It sounds like you want to read a file — which file?"
@@ -1029,6 +1194,17 @@ class SimpleAgent(BaseAgent):
                 re_write_match = detect_file_write_intent(user_input)
                 if re_write_match:
                     return handle_file_write(re_write_match[0], re_write_match[1], user_input=user_input)
+                
+                # Try extracting any filename from text
+                extracted_fname = extract_any_filename(user_input)
+                if extracted_fname:
+                    self._pending_clarification = {"category": category}
+                    return ChatMessage(
+                        role=Role.ASSISTANT,
+                        content=f"I found the filename '{extracted_fname}' — what content should I write to it?"
+                    )
+
+                self._pending_clarification = {"category": category}
                 return ChatMessage(
                     role=Role.ASSISTANT,
                     content="It sounds like you want to write a file — which file and what content?"
@@ -1038,6 +1214,7 @@ class SimpleAgent(BaseAgent):
                 re_command = detect_command_intent(user_input)
                 if re_command:
                     return handle_command(re_command)
+                self._pending_clarification = {"category": category}
                 return ChatMessage(
                     role=Role.ASSISTANT,
                     content="It sounds like you want to run a command — which command?"
@@ -1047,6 +1224,40 @@ class SimpleAgent(BaseAgent):
                 re_http_match = detect_http_intent(user_input)
                 if re_http_match:
                     return handle_http(*re_http_match)
+
+            elif category == "web_search":
+                query = detect_web_search_intent(user_input) or user_input.strip()
+                if query:
+                    return ChatMessage(
+                        role=Role.ASSISTANT,
+                        content=f"Web search requested: '{query}'",
+                        pending_action=PendingAction(
+                            action_type="web_search",
+                            target=query
+                        )
+                    )
+
+            elif category == "fetch_page":
+                url = detect_fetch_page_intent(user_input)
+                if not url:
+                    # Extract any http:// or https:// URL if present
+                    url_match = re.search(r'https?://[^\s]+', user_input, re.IGNORECASE)
+                    if url_match:
+                        raw_url = url_match.group(0)
+                        url = re.sub(r'[\.,;\)]+$', '', raw_url).strip()
+                if url:
+                    return ChatMessage(
+                        role=Role.ASSISTANT,
+                        content=f"Web page fetch requested: '{url}'",
+                        pending_action=PendingAction(
+                            action_type="fetch_page",
+                            target=url
+                        )
+                    )
+                return ChatMessage(
+                    role=Role.ASSISTANT,
+                    content="It sounds like you want to fetch a web page — which URL?"
+                )
 
             elif category == "git":
                 re_git_cmd = detect_git_intent(user_input)
@@ -1071,4 +1282,5 @@ class SimpleAgent(BaseAgent):
 
         # Step 6: nothing matched — fall through to the LLM
         return await handle_llm_fallback(user_input, history or [], self.engine)
+
 

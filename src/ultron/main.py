@@ -192,6 +192,64 @@ async def handle_slash_command(
         console.print("[bold green]Conversation history cleared.[/bold green]\n")
         return True, False
 
+    if clean_cmd == "/reload":
+        # Plain-English note: This performs a "soft reload" by re-importing core modules
+        # and creating a fresh agent instance from scratch. In Python, importlib.reload()
+        # does not update existing object instances in-place; recreating the agent ensures
+        # predictable behavior without lingering old code references.
+        import importlib
+        from ultron.core.types import ChatMessage, Role
+
+        try:
+            # Reload core modules in dependency order
+            import ultron.core.tools.builtin.file_reader
+            import ultron.core.tools.builtin.file_writer
+            import ultron.core.tools.builtin.command_runner
+            import ultron.core.tools.builtin.http_client
+            import ultron.core.tools.builtin.web_search
+            import ultron.core.tools.memory.sqlite
+            import ultron.core.tools.registry
+            import ultron.core.agents.simple
+            import ultron.core.agents
+
+            importlib.reload(ultron.core.tools.builtin.file_reader)
+            importlib.reload(ultron.core.tools.builtin.file_writer)
+            importlib.reload(ultron.core.tools.builtin.command_runner)
+            importlib.reload(ultron.core.tools.builtin.http_client)
+            importlib.reload(ultron.core.tools.builtin.web_search)
+            importlib.reload(ultron.core.tools.memory.sqlite)
+            importlib.reload(ultron.core.tools.registry)
+            importlib.reload(ultron.core.agents.simple)
+            agents_mod = importlib.reload(ultron.core.agents)
+
+            # Re-create fresh agent instance from reloaded agents module
+            fresh_agent = agents_mod.get_agent("simple")
+
+            # Update caller's agent reference if applicable
+            if agent is not None:
+                # If caller passed a mutable dictionary or object wrapper, or if agent is used as global
+                pass  # Caller will receive fresh_agent via return or outer scope reference
+
+            # Reset history back to initial SYSTEM message
+            history.clear()
+            history.append(ChatMessage(role=Role.SYSTEM, content="You are Ultron, a helpful local AI assistant."))
+
+            if layout and state:
+                layout["header"].update(build_header(state))
+                layout["footer"].update(build_status_bar(state))
+                if live:
+                    live.update(layout, refresh=True)
+
+            console.print("[bold green]✓ Reloaded — fresh agent and tools loaded. Conversation history reset.[/bold green]\n")
+            # Store fresh agent reference on session object or return indication if needed
+            if session is not None:
+                session.reloaded_agent = fresh_agent
+
+        except Exception as exc:
+            console.print(f"[bold red]✗ Failed to reload modules:[/bold red] {exc}\n[dim]Continuing with existing working agent session.[/dim]\n")
+
+        return True, False
+
     console.print(f"[bold yellow]Unknown command:[/bold yellow] [cyan]{cmd}[/cyan]. Type [bold cyan]/help[/bold cyan] to see available commands.\n")
     return True, False
 
@@ -342,6 +400,9 @@ async def async_chat():
                     session=session,
                     state=state,
                 )
+                if hasattr(session, "reloaded_agent") and session.reloaded_agent is not None:
+                    agent = session.reloaded_agent
+                    session.reloaded_agent = None
                 if should_exit:
                     UI.render_status("Goodbye.", status="info")
                     break
@@ -378,6 +439,10 @@ async def async_chat():
                     pass
                 finally:
                     try:
+                        termios.tcflush(fd, termios.TCIFLUSH)
+                    except Exception:
+                        pass
+                    try:
                         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                     except Exception:
                         pass
@@ -396,6 +461,7 @@ async def async_chat():
                     await asyncio.sleep(0.05)
 
             cancel_event.set()
+            esc_thread.join(timeout=0.2)
 
             if agent_task.cancelled():
                 state.status = "Ready"
@@ -442,6 +508,18 @@ async def async_chat():
                     UI.render_action_card(
                         title="Confirmation Required",
                         action="Overwrite existing file",
+                        target=action.target,
+                    )
+                elif action.action_type == "web_search":
+                    UI.render_action_card(
+                        title="Confirmation Required",
+                        action="Search the web",
+                        target=action.target,
+                    )
+                elif action.action_type == "fetch_page":
+                    UI.render_action_card(
+                        title="Confirmation Required",
+                        action="Fetch web page",
                         target=action.target,
                     )
                 else:
@@ -491,6 +569,14 @@ async def async_chat():
                     elif action.action_type == "overwrite_file":
                         write_func = get_tool("write_file")
                         result = write_func(action.target, action.content or "", overwrite=True) if write_func else "Error: Tool 'write_file' not found."
+
+                    elif action.action_type == "web_search":
+                        search_func = get_tool("search_web")
+                        result = search_func(action.target) if search_func else "Error: Tool 'search_web' not found."
+
+                    elif action.action_type == "fetch_page":
+                        fetch_func = get_tool("fetch_page_text")
+                        result = fetch_func(action.target) if fetch_func else "Error: Tool 'fetch_page_text' not found."
 
                     else:
                         result = f"Error: Unrecognised action type '{action.action_type}'."

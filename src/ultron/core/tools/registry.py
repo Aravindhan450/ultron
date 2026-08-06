@@ -3,6 +3,7 @@ from ultron.core.tools.builtin.file_reader import read_file
 from ultron.core.tools.builtin.file_writer import write_file
 from ultron.core.tools.builtin.command_runner import run_command
 from ultron.core.tools.builtin.http_client import make_http_request
+from ultron.core.tools.builtin.web_search import fetch_page_text, search_web
 from ultron.core.tools.memory.sqlite import add_memory, get_all_memories, search_memories
 
 # A dictionary that maps a tool's name (as a string) to the actual Python function.
@@ -12,6 +13,8 @@ TOOLS: dict[str, Callable[..., Any]] = {
     "write_file": write_file,
     "run_command": run_command,
     "make_http_request": make_http_request,
+    "search_web": search_web,
+    "fetch_page_text": fetch_page_text,
     "add_memory": add_memory,
     "get_all_memories": get_all_memories,
     "search_memories": search_memories,

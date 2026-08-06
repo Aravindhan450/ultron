@@ -37,9 +37,10 @@ def setup_logging() -> None:
         handlers=[console_handler, file_handler],
     )
 
-    # Silence verbose HTTP status logs from httpx and httpcore
+    # Silence verbose HTTP status logs from httpx, httpcore, and primp
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("primp").setLevel(logging.WARNING)
 
 def get_logger(name: str) -> logging.Logger:
     """
