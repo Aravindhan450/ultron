@@ -313,6 +313,28 @@ def detect_fetch_page_intent(user_input: str) -> str | None:
 
     return None
 
+def detect_db_query_intent(user_input: str) -> str | None:
+    """
+    Detects if the user input requests running a database SQL query.
+    Matches phrases like "run this query: X", "query the database: X", "execute sql: X", "run sql X".
+
+    Returns the extracted raw SQL string if matched, otherwise None.
+    """
+    pattern = (
+        r'^\s*(?:please\s+)?'
+        r'(?:run\s+this\s+query[:\s]+'
+        r'|query\s+the\s+database[:\s]+'
+        r'|execute\s+sql[:\s]+'
+        r'|run\s+sql\s+'
+        r'|query[:\s]+'
+        r'|run\s+query[:\s]+)'
+        r'(?P<sql>.+)\s*$'
+    )
+    match = re.search(pattern, user_input, re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group("sql").strip()
+    return None
+
 def detect_http_intent(user_input: str) -> tuple[str, str, str | None] | None:
     """
     Detects HTTP request intents using regular expressions and body/method rules.
@@ -1166,6 +1188,24 @@ class SimpleAgent(BaseAgent):
                     target=fetch_url
                 )
             )
+
+        # Step 4.95: Database query intent — before generic command detector
+        # Read-only SELECT queries execute immediately; non-SELECT queries emit a PendingAction confirmation
+        db_sql = detect_db_query_intent(user_input)
+        if db_sql:
+            from ultron.core.tools.builtin.database import is_readonly_query, run_query
+            if is_readonly_query(db_sql):
+                result = run_query(db_sql)
+                return ChatMessage(role=Role.ASSISTANT, content=result)
+            else:
+                return ChatMessage(
+                    role=Role.ASSISTANT,
+                    content=f"Database query execution requested: '{db_sql}'",
+                    pending_action=PendingAction(
+                        action_type="db_query",
+                        target=db_sql
+                    )
+                )
 
         # Step 5: generic shell command ("run X" / "execute X")
         command = detect_command_intent(user_input)

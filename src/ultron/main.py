@@ -240,7 +240,10 @@ async def handle_slash_command(
                 if live:
                     live.update(layout, refresh=True)
 
-            console.print("[bold green]✓ Reloaded — fresh agent and tools loaded. Conversation history reset.[/bold green]\n")
+            console.print(
+                "[bold green]✓ Reloaded — fresh agent and tools loaded. Conversation history reset.[/bold green]\n"
+                "[dim]Note: reload is best-effort. If your changes don't appear, exit (/exit) and restart 'ultron chat' for a guaranteed clean reload.[/dim]\n"
+            )
             # Store fresh agent reference on session object or return indication if needed
             if session is not None:
                 session.reloaded_agent = fresh_agent
@@ -522,6 +525,14 @@ async def async_chat():
                         action="Fetch web page",
                         target=action.target,
                     )
+                elif action.action_type == "db_query":
+                    # Note: db_query represents a higher-risk action type because non-SELECT queries
+                    # modify or delete database state, so explicit interactive confirmation is required.
+                    UI.render_action_card(
+                        title="Database Warning: Confirmation Required",
+                        action="Execute database query",
+                        target=action.target,
+                    )
                 else:
                     UI.render_action_card(
                         title="Confirmation Required",
@@ -577,6 +588,10 @@ async def async_chat():
                     elif action.action_type == "fetch_page":
                         fetch_func = get_tool("fetch_page_text")
                         result = fetch_func(action.target) if fetch_func else "Error: Tool 'fetch_page_text' not found."
+
+                    elif action.action_type == "db_query":
+                        query_func = get_tool("run_query")
+                        result = query_func(action.target) if query_func else "Error: Tool 'run_query' not found."
 
                     else:
                         result = f"Error: Unrecognised action type '{action.action_type}'."

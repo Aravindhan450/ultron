@@ -1,0 +1,9 @@
+python3 << 'EOF'
+import sqlite3
+conn = sqlite3.connect('test_db.sqlite')
+conn.execute('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)')
+conn.execute("INSERT INTO users (name) VALUES ('Aravind')")
+conn.commit()
+conn.close()
+print("Setup complete.")
+EOF

@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default_factory=lambda: Path.home() / ".ultron")
     memory_backend: Literal["sqlite", "json", "in-memory"] = "sqlite"
     security_mode: Literal["strict", "permissive", "interactive"] = "interactive"
+    database_type: Literal["sqlite", "postgres"] = "sqlite"
+    database_url: str | None = None
 
 # Global settings singleton
 settings = Settings()

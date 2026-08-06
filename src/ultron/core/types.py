@@ -28,6 +28,7 @@ class PendingAction(BaseModel):
         "write_file",
         "web_search",
         "fetch_page",
+        "db_query",
     ]
     target: str          # The command string OR the filename/query/URL to act upon
     content: str | None = None  # Content to write if action_type is "write_file" or "overwrite_file"
