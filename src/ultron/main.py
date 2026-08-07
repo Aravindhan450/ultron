@@ -11,6 +11,9 @@ logger = get_logger("ultron.cli")
 
 app = typer.Typer(name="ultron", help="Ultron AI Assistant CLI")
 
+# Valid security modes for the /security slash command.
+SECURITY_MODES = ("permissive", "interactive", "strict")
+
 def version_callback(value: bool):
     if value:
         typer.echo(f"ultron version: {__version__}")
@@ -102,6 +105,50 @@ def print_help_table(console):
     UI.render_help_table()
 
 
+def render_security_status(console, mode: str) -> None:
+    """
+    Prints the active security mode and how each risk tier maps to a decision
+    under that mode, plus the guardrail summary.
+    """
+    from rich import box
+    from rich.panel import Panel
+    from rich.table import Table
+
+    from ultron.security import Decision, RiskTier, SecurityBoundary
+
+    policy = SecurityBoundary(mode=mode)
+
+    table = Table(box=box.ROUNDED, expand=False)
+    table.add_column("Risk tier", style="bold #ffcc00")
+    table.add_column("Decision", style="bold white")
+    table.add_column("What happens", style="dim")
+
+    for tier in RiskTier:
+        decision = policy.decide(tier)
+        note = {
+            Decision.ALLOW: "runs automatically",
+            Decision.CONFIRM: "requires your approval",
+            Decision.DENY: "hard-blocked",
+        }[decision]
+        if tier == RiskTier.MEDIUM:
+            note += " (reserved — no action maps to it yet)"
+        table.add_row(tier.value, decision.value, note)
+
+    console.print(
+        Panel(
+            table,
+            title=f"[bold #ffcc00]🔒 Security mode: {mode}[/bold #ffcc00]",
+            border_style="#ff8700",
+            box=box.ROUNDED,
+        )
+    )
+    console.print(
+        "[dim]Guardrails always hard-block leaked credentials, unsafe URLs, and "
+        "path escapes. "
+        f"Switch anytime with /security <{'|'.join(SECURITY_MODES)}>.[/dim]\n"
+    )
+
+
 async def handle_slash_command(
     cmd: str,
     console,
@@ -177,6 +224,124 @@ async def handle_slash_command(
                 )
             )
             console.print()
+
+        return True, False
+
+    if clean_cmd == "/agent" or clean_cmd.startswith("/agent "):
+        import questionary
+        from rich import box
+        from rich.panel import Panel
+
+        from ultron.core.agents import SUPPORTED_AGENTS, get_agent
+
+        # /agent <type> switches directly; a bare /agent shows a picker
+        # (pre-selecting the current agent when known).
+        requested = clean_cmd[len("/agent"):].strip()
+        if requested:
+            selected = requested
+        else:
+            current_type = getattr(session, "active_agent_type", None)
+            selected = await questionary.select(
+                "Select agent type:",
+                choices=list(SUPPORTED_AGENTS),
+                default=current_type if current_type in SUPPORTED_AGENTS else None,
+            ).ask_async()
+
+        if not selected:
+            return True, False  # user cancelled the picker
+
+        if selected not in SUPPORTED_AGENTS:
+            console.print(
+                f"[bold red]Unknown agent type:[/bold red] [cyan]{selected}[/cyan]. "
+                f"Available: {', '.join(SUPPORTED_AGENTS)}.\n"
+            )
+            return True, False
+
+        try:
+            # Reuse the live engine so the current model (and any other live
+            # engine state) carries over exactly; the factory still chooses the
+            # class from the single SUPPORTED_AGENTS contract.
+            new_agent = get_agent(selected, engine=getattr(agent, "engine", None))
+        except ValueError as exc:
+            console.print(f"[bold red]✗ Failed to switch agent:[/bold red] {exc}\n")
+            return True, False
+
+        old_type = getattr(session, "active_agent_type", type(agent).__name__ if agent else "none")
+
+        # Queue the new agent for the chat loop, which swaps it in on the next
+        # iteration (same hand-off pattern as /reload). History is preserved.
+        if session is not None:
+            session.next_agent = new_agent
+            session.active_agent_type = selected
+            console.print(
+                Panel(
+                    f"[bold green]✓ Switched agent to '{selected}'[/bold green]\n"
+                    f"[dim]{old_type}[/] ➔ [bold magenta]{selected}[/]",
+                    box=box.ROUNDED,
+                    expand=False,
+                )
+            )
+            console.print()
+        else:
+            console.print(
+                "[bold yellow]⚠ Switched agent, but no active session to apply it to.[/bold yellow]\n"
+            )
+        return True, False
+
+    if clean_cmd == "/security" or clean_cmd.startswith("/security "):
+        import os
+
+        import questionary
+        from rich import box
+        from rich.panel import Panel
+
+        from ultron.core.agents.security import get_security
+        from ultron.core.config import settings, update_env_file
+
+        current = getattr(get_security(), "mode", None) or settings.security_mode
+
+        # Show the current status up front so the user sees what they have
+        # before deciding whether to change it.
+        render_security_status(console, current)
+
+        requested = clean_cmd[len("/security"):].strip()
+        if requested:
+            selected = requested
+            if selected not in SECURITY_MODES:
+                console.print(
+                    f"[bold red]Unknown security mode:[/bold red] [cyan]{selected}[/cyan]. "
+                    "Available: "
+                    f"{', '.join(SECURITY_MODES)}.\n"
+                )
+                return True, False
+        else:
+            selected = await questionary.select(
+                "Security mode:",
+                choices=list(SECURITY_MODES),
+                default=current if current in SECURITY_MODES else None,
+            ).ask_async()
+            if not selected:
+                return True, False  # cancelled — current mode stays
+
+        if selected != current:
+            # Apply the switch live: the shared boundary the agents use, the
+            # settings object, the process env, and the .env file on disk.
+            get_security().mode = selected
+            settings.security_mode = selected
+            os.environ["ULTRON_SECURITY_MODE"] = selected
+            update_env_file("ULTRON_SECURITY_MODE", selected)
+
+            console.print(
+                Panel(
+                    f"[bold green]✓ Switched security mode:[/bold green] "
+                    f"[dim]{current}[/] ➔ [bold magenta]{selected}[/]\n"
+                    f"[dim]persisted to ULTRON_SECURITY_MODE in .env[/dim]",
+                    box=box.ROUNDED,
+                    expand=False,
+                )
+            )
+            console.print()
+            render_security_status(console, selected)
 
         return True, False
 
@@ -337,7 +502,7 @@ def summarize_lint_output(raw_output: str) -> str:
     except Exception:
         return raw_output
 
-async def async_chat():
+async def async_chat(agent_type: str = "simple"):
     """
     Asynchronous runner for the interactive chat session powered by Rich Live & Layout.
     """
@@ -357,11 +522,12 @@ async def async_chat():
 
     session = PromptSession()
     session.active_model = state.active_model
+    session.active_agent_type = agent_type
 
     layout = build_layout(state)
 
     try:
-        agent = get_agent("simple")
+        agent = get_agent(agent_type)
     except Exception as e:
         logger.error(f"Failed to initialize agent: {e}")
         console.print(f"[bold red]Initialization Error[/bold red]: {e}")
@@ -382,8 +548,9 @@ async def async_chat():
         try:
             state.status = "Ready"
 
+            agent_tag = getattr(session, "active_agent_type", agent_type)
             user_input = await session.prompt_async(
-                HTML(f"<b><cyan>[{state.active_model}]</cyan> <blue>You</blue></b>: ")
+                HTML(f"<b><cyan>[{state.active_model} | {agent_tag}]</cyan> <blue>You</blue></b>: ")
             )
             trimmed_input = user_input.strip()
 
@@ -406,6 +573,10 @@ async def async_chat():
                 if hasattr(session, "reloaded_agent") and session.reloaded_agent is not None:
                     agent = session.reloaded_agent
                     session.reloaded_agent = None
+                # /agent queues a fresh instance here; swap it in for the next turn.
+                if getattr(session, "next_agent", None) is not None:
+                    agent = session.next_agent
+                    session.next_agent = None
                 if should_exit:
                     UI.render_status("Goodbye.", status="info")
                     break
@@ -623,11 +794,18 @@ async def async_chat():
             UI.render_error(str(e), title="Runtime Error")
 
 @app.command()
-def chat():
+def chat(
+    agent: str = typer.Option(
+        "simple",
+        "--agent",
+        "-a",
+        help="Agent type to use (simple or react).",
+    ),
+):
     """
     Start an interactive text chat session with Ultron.
     """
-    asyncio.run(async_chat())
+    asyncio.run(async_chat(agent_type=agent))
 
 @app.command()
 def logs(

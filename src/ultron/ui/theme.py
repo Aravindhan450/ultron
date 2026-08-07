@@ -288,6 +288,8 @@ class UI:
 
         table.add_row("/help",          "Show this help table.")
         table.add_row("/model",         "Select an available LLM model interactively.")
+        table.add_row("/agent",         "Switch agent type (simple or react); use /agent <type> to skip the picker.")
+        table.add_row("/security",      "Show security mode + tier policy; use /security <permissive|interactive|strict> to switch.")
         table.add_row("/clear",         "Reset conversation history to start fresh.")
         table.add_row("/reload",        "Best-effort code reload without restarting (may not catch all changes; restart if unsure).")
         table.add_row("/exit, /quit",   "Exit the chat session.")

@@ -2,10 +2,93 @@ import re
 import json
 import asyncio
 from ultron.core.agents.base import BaseAgent
+from ultron.core.agents.security import (
+    blocked_message,
+    check_action,
+    is_allow,
+    is_confirm,
+    is_denied,
+    security_mode,
+)
 from ultron.core.logging import get_logger
 from ultron.core.types import ChatMessage, Role, PendingAction, history_to_openai_format
 
 logger = get_logger("ultron.agents.simple")
+
+
+# ---------------------------------------------------------------------------
+# Shared execution + security-mapping helpers
+# ---------------------------------------------------------------------------
+
+def execute_tool(tool_name: str, **kwargs) -> str:
+    """
+    Executes a registered tool directly and returns its output as a string.
+
+    Used by paths the security boundary classifies as auto-allowed (LOW risk
+    or a permissive mode). Returns an error string if the tool is missing or
+    raises, so the failure surfaces as a message instead of a crash.
+    """
+    from ultron.core.tools.registry import get_tool
+    func = get_tool(tool_name)
+    if not func:
+        return f"Error: Tool '{tool_name}' not found in registry."
+    try:
+        return str(func(**kwargs))
+    except Exception as exc:
+        return f"Error executing tool '{tool_name}': {exc}"
+
+
+def _generic_target_content(tool_name: str, arguments: dict) -> tuple[str, str | None]:
+    """
+    Maps a tool call's arguments to the (target, content) pair the security
+    boundary expects for classification and guardrail scanning.
+    """
+    if tool_name == "read_file":
+        return str(arguments.get("file_path", "")), None
+    if tool_name == "web_search":
+        return str(arguments.get("query", "")), None
+    if tool_name == "fetch_page_text":
+        return str(arguments.get("url", "")), None
+    if tool_name == "search_memories":
+        return str(arguments.get("keyword", "")), None
+    if tool_name == "add_memory":
+        return "", str(arguments.get("fact", ""))
+    return "", None
+
+
+def _step_target_content(step: dict) -> tuple[str, str | None]:
+    """
+    Maps a multi-step plan step to the (target, content) pair the boundary
+    uses to gate the step before execution.
+    """
+    action = step.get("action", "")
+    if action == "read_file":
+        return str(step.get("filename", "")), None
+    if action == "write_file":
+        return str(step.get("filename", "")), str(step.get("content", ""))
+    if action == "run_command":
+        return str(step.get("command", "")), None
+    if action == "make_http_request":
+        return str(step.get("url", "")), str(step.get("body") or step.get("method", ""))
+    if action == "add_memory":
+        return "", str(step.get("fact", ""))
+    return "", None
+
+
+def _gate_command(command: str) -> ChatMessage | None:
+    """
+    Gates a shell command through the security boundary.
+
+    Returns a blocked or auto-executed ChatMessage when the boundary denies or
+    allows the command directly; returns None when the command needs
+    interactive confirmation (the caller should emit a PendingAction).
+    """
+    verdict = check_action("run_command", command)
+    if is_denied(verdict):
+        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+    if is_allow(verdict):
+        return ChatMessage(role=Role.ASSISTANT, content=execute_tool("run_command", command=command))
+    return None
 
 # ---------------------------------------------------------------------------
 # Detectors
@@ -550,6 +633,21 @@ async def execute_plan(steps: list[dict]) -> list[str]:
         action = step.get("action", "")
         label = f"Step {i} ({action})"
 
+        # Security gate per step. A DENY verdict (secret exfiltration, unsafe
+        # URL, path escape) hard-blocks the step and stops the plan — a step
+        # that is blocked never runs, and nothing after it runs either.
+        # CONFIRM steps run because the plan itself is the user's explicit
+        # directive — except in strict mode, where anything above LOW risk is
+        # skipped until the user approves it separately.
+        target, content = _step_target_content(step)
+        verdict = check_action(action, target, content)
+        if is_denied(verdict):
+            results.append(f"{label}: BLOCKED by security — {blocked_message(verdict)}")
+            break
+        if is_confirm(verdict) and security_mode() == "strict":
+            results.append(f"{label}: skipped — requires your approval ({verdict.reason})")
+            break
+
         max_attempts = 3 if action in retryable_actions else 1
         last_result = ""
         attempts_used = 0
@@ -651,18 +749,26 @@ def handle_greeting() -> ChatMessage:
 
 def handle_file_read(filename: str) -> ChatMessage:
     """
-    Signals main.py to show an interactive confirmation before reading a file.
-    Reading a file exposes its contents, so it follows the same confirmation
-    pattern as running commands — the user sees what will happen and can
-    allow or cancel before anything is executed.
+    Reads a file, gated by the security boundary.
+
+    File reads are LOW risk and auto-allowed in every security mode, so they
+    execute directly. The guardrails deny reads that escape the allowed
+    working directory (path escape) — those are blocked here before any
+    filesystem access.
     """
+    verdict = check_action("read_file", filename)
+    if is_denied(verdict):
+        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+
+    result = execute_tool("read_file", file_path=filename)
+    if str(result).startswith("Error"):
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=f"Sorry, I could not find or read the file '{filename}'.",
+        )
     return ChatMessage(
         role=Role.ASSISTANT,
-        content=f"File read requested: '{filename}'",
-        pending_action=PendingAction(
-            action_type="read_file",
-            target=filename
-        )
+        content=f"Here are the contents of '{filename}':\n\n{result}",
     )
 
 def handle_file_write(filename: str, content: str, user_input: str = "") -> ChatMessage:
@@ -684,6 +790,20 @@ def handle_file_write(filename: str, content: str, user_input: str = "") -> Chat
             role=Role.ASSISTANT,
             content="Sorry, I couldn't determine the file name from your request. "
                     "Please specify a filename with an extension, e.g. 'notes.txt'.",
+        )
+
+    # Security gate: classify the write and scan the content (secrets, PII)
+    # before anything touches the filesystem. A denial hard-blocks here — the
+    # action is never offered for confirmation.
+    verdict = check_action("write_file", filename, content)
+    if is_denied(verdict):
+        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+
+    # Permissive mode auto-allows file writes — execute directly.
+    if is_allow(verdict):
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=execute_tool("write_file", filename=filename, content=content, overwrite=True),
         )
 
     # Resolve to absolute path the same way file_writer.py does
@@ -726,7 +846,13 @@ def handle_file_write(filename: str, content: str, user_input: str = "") -> Chat
     )
 
 def handle_remember(fact: str) -> ChatMessage:
-    """Stores a new fact in the SQLite memory store and confirms to the user."""
+    """
+    Stores a new fact in the SQLite memory store, gated by the security
+    boundary (which blocks outgoing content carrying credential-like data).
+    """
+    verdict = check_action("add_memory", "", fact)
+    if is_denied(verdict):
+        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
     from ultron.core.tools.registry import get_tool
     func = get_tool("add_memory")
     tool_result = func(fact) if func else "Error: Tool 'add_memory' not found in registry."
@@ -738,6 +864,9 @@ def handle_memory_question(topic: str) -> ChatMessage:
     topic keyword — never all memories.  Built directly from DB rows so the
     AI is never involved and cannot hallucinate stored facts.
     """
+    verdict = check_action("search_memories", topic)
+    if is_denied(verdict):
+        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
     from ultron.core.tools.registry import get_tool
     func = get_tool("search_memories")
     matches = func(topic) if func else []
@@ -754,7 +883,16 @@ def handle_memory_question(topic: str) -> ChatMessage:
     )
 
 def handle_test() -> ChatMessage:
-    """Signals main.py to confirm and run pytest -v via the run_command tool."""
+    """
+    Runs pytest -v, gated by the security boundary.
+
+    pytest is a read-only command (LOW risk), so it auto-executes in every
+    mode; a confirmation prompt only appears if the security mode classifies
+    it otherwise.
+    """
+    blocked = _gate_command("pytest -v")
+    if blocked is not None:
+        return blocked
     return ChatMessage(
         role=Role.ASSISTANT,
         content="Test execution requested: 'pytest -v'",
@@ -766,10 +904,15 @@ def handle_test() -> ChatMessage:
 
 def handle_git(command: str) -> ChatMessage:
     """
-    Signals main.py to confirm and run a git command via the run_command tool.
-    Zero new infrastructure — the same PendingAction / confirmation flow used
-    for all other shell commands.
+    Runs a git command, gated by the security boundary.
+
+    Read-only git commands (status/diff/log) are LOW risk and auto-execute;
+    state-changing ones (e.g. ``git add -A && git commit``) need interactive
+    confirmation via the PendingAction flow.
     """
+    blocked = _gate_command(command)
+    if blocked is not None:
+        return blocked
     return ChatMessage(
         role=Role.ASSISTANT,
         content=f"Git command requested: '{command}'",
@@ -781,11 +924,14 @@ def handle_git(command: str) -> ChatMessage:
 
 def handle_lint() -> ChatMessage:
     """
-    Signals main.py to confirm and run ruff in concise mode.
-    --output-format=concise produces one issue-per-line output that
-    summarize_lint_output() in main.py can parse reliably.
+    Runs ruff in concise mode, gated by the security boundary.
+
+    ruff is a read-only command (LOW risk), so it auto-executes in every mode.
     """
     ruff_cmd = "ruff check . --output-format=concise"
+    blocked = _gate_command(ruff_cmd)
+    if blocked is not None:
+        return blocked
     return ChatMessage(
         role=Role.ASSISTANT,
         content=f"Lint check requested: '{ruff_cmd}'",
@@ -796,7 +942,17 @@ def handle_lint() -> ChatMessage:
     )
 
 def handle_command(command: str) -> ChatMessage:
-    """Signals main.py to confirm and run an arbitrary shell command."""
+    """
+    Runs a shell command, gated by the security boundary.
+
+    Read-only commands (ls, cat, git status, pytest, …) are LOW risk and
+    auto-execute; state-changing commands need interactive confirmation;
+    dangerous patterns are escalated to CRITICAL and still require
+    confirmation (the user keeps the final say).
+    """
+    blocked = _gate_command(command)
+    if blocked is not None:
+        return blocked
     return ChatMessage(
         role=Role.ASSISTANT,
         content=f"Command execution requested: '{command}'",
@@ -808,28 +964,29 @@ def handle_command(command: str) -> ChatMessage:
 
 def handle_http(method: str, url: str, body: str | None = None) -> ChatMessage:
     """
-    Handles HTTP request intents.
+    Handles HTTP request intents, gated by the security boundary.
 
     Safety & Security Policy:
-    1. Restrict unencrypted 'http://' to localhost / 127.0.0.1 only. Enforce 'https://' for external hosts.
-    2. Read-only GET requests (to localhost or external HTTPS endpoints) bypass interactive confirmation
-       and execute immediately.
-    3. State-modifying requests (POST, PUT, DELETE, PATCH) emit a PendingAction interactive confirmation request.
+    1. The guardrails deny non-https / non-localhost URLs before anything runs.
+    2. GET requests (auto-allowed, LOW risk) execute immediately.
+    3. State-modifying requests (POST, PUT, DELETE, PATCH) are HIGH risk and
+       emit a PendingAction confirmation — except in a permissive mode, where
+       they auto-execute.
     """
     from ultron.core.tools.registry import get_tool
 
-    # Security check: allow http:// ONLY for localhost / 127.0.0.1; require https:// for all external URLs.
-    is_localhost = url.startswith("http://localhost") or url.startswith("http://127.0.0.1")
-    is_https = url.startswith("https://")
-
-    if not (is_localhost or is_https):
-        return ChatMessage(
-            role=Role.ASSISTANT,
-            content="Error: only localhost or https URLs are allowed."
-        )
-
     method_upper = method.strip().upper()
     is_state_modifying = method_upper in {"POST", "PUT", "DELETE", "PATCH"}
+
+    # Security gate: URL safety + method classification happen here.
+    verdict = check_action("make_http_request", url, content=body or method)
+    if is_denied(verdict):
+        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+
+    # Permissive mode auto-allows state-changing requests.
+    if is_state_modifying and is_allow(verdict):
+        result = execute_tool("make_http_request", method=method_upper, url=url, body=body)
+        return ChatMessage(role=Role.ASSISTANT, content=result)
 
     # Emit PendingAction confirmation prompt for state-modifying HTTP methods
     if is_state_modifying:
@@ -952,9 +1109,19 @@ async def handle_llm_fallback(
 
             func = get_tool(tool_name)
             if func:
-                # Security Check: Route state-modifying actions through PendingAction flow
+                # Security Check: every tool call is gated by the boundary
+                # before execution — deny blocks, allow executes directly,
+                # confirm routes through the PendingAction flow.
                 if tool_name == "run_command":
                     cmd = arguments.get("command", "")
+                    verdict = check_action("run_command", cmd)
+                    if is_denied(verdict):
+                        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+                    if is_allow(verdict):
+                        return ChatMessage(
+                            role=Role.ASSISTANT,
+                            content=execute_tool("run_command", command=cmd),
+                        )
                     return ChatMessage(
                         role=Role.ASSISTANT,
                         content=f"Command execution requested: '{cmd}'",
@@ -968,7 +1135,12 @@ async def handle_llm_fallback(
                     content = arguments.get("content", "")
                     return handle_file_write(fname, content, user_input=user_input)
 
-                # Direct execution for read-only tools or non-destructive operations
+                # Direct execution for read-only tools or non-destructive
+                # operations — still gated so a denied action never runs.
+                target, content = _generic_target_content(tool_name, arguments)
+                verdict = check_action(tool_name, target, content)
+                if is_denied(verdict):
+                    return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
                 try:
                     tool_result = func(**arguments)
                 except Exception as exc:
@@ -981,11 +1153,15 @@ async def handle_llm_fallback(
         except Exception as exc:
             logger.debug(f"Failed to parse tool call JSON from LLM: {exc}")
 
-    # Legacy TOOL_CALL: read_file: fallback compatibility
+    # Legacy TOOL_CALL: read_file: fallback compatibility — still gated by
+    # the security boundary so a path-escape read can never execute here.
     if "TOOL_CALL: read_file:" in response_content:
         for line in response_content.splitlines():
             if "TOOL_CALL: read_file:" in line:
                 file_path = line.split("TOOL_CALL: read_file:")[1].strip()
+                verdict = check_action("read_file", file_path)
+                if is_denied(verdict):
+                    return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
                 read_file_func = get_tool("read_file")
                 tool_result = read_file_func(file_path) if read_file_func else "Error: Tool 'read_file' not found."
                 return ChatMessage(
@@ -1165,39 +1341,42 @@ class SimpleAgent(BaseAgent):
         if http_match:
             return handle_http(*http_match)
 
-        # Step 4.88: Web search intent — before generic command detector
+        # Step 4.88: Web search intent — before generic command detector.
+        # Web searches are LOW risk and auto-allowed, so they execute directly
+        # (the guardrails deny credential-like queries).
         search_query = detect_web_search_intent(user_input)
         if search_query:
+            verdict = check_action("web_search", search_query)
+            if is_denied(verdict):
+                return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
             return ChatMessage(
                 role=Role.ASSISTANT,
-                content=f"Web search requested: '{search_query}'",
-                pending_action=PendingAction(
-                    action_type="web_search",
-                    target=search_query
-                )
+                content=execute_tool("search_web", query=search_query),
             )
 
-        # Step 4.9: Fetch web page intent — before generic command detector
+        # Step 4.9: Fetch web page intent — before generic command detector.
+        # Page fetches are LOW risk and auto-allowed; unsafe URLs (non-https /
+        # non-localhost) are denied by the guardrails before any request fires.
         fetch_url = detect_fetch_page_intent(user_input)
         if fetch_url:
+            verdict = check_action("fetch_page_text", fetch_url)
+            if is_denied(verdict):
+                return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
             return ChatMessage(
                 role=Role.ASSISTANT,
-                content=f"Web page fetch requested: '{fetch_url}'",
-                pending_action=PendingAction(
-                    action_type="fetch_page",
-                    target=fetch_url
-                )
+                content=execute_tool("fetch_page_text", url=fetch_url),
             )
 
-        # Step 4.95: Database query intent — before generic command detector
-        # Read-only SELECT queries execute immediately; non-SELECT queries emit a PendingAction confirmation
+        # Step 4.95: Database query intent — before generic command detector.
+        # The boundary verdict decides: read-only SQL auto-executes, destructive
+        # or state-changing SQL is confirmed, and anything denied never runs.
         db_sql = detect_db_query_intent(user_input)
         if db_sql:
-            from ultron.core.tools.builtin.database import is_readonly_query, run_query
-            if is_readonly_query(db_sql):
-                result = run_query(db_sql)
-                return ChatMessage(role=Role.ASSISTANT, content=result)
-            else:
+            from ultron.core.tools.builtin.database import run_query
+            verdict = check_action("run_query", db_sql)
+            if is_denied(verdict):
+                return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+            if is_confirm(verdict):
                 return ChatMessage(
                     role=Role.ASSISTANT,
                     content=f"Database query execution requested: '{db_sql}'",
@@ -1206,6 +1385,7 @@ class SimpleAgent(BaseAgent):
                         target=db_sql
                     )
                 )
+            return ChatMessage(role=Role.ASSISTANT, content=run_query(db_sql))
 
         # Step 5: generic shell command ("run X" / "execute X")
         command = detect_command_intent(user_input)

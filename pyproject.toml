@@ -9,13 +9,21 @@ description = "Ultron - Local-first AI assistant"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "beautifulsoup4>=4.12",
+    "ddgs>=9.0",
+    "httpx>=0.27",
+    "prompt-toolkit>=3.0",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+    "questionary>=2.0",
     "rich>=13.0",
     "typer>=0.12",
-    "httpx>=0.27",
-    "python-dotenv>=1.0",
 ]
+
+[project.optional-dependencies]
+postgres = ["psycopg2-binary>=2.9"]
+dev = ["pytest>=7.0", "ruff>=0.6"]
 
 [project.scripts]
 ultron = "ultron.main:app"
