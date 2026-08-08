@@ -106,6 +106,19 @@ def test_agent_prefix_requires_space():
 
 
 # ---------------------------------------------------------------------------
+# /memory
+# ---------------------------------------------------------------------------
+
+
+def test_memory_command_shows_graph_status():
+    console = FakeConsole()
+    handled, should_exit = _run(handle_slash_command("/memory", console, []))
+    assert handled is True
+    assert should_exit is False
+    assert any("Memory graph" in m for m in console.messages)
+
+
+# ---------------------------------------------------------------------------
 # /security
 # ---------------------------------------------------------------------------
 
@@ -139,6 +152,7 @@ def _security_fixture(monkeypatch):
 
 def test_security_switch_inline(monkeypatch):
     import os
+
     from ultron.core.agents import security as agent_security
     from ultron.core.config import settings
 

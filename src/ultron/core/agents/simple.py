@@ -1,6 +1,9 @@
-import re
-import json
 import asyncio
+import json
+import re
+
+import httpx
+
 from ultron.core.agents.base import BaseAgent
 from ultron.core.agents.security import (
     blocked_message,
@@ -10,8 +13,12 @@ from ultron.core.agents.security import (
     is_denied,
     security_mode,
 )
+from ultron.core.intelligence.prompt_assembly import (
+    build_response_guidance,
+    polish_response,
+)
 from ultron.core.logging import get_logger
-from ultron.core.types import ChatMessage, Role, PendingAction, history_to_openai_format
+from ultron.core.types import ChatMessage, PendingAction, Role, history_to_openai_format
 
 logger = get_logger("ultron.agents.simple")
 
@@ -34,7 +41,8 @@ def execute_tool(tool_name: str, **kwargs) -> str:
         return f"Error: Tool '{tool_name}' not found in registry."
     try:
         return str(func(**kwargs))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — tools are arbitrary; a tool bug
+        # must surface as a message, never crash the agent loop.
         return f"Error executing tool '{tool_name}': {exc}"
 
 
@@ -53,6 +61,69 @@ def _generic_target_content(tool_name: str, arguments: dict) -> tuple[str, str |
         return str(arguments.get("keyword", "")), None
     if tool_name == "add_memory":
         return "", str(arguments.get("fact", ""))
+    if tool_name == "add_triple":
+        return "", " ".join(
+            str(arguments.get(key, "")) for key in ("subject", "predicate", "object")
+        )
+    if tool_name == "query_triples":
+        target = next(
+            (str(arguments.get(key, "")) for key in ("subject", "predicate", "object") if arguments.get(key)),
+            "",
+        )
+        return target, None
+    if tool_name == "search_triples":
+        return str(arguments.get("keyword", "")), None
+    if tool_name == "query_chain":
+        return str(arguments.get("anchor", "")), None
+    if tool_name == "run_parallel":
+        # The batch is encoded newline-joined so the boundary can classify
+        # and scan each command in the batch individually.
+        return "\n".join(str(c) for c in arguments.get("commands", [])), None
+    if tool_name == "retrieve":
+        return str(arguments.get("url", "") or arguments.get("request", "")), None
+    if tool_name == "check_connectivity":
+        return str(arguments.get("url", "")), None
+    if tool_name == "learn_api_schema":
+        return str(arguments.get("base_url", "")), None
+    if tool_name == "get_api_knowledge":
+        return str(arguments.get("base_url", "")), None
+    if tool_name == "forget_api":
+        return str(arguments.get("base_url", "")), None
+    if tool_name == "api_usage_hint":
+        return str(arguments.get("url", "")), str(arguments.get("body"))
+    if tool_name == "resource_forecast":
+        return str(arguments.get("command", "")), None
+    if tool_name == "check_resources":
+        return "", None
+    if tool_name == "memory_connections":
+        return str(arguments.get("topic", "")), None
+    if tool_name == "related_facts":
+        return str(arguments.get("fact", "")), None
+    if tool_name == "discover_connections":
+        return "", None
+    if tool_name == "explain_relation":
+        return "", f"{arguments.get('a', '')} {arguments.get('b', '')}"
+    if tool_name in {"enforce_schema", "schema_validate"}:
+        return str(arguments.get("format", "")), str(arguments.get("text", ""))
+    if tool_name == "list_schemas":
+        return "", None
+    if tool_name in {"preflight_plan", "analyze_dependencies"}:
+        return "", str(arguments.get("steps_json", ""))
+    if tool_name == "list_plan_actions":
+        return "", None
+    if tool_name == "get_debug_context":
+        return "", None
+    if tool_name == "diagnose_failure":
+        return str(arguments.get("command", "")), str(arguments.get("text", ""))
+    if tool_name == "check_dependency":
+        return str(arguments.get("name", "")), None
+    if tool_name == "run_tool_batch":
+        # The batch payload is the content: the guardrails scan it for
+        # secrets/URLs while the per-call gating inside run_tool_batch
+        # classifies each member individually.
+        return "", str(arguments.get("calls_json", ""))
+    if tool_name == "synthesize_analysis":
+        return "", str(arguments.get("results_json", ""))
     return "", None
 
 
@@ -70,6 +141,8 @@ def _step_target_content(step: dict) -> tuple[str, str | None]:
         return str(step.get("command", "")), None
     if action == "make_http_request":
         return str(step.get("url", "")), str(step.get("body") or step.get("method", ""))
+    if action == "run_query":
+        return str(step.get("sql", "")), None
     if action == "add_memory":
         return "", str(step.get("fact", ""))
     return "", None
@@ -87,7 +160,38 @@ def _gate_command(command: str) -> ChatMessage | None:
     if is_denied(verdict):
         return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
     if is_allow(verdict):
-        return ChatMessage(role=Role.ASSISTANT, content=execute_tool("run_command", command=command))
+        from ultron.core.tools.resource_monitor import (
+            forecast_severity,
+            forecast_warning,
+        )
+
+        severity = forecast_severity(command)
+        warning = forecast_warning(command)
+        if severity in {"heavy", "critical"}:
+            # Resource escalation: a forecast-heavy command that would
+            # otherwise auto-run is offered for confirmation with the
+            # resource warning shown up front — except in permissive mode,
+            # which promises no prompts: there it runs with the warning
+            # attached to the reply instead.
+            if security_mode() == "permissive":
+                result = execute_tool("run_command", command=command)
+                if warning:
+                    result = f"{result}\n\n[resources] ⚠ {warning}"
+                return ChatMessage(role=Role.ASSISTANT, content=result)
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=(
+                    f"Command execution requested: '{command}'\n\n"
+                    f"[resources] ⚠ {warning}"
+                ),
+                pending_action=PendingAction(
+                    action_type="run_command", target=command
+                ),
+            )
+        result = execute_tool("run_command", command=command)
+        if severity == "moderate" and warning:
+            result = f"{result}\n\n[resources] ⚠ note: {warning}"
+        return ChatMessage(role=Role.ASSISTANT, content=result)
     return None
 
 # ---------------------------------------------------------------------------
@@ -108,6 +212,41 @@ def extract_any_filename(text: str) -> str | None:
     if match:
         return match.group(1)
     return None
+
+_IMAGE_EXT_RE = re.compile(r"\.(?:png|jpe?g|gif|webp|bmp|tiff?|heic)$", re.IGNORECASE)
+
+
+def detect_image_intent(user_input: str) -> str | None:
+    """
+    Detects requests to analyze an uploaded image (e.g. "analyze this chart.png",
+    "look at the graph in plot.png", "view the file data.bmp",
+    "what's in screenshot.png").
+
+    Returns the first image-extension filename when a vision verb is present,
+    otherwise None. Ordinary file reads ("read config.json") keep their
+    existing path because their extension is not an image one. Runs before the
+    file-read detector so image files route to the vision model rather than
+    the raw-file reader.
+    """
+    text = user_input.strip()
+    has_vision_verb = re.search(
+        r"\b(?:analyze|analyse|examine|inspect|view|read)\b"
+        r"|\blook\s+at\b"
+        r"|\bwhat(?:'s|\s+is)\s+in\b",
+        text,
+        re.IGNORECASE,
+    )
+    if not has_vision_verb:
+        return None
+    for match in re.finditer(r"[\w./-]+\.[a-zA-Z0-9]+", text):
+        token = match.group(0)
+        # A URL-ish token ("//example.com/chart.png") is not a local image path.
+        if "://" in token or token.startswith("//"):
+            continue
+        if _IMAGE_EXT_RE.search(token):
+            return token
+    return None
+
 
 def detect_greeting_intent(user_input: str) -> bool:
     """
@@ -223,6 +362,223 @@ def detect_command_intent(user_input: str) -> str | None:
         return match.group("command").strip()
     return None
 
+def _split_commands(text: str) -> list[str]:
+    """
+    Splits a parallel-request command portion into individual commands.
+
+    Separators are commas, the word "and", and newlines — but only outside
+    single/double quotes, so `echo "fish and chips"` stays one command.
+    Surrounding quotes are stripped per segment and blank segments dropped.
+    """
+    commands: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(text)
+
+    def unwrap(segment: str) -> str:
+        """Strips quotes only when they wrap the whole segment — quotes that
+        are part of the command (e.g. `echo "fish and chips"`) are kept."""
+        s = segment.strip()
+        if len(s) >= 2 and s[0] in "\"'" and s[-1] == s[0]:
+            return s[1:-1]
+        return s
+
+    while i < n:
+        ch = text[i]
+        if quote:
+            current.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            current.append(ch)
+            i += 1
+            continue
+        if ch in ",\n":
+            segment = unwrap("".join(current))
+            if segment:
+                commands.append(segment)
+            current = []
+            i += 1
+            continue
+        if ch == " " and text[i : i + 5].lower() == " and ":
+            segment = unwrap("".join(current))
+            if segment:
+                commands.append(segment)
+            current = []
+            i += 5
+            continue
+        current.append(ch)
+        i += 1
+    segment = unwrap("".join(current))
+    if segment:
+        commands.append(segment)
+    return commands
+
+
+def detect_parallel_intent(user_input: str) -> list[str] | None:
+    """
+    Detects requests to run multiple commands at once (e.g. "run X and Y in
+    parallel", "execute a, b, c simultaneously").
+
+    Returns the list of extracted commands if an explicit parallelism marker
+    is present, otherwise None. The marker is required — a bare "run ls"
+    stays sequential so nothing is silently parallelized.
+
+    Supported markers: in parallel, simultaneously, concurrently,
+    at the same time. Both trailing ("run X and Y in parallel") and leading
+    ("in parallel, run X and Y") forms are matched.
+    """
+    text = user_input.strip()
+    marker = (
+        r"\b(?:in\s+parallel|simultaneously|concurrently|at\s+the\s+same\s+time)\b"
+    )
+
+    # Trailing form: "run <cmds> in parallel" / "execute <cmds> simultaneously"
+    match = re.search(
+        rf"^\s*(?:please\s+)?(?:run|execute)\s+(?P<cmds>.+?)\s+{marker}\s*(?:please)?\s*\.?\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return _split_commands(match.group("cmds"))
+
+    # Leading form: "in parallel, run <cmds>" / "simultaneously execute <cmds>"
+    match = re.search(
+        rf"^\s*(?:please\s+)?{marker}\s*,\s*(?:run|execute)\s+(?P<cmds>.+)\s*\.?\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return _split_commands(match.group("cmds"))
+
+    return None
+
+
+# TLDs treated as bare-domain candidates ("check example.com and example.org").
+# Deliberately excludes file-like extensions (json, txt, …) so "config.json"
+# is never mistaken for a domain.
+_BARE_DOMAIN_TLDS = frozenset(
+    {
+        "com", "org", "net", "io", "ai", "dev", "co", "me", "app",
+        "gov", "edu", "info", "biz", "us", "uk", "de", "fr", "ca",
+        "jp", "ru", "in", "xyz",
+    }
+)
+
+
+def _extract_bare_domains(text: str) -> list[str]:
+    """
+    Extracts bare hostnames (example.com, docs.pandas.org) without a scheme.
+
+    Conservative: the final label must be a known TLD so filenames like
+    ``config.json`` are never captured. Returns lowercased domains, deduped.
+    """
+    domains: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"\b(?:[\w-]+\.)+[a-z]{2,}\b", text, re.IGNORECASE):
+        token = match.group(0)
+        tld = token.rsplit(".", 1)[-1].lower()
+        if tld not in _BARE_DOMAIN_TLDS:
+            continue
+        if "://" in token or token.startswith("//"):
+            continue
+        lowered = token.lower()
+        if lowered not in seen:
+            seen.add(lowered)
+            domains.append(lowered)
+    return domains
+
+
+def detect_tool_batch_intent(user_input: str) -> dict | None:
+    """
+    Detects requests that want results from several *different* tools at
+    once — e.g. "read config.json and notes.txt", "check example.com and
+    example.org", "search for pandas and numpy at the same time".
+
+    Returns one of:
+      {"calls": [{tool, arguments}, ...]}  — deterministically extracted batch
+      {"planner": True}                     — ambiguous parallel request;
+                                               the LLM planner builds the batch
+      None                                   — not a parallel-tool request
+
+    This is the *inter-tool* counterpart of ``detect_parallel_intent`` (which
+    only parallelizes shell commands). Runs before the single-target
+    detectors so a multi-target request is captured as a unit instead of
+    being claimed by the first single-target match.
+    """
+    text = user_input.strip()
+
+    # Shell-command parallel batches stay with detect_parallel_intent
+    # ("run X and Y in parallel" must not become a tool batch).
+    if detect_parallel_intent(text):
+        return None
+
+    calls: list[dict] = []
+    seen: set[tuple] = set()
+
+    def add(tool: str, arguments: dict) -> None:
+        key = (tool, tuple(sorted(arguments.items())))
+        if key not in seen:
+            seen.add(key)
+            calls.append({"tool": tool, "arguments": arguments})
+
+    # 1) Multiple filenames -> read_file calls ("read X and Y").
+    #    Image files are skipped — they route to the vision model instead.
+    if re.search(r"\b(?:read|open|show|cat)\b", text, re.IGNORECASE):
+        for fname in re.findall(r"[\w./-]+\.[a-zA-Z0-9]+", text):
+            if "://" in fname or fname.startswith("//"):
+                continue  # URL, not a local file
+            if _IMAGE_EXT_RE.search(fname):
+                continue
+            add("read_file", {"file_path": fname})
+
+    # 2) URLs (explicit scheme or bare domain) -> connectivity check / fetch.
+    if re.search(r"\b(?:check|fetch|read|is\s+.+\bup|online)\b", text, re.IGNORECASE):
+        urls: list[str] = []
+        explicit = [
+            re.sub(r"[\.,;\)]+$", "", u).strip()
+            for u in re.findall(r"https?://[^\s]+", text, re.IGNORECASE)
+        ]
+        urls.extend(u for u in explicit if u)
+        # Mask explicit URLs so bare-domain extraction never re-matches the
+        # host inside them ("https://example.com" must yield one URL, not two).
+        masked = re.sub(r"https?://[^\s]+", " ", text, flags=re.IGNORECASE)
+        urls.extend(_extract_bare_domains(masked))
+        fetch_mode = bool(re.search(r"\b(?:fetch|read)\b", text, re.IGNORECASE))
+        for url in urls:
+            if fetch_mode:
+                add("fetch_page_text", {"url": url})
+            else:
+                add("check_connectivity", {"url": url})
+
+    # 3) Repeated or comma-separated search queries ("search for A and B"
+    #    splits only on explicit structure, so "fish and chips" stays whole).
+    search_matches = list(
+        re.finditer(r"\bsearch\s+(?:the\s+web\s+)?for\s+(.+?)(?=\s+(?:and|,)\s+search|$)", text, re.IGNORECASE)
+    )
+    if search_matches:
+        queries = [m.group(1).strip().rstrip(".") for m in search_matches if m.group(1).strip()]
+        for q in queries:
+            add("web_search", {"query": q})
+
+    if len(calls) >= 2:
+        return {"calls": calls}
+
+    # Explicit parallelism phrasing with no concrete targets -> LLM planner.
+    if re.search(
+        r"\b(?:at\s+the\s+same\s+time|simultaneously|concurrently|in\s+parallel|together)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return {"planner": True}
+
+    return None
+
+
 def detect_remember_intent(user_input: str) -> str | None:
     """
     Detects if the user input requests remembering a fact (e.g. "remember that ...", "remember ...").
@@ -233,6 +589,23 @@ def detect_remember_intent(user_input: str) -> str | None:
     if match:
         return match.group("fact").strip()
     return None
+
+def detect_deduction_question(user_input: str) -> str | None:
+    """
+    Detects knowledge-graph reasoning questions (e.g. "what is the capital of
+    a country that borders Germany"). Returns the question when it matches a
+    deterministic reasoning template, otherwise None.
+
+    These are answered from stored triples by graph traversal — the AI is
+    never involved, so the answer is always grounded in remembered facts.
+    """
+    from ultron.core.tools.memory import graph
+
+    text = user_input.strip()
+    if graph.is_deduction_question(text):
+        return text
+    return None
+
 
 def detect_memory_question(user_input: str) -> str | None:
     """
@@ -418,6 +791,192 @@ def detect_db_query_intent(user_input: str) -> str | None:
         return match.group("sql").strip()
     return None
 
+def extract_api_url(text: str) -> str | None:
+    """
+    Extracts a base URL for API schema-learning requests.
+
+    Accepts http(s):// URLs, localhost/127.0.0.1 bases (kept as http://), and
+    bare domains (normalized to https://) — the shapes users most often use
+    to point Ultron at an API.
+    """
+    url_match = re.search(r"https?://[^\s]+", text, re.IGNORECASE)
+    if url_match:
+        return re.sub(r"[.,;\\)]+$", "", url_match.group(0)).strip()
+    host_match = re.search(r"\b(?:localhost|127\.0\.0\.1)(?::\d+)?\b", text, re.IGNORECASE)
+    if host_match:
+        return "http://" + host_match.group(0).lower()
+    domain_match = re.search(r"\b(?:[\w-]+\.)+[a-z]{2,}\b", text, re.IGNORECASE)
+    if domain_match:
+        return "https://" + domain_match.group(0).lower()
+    return None
+
+
+def detect_api_schema_intent(user_input: str) -> dict | None:
+    """
+    Detects API schema learning / inspection / reset requests:
+
+      - "learn the api schema for http://localhost:8000"  -> learn
+      - "fetch the schema for example.com"                  -> learn
+      - "what do you know about the api at example.com"     -> knowledge
+      - "what apis do you know"                             -> knowledge
+      - "api usage hints for http://localhost:8000"         -> hints
+      - "forget the api schema for http://localhost:8000"   -> forget
+
+    Returns {"action": ..., "url": str | None}. The URL is None for
+    knowledge requests that name no API (those list everything learned).
+    Runs before the HTTP detector so schema-learning phrasing is never
+    mistaken for a plain GET of the URL.
+    """
+    text = user_input.strip()
+
+    if re.search(
+        r"\blearn\s+(?:the\s+)?(?:api\s+)?schema\b"
+        r"|\bfetch\s+(?:the\s+)?(?:api\s+)?schema\b"
+        r"|\bdiscover\s+(?:the\s+)?(?:api\s+)?schema\b",
+        text,
+        re.IGNORECASE,
+    ):
+        action = "learn"
+    elif re.search(r"\bapi\s+usage\s+hints?\b", text, re.IGNORECASE):
+        action = "hints"
+    elif re.search(
+        r"\bforget\s+(?:the\s+)?(?:api\s+)?(?:schema|knowledge)\b"
+        r"|\bclear\s+(?:the\s+)?(?:api\s+)?(?:schema|knowledge)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        action = "forget"
+    elif re.search(
+        r"\bwhat\s+do\s+you\s+know\s+about\s+(?:the\s+)?apis?\b"
+        r"|\bwhat\s+apis?\s+do\s+you\s+know\b"
+        r"|\bapi\s+knowledge\b"
+        r"|\bknown\s+apis?\b"
+        r"|\bwhat\s+(?:have|'ve)\s+you\s+learned\s+about\s+(?:the\s+)?apis?\b",
+        text,
+        re.IGNORECASE,
+    ):
+        action = "knowledge"
+    else:
+        return None
+
+    return {"action": action, "url": extract_api_url(text)}
+
+
+def _extract_forecast_command(text: str) -> str | None:
+    """Pulls a command out of a forecast request (quotes, 'for/of:', 'heavy is')."""
+    quoted = re.search(r"[\"'](.+?)[\"']", text)
+    if quoted:
+        return quoted.group(1).strip()
+    match = re.search(r"\b(?:for|of|:)\s+(.+)$", text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip().rstrip("?").strip()
+    match = re.search(r"\bheavy\s+is\s+(.+)$", text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip().rstrip("?").strip()
+    return None
+
+
+def detect_resource_intent(user_input: str) -> dict | None:
+    """
+    Detects resource-monitoring requests:
+
+      - "check system resources" / "how much memory is free"  -> check
+      - "resource forecast for pip install" / "how heavy is find /" -> forecast
+
+    Returns {"action": "check"|"forecast", "command": str | None}.
+    Runs before the HTTP/retrieval detectors; resource phrasing carries no
+    URLs so there is no overlap with the networking tools.
+    """
+    text = user_input.strip()
+
+    if re.search(
+        r"\b(?:check\s+(?:the\s+)?(?:system\s+)?resources?)\b"
+        r"|\bsystem\s+resources?\b"
+        r"|\b(?:cpu|memory|ram)\s+(?:usage|load|status)\b"
+        r"|\bhow\s+(?:much|is)\s+(?:memory|ram|cpu)\b"
+        r"|\bhow\s+is\s+my\s+system\b"
+        r"|\bsystem\s+(?:status|load)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return {"action": "check", "command": None}
+
+    if re.search(
+        r"\b(?:resource\s+)?forecast\b"
+        r"|\bhow\s+heavy\s+is\b"
+        r"|\bhow\s+long\s+will\s+(?:this|it|that)\b"
+        r"|\bwill\s+this\s+be\s+heavy\b"
+        r"|\bhow\s+much\s+(?:cpu|memory)\s+will\s+this\s+use\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return {"action": "forecast", "command": _extract_forecast_command(text)}
+
+    return None
+
+
+def detect_association_intent(user_input: str) -> dict | None:
+    """
+    Detects personalized-learning requests — asking how stored facts connect
+    across domains:
+
+      - "what connections do you see"                   -> connections
+      - "connections for renaissance"                    -> connections (topic)
+      - "how is renaissance art related to the medici"   -> relate (a, b)
+      - "discover new connections" / "link my memories" -> discover
+
+    Returns {"action", "a", "b", "topic"}. Runs after the memory-question
+    detector (3.5) so recall ("what do you remember about X") keeps its
+    existing path.
+    """
+    text = user_input.strip()
+
+    if re.search(
+        r"\bdiscover\b.*\bconnections?\b|\bnovel\s+connections?\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return {"action": "discover", "a": "", "b": "", "topic": ""}
+
+    for pattern in (
+        r"\bhow\s+is\s+(?P<a>.+?)\s+related\s+to\s+(?P<b>.+?)\??\s*$",
+        r"\bhow\s+does\s+(?P<a>.+?)\s+(?:relate|connect)\s+to\s+(?P<b>.+?)\??\s*$",
+        r"\bis\s+(?P<a>.+?)\s+related\s+to\s+(?P<b>.+?)\??\s*$",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return {
+                "action": "relate",
+                "a": match.group("a").strip(),
+                "b": match.group("b").strip(),
+                "topic": "",
+            }
+
+    if re.search(
+        r"\bwhat\s+connections?\b"
+        r"|\bshow\s+(?:me\s+)?connections?\b"
+        r"|\bmemory\s+connections?\b"
+        r"|\bconnections?\s+(?:between|among|for|about)\b"
+        r"|\brelated\s+facts?\b"
+        r"|\bhow\s+(?:are|do)\s+my\s+(?:memories|facts)\s+(?:connected|linked|relate)\b"
+        r"|\blink(?:ed|s)?\s+(?:memories|facts|knowledge)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        topic = ""
+        topic_match = re.search(
+            r"\bconnections?\s+(?:for|about)\s+(.+?)\??\s*$"
+            r"|\brelated\s+facts?\s+(?:about|for)\s+(.+?)\??\s*$",
+            text,
+            re.IGNORECASE,
+        )
+        if topic_match:
+            topic = (topic_match.group(1) or topic_match.group(2) or "").strip()
+        return {"action": "connections", "a": "", "b": "", "topic": topic}
+
+    return None
+
+
 def detect_http_intent(user_input: str) -> tuple[str, str, str | None] | None:
     """
     Detects HTTP request intents using regular expressions and body/method rules.
@@ -460,12 +1019,15 @@ def detect_http_intent(user_input: str) -> tuple[str, str, str | None] | None:
             try:
                 json.loads(body_candidate)
                 body = body_candidate
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 body = body_candidate
 
     # Clean wrapping quotes if body was specified as '...' or "..."
     if body:
-        if (body.startswith('"') and body.endswith('"')) or (body.startswith("'") and body.endswith("'")):
+        wrapped_in_quotes = (body.startswith('"') and body.endswith('"')) or (
+            body.startswith("'") and body.endswith("'")
+        )
+        if wrapped_in_quotes:
             body = body[1:-1].strip()
 
     # 3. Method Selection Logic
@@ -483,6 +1045,100 @@ def detect_http_intent(user_input: str) -> tuple[str, str, str | None] | None:
         method = "GET"
 
     return method, url, body
+
+def detect_debug_intent(user_input: str) -> dict | None:
+    """
+    Detects debugging requests and extracts the failure target.
+
+    Matches debugging phrasing: "debug this", "why is my script failing",
+    "diagnose this error: …", "help me fix", "what went wrong", …
+
+    Returns {"command": str, "error": str, "expected": str} where:
+      - ``command``  — a quoted command, or the text after "debug "/"run "
+      - ``error``    — pasted error/traceback text (quoted or after
+        "error:"/"this error:"/"diagnose this:")
+      - ``expected`` — the user's stated expectation after "expected"/
+        "should …" (used for expected-vs-actual reconciliation)
+
+    Runs after the HTTP/retrieval detectors (so URL-bearing inputs keep their
+    networking path) and before the generic command detector.
+    """
+    text = user_input.strip()
+    triggers = (
+        r"\bdebug(?:ging)?\b"
+        r"|\bdiagnos[ei]\b"
+        r"|\bwhy\s+(?:is|did|does|do|can'?t)\b.*\b(?:fail|crash|break|not\s+work)\b"
+        r"|\bwhy\s+.*\b(?:failing|crashed|broken|not\s+working)\b"
+        r"|\bmy\s+(?:code|script|program|app|tests?)\s+(?:crashed|failed|is\s+broken|doesn'?t\s+work|isn'?t\s+working)\b"
+        r"|\bhelp\s+(?:me\s+)?(?:fix|debug)\b"
+        r"|\bfix\s+this\s+error\b"
+        r"|\bwhat\s+went\s+wrong\b"
+        r"|\binvestigate\s+(?:the\s+)?error\b"
+        r"|\bwhat'?s\s+wrong\s+(?:with|in)\b"
+    )
+    if not re.search(triggers, text, re.IGNORECASE):
+        return None
+
+    command = ""
+    error = ""
+    expected = ""
+
+    # Quoted segments: an error-looking quote is the pasted failure, otherwise
+    # the first quote is the command to debug.
+    for quoted in re.findall(r"[\"'](.+?)[\"']", text):
+        if re.search(r"Traceback|ModuleNotFoundError|Error|error\b", quoted):
+            if not error:
+                error = quoted.strip()
+        elif not command:
+            command = quoted.strip()
+
+    # Pasted error after "error:" / "this error:" / "diagnose this:"
+    if not error:
+        err_match = re.search(
+            r"\b(?:diagnose\s+this\s+)?error\s*[:]\s*(.+)$",
+            text,
+            re.IGNORECASE,
+        )
+        if err_match:
+            error = err_match.group(1).strip()
+
+    # Bare target: "debug main.py" / "debug the script" / "run pytest"
+    # (dots are allowed so "debug main.py" keeps its extension).
+    if not command and not error:
+        target_match = re.search(
+            r"\b(?:debug|run|diagnose)\s+(?P<target>[^!?;]+)$",
+            text,
+            re.IGNORECASE,
+        )
+        if target_match:
+            target = target_match.group("target").strip()
+            # Vague targets ("debug this script") would run nonsense in the
+            # shell — strip filler words until something concrete remains.
+            # The stopword match consumes trailing whitespace OR the end of
+            # the string so stripping always makes progress (no infinite loop).
+            while True:
+                filler = re.match(
+                    r"^(?:this|my|the|it|that|script|code|program|app)(?:\s+|$)",
+                    target,
+                    re.IGNORECASE,
+                )
+                if not filler:
+                    break
+                target = target[filler.end():].strip()
+            command = target
+
+    # Stated expectation: "expected …" / "should print/output/be …"
+    expected_match = re.search(
+        r"\bexpected\s*[:]?\s*(.+?)(?:\s*\.\s*)?$"
+        r"|\bshould\s+(?:print|output|be|produce|return)\s+(.+?)(?:\s*\.\s*)?$",
+        text,
+        re.IGNORECASE,
+    )
+    if expected_match:
+        expected = (expected_match.group(1) or expected_match.group(2) or "").strip()
+
+    return {"command": command, "error": error, "expected": expected}
+
 
 def detect_multistep_intent(user_input: str) -> bool:
     """
@@ -547,12 +1203,15 @@ async def plan_task(user_input: str, engine) -> list[dict] | None:
     planning_prompt = (
         "You are a task-planning assistant.\n"
         "Break the following user request into a list of simple steps.\n"
-        "Only use these action types: read_file, write_file, run_command, add_memory.\n"
+        "Only use these action types: read_file, write_file, run_command, "
+        "make_http_request, run_query, add_memory.\n"
         "Respond with ONLY a JSON array — no other text, no markdown fences.\n"
         "Use exactly these formats for each action type:\n"
         '  {"action": "read_file",   "filename": "..."}\n'
         '  {"action": "write_file",  "filename": "...", "content": "..."}\n'
         '  {"action": "run_command", "command": "..."}\n'
+        '  {"action": "make_http_request", "method": "GET|POST", "url": "...", "body": "..."}\n'
+        '  {"action": "run_query",   "sql": "..."}\n'
         '  {"action": "add_memory",  "fact": "..."}\n'
         "\n"
         f"User request: {user_input}"
@@ -560,7 +1219,7 @@ async def plan_task(user_input: str, engine) -> list[dict] | None:
 
     try:
         raw = await engine.generate([{"role": "user", "content": planning_prompt}])
-    except Exception:
+    except (httpx.HTTPError, OSError, ValueError):
         return None  # Engine error — fall back silently
 
     # Strip markdown code fences if the model wrapped its answer
@@ -579,7 +1238,14 @@ async def plan_task(user_input: str, engine) -> list[dict] | None:
         return None
 
     # Validate that every step has a recognised action key
-    valid_actions = {"read_file", "write_file", "run_command", "add_memory"}
+    valid_actions = {
+        "read_file",
+        "write_file",
+        "run_command",
+        "make_http_request",
+        "run_query",
+        "add_memory",
+    }
     cleaned: list[dict] = []
     for step in steps:
         if isinstance(step, dict) and step.get("action") in valid_actions:
@@ -603,9 +1269,7 @@ def is_step_failure(action: str, result: str) -> bool:
         if res_str.startswith("Error"):
             return True
         exit_code_match = re.search(r'Exit code:\s*(\d+)', res_str, re.IGNORECASE)
-        if exit_code_match and exit_code_match.group(1) != "0":
-            return True
-        return False
+        return bool(exit_code_match and exit_code_match.group(1) != "0")
 
     return res_str.startswith("Error")
 
@@ -623,7 +1287,6 @@ async def execute_plan(steps: list[dict]) -> list[str]:
       This is an intentional predictability guarantee: if step 2 failed, the user can be
       certain step 3 never touched anything.
     """
-    import time
     from ultron.core.tools.registry import get_tool
 
     results: list[str] = []
@@ -651,6 +1314,18 @@ async def execute_plan(steps: list[dict]) -> list[str]:
         max_attempts = 3 if action in retryable_actions else 1
         last_result = ""
         attempts_used = 0
+
+        # Resource awareness in multi-step plans: annotate run_command steps
+        # whose forecast is heavy or critical before they execute.
+        step_note = ""
+        if action == "run_command":
+            from ultron.core.tools.resource_monitor import (
+                forecast_severity,
+                forecast_warning,
+            )
+            cmd_text = str(step.get("command", ""))
+            if forecast_severity(cmd_text) in {"heavy", "critical"}:
+                step_note = " \u26a0 " + (forecast_warning(cmd_text) or "")
 
         for attempt in range(1, max_attempts + 1):
             attempts_used = attempt
@@ -688,6 +1363,13 @@ async def execute_plan(steps: list[dict]) -> list[str]:
                             step.get("body")
                         )
 
+                elif action == "run_query":
+                    func = get_tool("run_query")
+                    if not func:
+                        result = "Error: Tool 'run_query' not found in registry."
+                    else:
+                        result = func(step["sql"])
+
                 elif action == "add_memory":
                     func = get_tool("add_memory")
                     if not func:
@@ -698,7 +1380,7 @@ async def execute_plan(steps: list[dict]) -> list[str]:
                 else:
                     result = f"Error: unknown action type '{action}'"
 
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — plan steps run arbitrary tools
                 result = f"Error: {exc}"
 
             last_result = str(result)
@@ -707,24 +1389,24 @@ async def execute_plan(steps: list[dict]) -> list[str]:
             if not is_step_failure(action, last_result):
                 break
 
-            # If retrying, pause 1 second before the next attempt
+            # If retrying, pause 1 second before the next attempt (non-blocking)
             if attempt < max_attempts:
-                time.sleep(1)
+                await asyncio.sleep(1)
 
         # Format output entry based on success/failure and attempt count
         if is_step_failure(action, last_result):
             if max_attempts > 1:
-                entry = f"{label}: FAILED after {attempts_used} attempts. Last error: {last_result}"
+                entry = f"{label}{step_note}: FAILED after {attempts_used} attempts. Last error: {last_result}"
             else:
-                entry = f"{label}: {last_result}"
+                entry = f"{label}{step_note}: {last_result}"
             results.append(entry)
             # Stop on first error — don't execute further steps.
             break
         else:
             if attempts_used > 1:
-                entry = f"{label}: [succeeded after {attempts_used} attempts] {last_result}"
+                entry = f"{label}{step_note}: [succeeded after {attempts_used} attempts] {last_result}"
             else:
-                entry = f"{label}: {last_result}"
+                entry = f"{label}{step_note}: {last_result}"
             results.append(entry)
 
     return results
@@ -746,6 +1428,81 @@ def handle_greeting() -> ChatMessage:
         role=Role.ASSISTANT,
         content="Hello! How can I help you today?"
     )
+
+async def handle_image(path: str, user_input: str, engine) -> ChatMessage:
+    """
+    Analyzes an image with a vision-capable model.
+
+    Reads the image file, base64-encodes it, and sends it to the engine as an
+    Ollama image part alongside a prompt derived from the user's request.
+    Gated by the security boundary like any file read (path escapes and
+    secret-bearing content are denied before the file is touched).
+
+    When the active model cannot see images, explains how to switch to a
+    vision model instead of failing obscurely.
+    """
+    import base64
+    from pathlib import Path
+
+    # Security gate: same classification as a file read (path-escape deny).
+    verdict = check_action("read_file", path)
+    if is_denied(verdict):
+        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+
+    image_file = Path(path)
+    if not image_file.is_file():
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=f"Sorry, I couldn't find the image '{path}'.",
+        )
+
+    # Vision capability pre-check (only when the engine can report it).
+    supports = getattr(engine, "supports_images", None)
+    if supports is not None:
+        try:
+            supported = await supports()
+        except (httpx.HTTPError, OSError, ValueError):
+            supported = None
+        if supported is False:
+            model = getattr(engine, "model", "?")
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=(
+                    f"The active model '{model}' can't see images yet. Pull a "
+                    "vision-capable model and select it, e.g.:\n"
+                    "  ollama pull llava\n"
+                    "  /model  →  llava"
+                ),
+            )
+
+    try:
+        encoded = base64.b64encode(image_file.read_bytes()).decode("ascii")
+    except OSError as exc:
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=f"Sorry, I couldn't read the image '{path}' ({exc}).",
+        )
+
+    prompt = (
+        f"The user attached the image '{path}' and asked:\n{user_input}\n\n"
+        "Analyze the image carefully. If it contains a diagram, chart, graph, "
+        "table, or handwritten notes, interpret the visual data precisely and "
+        "act on the user's request (e.g. write code implementing what is "
+        "shown, or explain what the data means). Be specific and concrete."
+    )
+    messages = [{"role": "user", "content": prompt, "images": [encoded]}]
+    try:
+        content = await engine.generate(messages)
+    except (httpx.HTTPError, OSError, ValueError) as exc:
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=f"Sorry, the image analysis failed ({exc}).",
+        )
+    return ChatMessage(
+        role=Role.ASSISTANT,
+        content=f"Here's my analysis of '{path}':\n\n{polish_response(content)}",
+    )
+
 
 def handle_file_read(filename: str) -> ChatMessage:
     """
@@ -847,8 +1604,10 @@ def handle_file_write(filename: str, content: str, user_input: str = "") -> Chat
 
 def handle_remember(fact: str) -> ChatMessage:
     """
-    Stores a new fact in the SQLite memory store, gated by the security
-    boundary (which blocks outgoing content carrying credential-like data).
+    Stores a new memory via the unified write path: sentences that parse as
+    subject/predicate/object are stored as knowledge-graph triples, everything
+    else falls back to the flat fact store. Gated by the security boundary
+    (which blocks outgoing content carrying credential-like data).
     """
     verdict = check_action("add_memory", "", fact)
     if is_denied(verdict):
@@ -856,13 +1615,50 @@ def handle_remember(fact: str) -> ChatMessage:
     from ultron.core.tools.registry import get_tool
     func = get_tool("add_memory")
     tool_result = func(fact) if func else "Error: Tool 'add_memory' not found in registry."
-    return ChatMessage(role=Role.ASSISTANT, content=str(tool_result))
+    content = str(tool_result)
+    try:
+        # Personalized learning: correlate the new fact against everything
+        # stored and announce any cross-domain connections. Best-effort —
+        # the learning layer must never break remembering.
+        from ultron.core.learning.associations import connect_new_fact
+        announcement = connect_new_fact(fact)
+        if announcement:
+            content += f"\n\n{announcement}"
+    except Exception:  # noqa: BLE001, S110 — learning layer is optional, best-effort only
+        pass
+    return ChatMessage(role=Role.ASSISTANT, content=content)
+
+def handle_deduction_question(question: str) -> ChatMessage:
+    """
+    Answers a reasoning question from the knowledge graph by walking stored
+    triples (answer_question / query_chain). Gated by the security boundary
+    like every other tool action. When no stored facts support the deduction,
+    says so honestly instead of guessing.
+    """
+    verdict = check_action("query_triples", question)
+    if is_denied(verdict):
+        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+
+    from ultron.core.tools.memory import graph
+
+    answer = graph.answer_question(question)
+    if answer:
+        return ChatMessage(role=Role.ASSISTANT, content=answer)
+    return ChatMessage(
+        role=Role.ASSISTANT,
+        content=(
+            "I can't deduce that from what I have stored yet — I only answer "
+            "reasoning questions from knowledge-graph facts I've actually remembered."
+        ),
+    )
+
 
 def handle_memory_question(topic: str) -> ChatMessage:
     """
     Answers a memory-recall question by fetching only facts that match the
-    topic keyword — never all memories.  Built directly from DB rows so the
-    AI is never involved and cannot hallucinate stored facts.
+    topic keyword — never all memories.  Unions the flat fact store with the
+    knowledge graph (edges where the topic is the subject or object).  Built
+    directly from DB rows so the AI is never involved and cannot hallucinate.
     """
     verdict = check_action("search_memories", topic)
     if is_denied(verdict):
@@ -871,8 +1667,14 @@ def handle_memory_question(topic: str) -> ChatMessage:
     func = get_tool("search_memories")
     matches = func(topic) if func else []
 
-    if matches:
-        bullet_list = "\n".join(f"- {fact}" for fact in matches)
+    from ultron.core.tools.memory import graph
+    graph_matches = graph.recall_about(topic)
+
+    # Deduplicate while preserving order (flat facts first, then graph edges).
+    combined = list(dict.fromkeys(matches + graph_matches))
+
+    if combined:
+        bullet_list = "\n".join(f"- {item}" for item in combined)
         return ChatMessage(
             role=Role.ASSISTANT,
             content=f"Here's what I have stored about '{topic}':\n{bullet_list}"
@@ -941,6 +1743,156 @@ def handle_lint() -> ChatMessage:
         )
     )
 
+def handle_resource(action: str, command: str | None = None) -> ChatMessage:
+    """
+    Handles resource-monitoring requests, gated by the security boundary.
+
+    - check    -> current system snapshot (CPU / load / memory)
+    - forecast -> predicted resource profile of a command
+    Both are read-only (LOW risk) and auto-execute; a missing forecast
+    target asks for the command instead of guessing.
+    """
+    if action == "forecast" and not command:
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=(
+                "Which command should I forecast? "
+                "e.g. 'resource forecast for pip install'."
+            ),
+        )
+    tool_name = "check_resources" if action == "check" else "resource_forecast"
+    verdict = check_action(tool_name, command or "")
+    if is_denied(verdict):
+        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+    if action == "check":
+        return ChatMessage(role=Role.ASSISTANT, content=execute_tool("check_resources"))
+    return ChatMessage(
+        role=Role.ASSISTANT,
+        content=execute_tool("resource_forecast", command=command),
+    )
+
+
+def handle_debug(
+    command: str = "",
+    error: str = "",
+    expected: str = "",
+) -> ChatMessage:
+    """
+    Produces an environmental-state debug report for failing code.
+
+    Three modes:
+      1. Pasted error text -> the failure is diagnosed directly (no command
+         executes; the security boundary never gets involved because nothing
+         runs).
+      2. A command -> gated through the security boundary exactly like a
+         normal run_command (path-escape, secret and dangerous-pattern
+         guardrails all apply), executed, and its result diagnosed.
+      3. Neither -> the environment snapshot is shown and the user is asked
+         what to debug.
+
+    Every report couples the diagnosis with the exact environmental state
+    (OS, Python, tool versions, declared-vs-installed dependencies) and any
+    stated expectation, so fixes start from real data instead of guesses.
+    """
+    from ultron.core.intelligence.debug_context import (
+        capture_environment,
+        diagnose_failure,
+        format_debug_report,
+        format_environment,
+    )
+
+    command = (command or "").strip()
+    error = (error or "").strip()
+    expected = (expected or "").strip()
+
+    # Mode 1: pasted error/traceback — diagnose directly, nothing runs.
+    if error:
+        diagnosis = diagnose_failure(error, command or None)
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=format_debug_report(
+                command or None, diagnosis, expected or None
+            ),
+        )
+
+    # Mode 2: run the failing command (gated) and diagnose its result.
+    if command:
+        verdict = check_action("run_command", command)
+        if is_denied(verdict):
+            return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+        if is_confirm(verdict):
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=f"Debug command requested: '{command}'",
+                pending_action=PendingAction(
+                    action_type="run_command", target=command
+                ),
+            )
+        result = execute_tool("run_command", command=command)
+        diagnosis = diagnose_failure(result, command)
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=format_debug_report(command, diagnosis, expected or None),
+        )
+
+    # Mode 3: no target — show the environment and ask what to debug.
+    return ChatMessage(
+        role=Role.ASSISTANT,
+        content=(
+            format_environment(capture_environment())
+            + "\n\nWhat would you like me to debug? Paste the error, or tell me "
+            "the command to run (e.g. 'debug python main.py')."
+        ),
+    )
+
+
+def handle_association(
+    action: str,
+    a: str = "",
+    b: str = "",
+    topic: str = "",
+) -> ChatMessage:
+    """
+    Handles personalized-learning requests (cross-domain memory connections),
+    gated by the security boundary like every other tool action. All four
+    actions are read-only local operations (LOW risk) and auto-execute.
+    """
+    if action == "discover":
+        verdict = check_action("discover_connections", "")
+        if is_denied(verdict):
+            return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=execute_tool("discover_connections"),
+        )
+
+    if action == "relate":
+        if not a or not b:
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=(
+                    "Which two things should I relate? "
+                    "e.g. 'how is renaissance art related to the medici'."
+                ),
+            )
+        verdict = check_action("explain_relation", "", f"{a} {b}")
+        if is_denied(verdict):
+            return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=execute_tool("explain_relation", a=a, b=b),
+        )
+
+    # connections
+    verdict = check_action("memory_connections", topic or "")
+    if is_denied(verdict):
+        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+    return ChatMessage(
+        role=Role.ASSISTANT,
+        content=execute_tool("memory_connections", topic=topic),
+    )
+
+
 def handle_command(command: str) -> ChatMessage:
     """
     Runs a shell command, gated by the security boundary.
@@ -953,14 +1905,301 @@ def handle_command(command: str) -> ChatMessage:
     blocked = _gate_command(command)
     if blocked is not None:
         return blocked
+    content = f"Command execution requested: '{command}'"
+    from ultron.core.tools.resource_monitor import forecast_warning
+    warning = forecast_warning(command)
+    if warning:
+        content += f"\n\n[resources] ⚠ {warning}"
     return ChatMessage(
         role=Role.ASSISTANT,
-        content=f"Command execution requested: '{command}'",
+        content=content,
         pending_action=PendingAction(
             action_type="run_command",
             target=command
         )
     )
+
+def handle_parallel(commands: list[str]) -> ChatMessage:
+    """
+    Runs a batch of shell commands concurrently, gated command-by-command.
+
+    The batch is only as safe as its most dangerous command, so every
+    command is classified individually before anything runs:
+
+      - any denial (credential in a command, unsafe pattern) hard-blocks the
+        whole batch — nothing runs;
+      - any command needing confirmation routes the whole batch through a
+        single interactive PendingAction — the user approves the batch once,
+        seeing every command;
+      - when every command is auto-allowed, the batch executes immediately.
+    """
+    from ultron.core.tools.registry import get_tool
+
+    # Normalize: a single "command" may carry embedded newlines (e.g. from an
+    # LLM tool call). Each line is its own shell command, so gate and run them
+    # per line — classification must match execution exactly.
+    normalized: list[str] = []
+    for cmd in commands:
+        for line in str(cmd).splitlines():
+            line = line.strip()
+            if line:
+                normalized.append(line)
+    commands = normalized
+    if not commands:
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content="Error: no commands provided to run in parallel.",
+        )
+
+    blocked_reasons: list[str] = []
+    needs_confirm = False
+    for i, cmd in enumerate(commands):
+        verdict = check_action("run_command", cmd)
+        if is_denied(verdict):
+            # Report the position and the reason, never the raw command text:
+            # the guardrails just flagged it (e.g. it carries a credential),
+            # so echoing it back would defeat the redaction stance used
+            # everywhere else.
+            blocked_reasons.append(
+                f"  - command {i + 1}: {blocked_message(verdict)}"
+            )
+        elif is_confirm(verdict):
+            needs_confirm = True
+
+    if blocked_reasons:
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=(
+                "Parallel execution blocked — one or more commands were denied "
+                "by the security boundary:\n" + "\n".join(blocked_reasons)
+            ),
+        )
+
+    # Resource awareness: a batch that would otherwise auto-run is escalated
+    # to confirmation when any command is forecast-heavy/critical or the
+    # batch is large (parallel execution multiplies CPU and memory).
+    from ultron.core.tools.resource_monitor import forecast_severity
+
+    heavy_cmds = [
+        cmd for cmd in commands if forecast_severity(cmd) in {"heavy", "critical"}
+    ]
+    resource_note: str | None = None
+    if heavy_cmds:
+        resource_note = (
+            "[resources] \u26a0 heavy commands in this batch: "
+            + ", ".join(heavy_cmds)
+            + " — running them together may spike CPU and memory."
+        )
+    elif len(commands) > 8:
+        resource_note = (
+            f"[resources] \u26a0 batch of {len(commands)} commands in parallel "
+            "may spike CPU and memory."
+        )
+
+    if needs_confirm:
+        listing = "\n".join(
+            f"  {i + 1}. {cmd}" for i, cmd in enumerate(commands)
+        )
+        content = (
+            f"Parallel execution requested ({len(commands)} commands "
+            f"run simultaneously):\n{listing}"
+        )
+        if resource_note:
+            content += f"\n\n{resource_note}"
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=content,
+            pending_action=PendingAction(
+                action_type="run_parallel",
+                target="\n".join(commands),
+            ),
+        )
+
+    if resource_note:
+        # Permissive mode promises no prompts: run the batch and attach the
+        # resource warning to the reply instead of escalating.
+        if security_mode() == "permissive":
+            func = get_tool("run_parallel")
+            result = (
+                func(commands)
+                if func
+                else "Error: Tool 'run_parallel' not found in registry."
+            )
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=f"{result}\n\n{resource_note}",
+            )
+        listing = "\n".join(
+            f"  {i + 1}. {cmd}" for i, cmd in enumerate(commands)
+        )
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=(
+                f"Parallel execution requested ({len(commands)} commands "
+                f"run simultaneously):\n{listing}\n\n{resource_note}"
+            ),
+            pending_action=PendingAction(
+                action_type="run_parallel",
+                target="\n".join(commands),
+            ),
+        )
+
+    func = get_tool("run_parallel")
+    result = (
+        func(commands)
+        if func
+        else "Error: Tool 'run_parallel' not found in registry."
+    )
+    return ChatMessage(role=Role.ASSISTANT, content=str(result))
+
+
+async def handle_parallel_tools(
+    user_input: str,
+    engine,
+    calls: list[dict] | None = None,
+) -> ChatMessage:
+    """
+    Runs several *different* tools concurrently and returns one synthesized
+    report (the inter-tool counterpart of ``handle_parallel``).
+
+    ``calls`` is the deterministically-extracted batch when the detector
+    produced one; otherwise the LLM planner (``plan_tool_batch``) turns the
+    request into independent calls. Every call is gated through the security
+    boundary inside ``run_tool_batch`` — deny verdicts never execute, confirm
+    verdicts are surfaced as needing approval instead of running silently.
+    """
+    if calls is None:
+        from ultron.core.intelligence.parallel_tools import plan_tool_batch
+
+        calls = await plan_tool_batch(user_input, engine)
+    if not calls:
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=(
+                "I couldn't break that down into parallel tool calls. Try "
+                "naming the sources explicitly, e.g. 'read config.json and "
+                "notes.txt' or 'check example.com and the docs site'."
+            ),
+        )
+
+    from ultron.core.intelligence.parallel_tools import run_tool_batch
+
+    result = run_tool_batch(json.dumps(calls))
+    return ChatMessage(role=Role.ASSISTANT, content=str(result))
+
+
+def detect_retrieval_intent(user_input: str) -> dict | None:
+    """
+    Detects unified-retrieval requests: checking whether a site is online
+    and/or reading the content of a URL.
+
+    Returns {"request": ..., "url": ... | None} when the request is
+    retrieval-shaped, otherwise None. Placed before the HTTP / web-search /
+    fetch detectors so "is example.com online and read its headlines" is
+    handled by the orchestrator as one unit instead of being partially
+    matched per tool. Plain searches (no URL, no availability marker) and
+    state-changing API calls keep their existing paths.
+    """
+    from ultron.core.tools.builtin.retrieval import (
+        _CONNECTIVITY_MARKER,
+        _CONTENT_MARKER,
+        _DOMAIN_RE,
+        extract_retrieval_url,
+    )
+
+    text = user_input.strip()
+    url = extract_retrieval_url(text)
+    if url is None and _CONNECTIVITY_MARKER.search(text):
+        # Availability requests may name hosts with non-web TLDs (.local, .lan)
+        # that the web-domain guard in extract_retrieval_url rejects — accept
+        # any bare domain here since the request is explicitly about reachability.
+        domain = _DOMAIN_RE.search(text)
+        if domain:
+            url = "https://" + domain.group(0).lower()
+    if url is None:
+        # No URL: only claim availability requests (which need the URL from a
+        # follow-up clarification turn).
+        if _CONNECTIVITY_MARKER.search(text):
+            return {"request": text, "url": None}
+        return None
+
+    has_connectivity = bool(_CONNECTIVITY_MARKER.search(text))
+    has_content = bool(_CONTENT_MARKER.search(text))
+    if has_connectivity or has_content:
+        return {"request": text, "url": url}
+    return None
+
+
+def handle_retrieve(request: str, url: str | None = None) -> ChatMessage:
+    """
+    Runs the unified retrieval orchestrator, gated by the security boundary.
+
+    Retrieval is read-only (LOW risk) so it auto-executes in every mode; the
+    guardrails deny unsafe URLs before any network request fires. When no URL
+    can be found the orchestrator says so explicitly instead of guessing.
+    """
+    verdict = check_action("retrieve", url or "")
+    if is_denied(verdict):
+        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+    result = execute_tool("retrieve", request=request, url=url)
+    return ChatMessage(role=Role.ASSISTANT, content=str(result))
+
+
+def handle_api_schema(action: str, url: str | None = None) -> ChatMessage:
+    """
+    Handles API schema learning / inspection / reset requests, gated by the
+    security boundary like every other tool action.
+
+    - learn      -> fetch + mine the OpenAPI spec (read-only, LOW risk)
+    - knowledge  -> summarize learned endpoints + detected drift
+    - hints      -> usage prediction for a pending call
+    - forget     -> clear everything learned about one API
+    """
+    if action == "knowledge" and not url:
+        verdict = check_action("get_api_knowledge", "")
+        if is_denied(verdict):
+            return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=execute_tool("get_api_knowledge", base_url=""),
+        )
+
+    if not url:
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=(
+                "Which API? Send me its base URL "
+                "(e.g. http://localhost:8000 or example.com)."
+            ),
+        )
+
+    if action == "hints":
+        verdict = check_action("api_usage_hint", url)
+        if is_denied(verdict):
+            return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=execute_tool("api_usage_hint", method="GET", url=url),
+        )
+
+    tool_name = {
+        "learn": "learn_api_schema",
+        "knowledge": "get_api_knowledge",
+        "forget": "forget_api",
+    }.get(action)
+    if tool_name is None:
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content="Sorry, I didn't understand that schema request.",
+        )
+    verdict = check_action(tool_name, url)
+    if is_denied(verdict):
+        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+    return ChatMessage(
+        role=Role.ASSISTANT,
+        content=execute_tool(tool_name, base_url=url),
+    )
+
 
 def handle_http(method: str, url: str, body: str | None = None) -> ChatMessage:
     """
@@ -1010,16 +2249,21 @@ def handle_http(method: str, url: str, body: str | None = None) -> ChatMessage:
     else:
         try:
             result = http_tool(method_upper, url, body)
-        except Exception as exc:
+        except (httpx.HTTPError, OSError, ValueError) as exc:
             result = f"Error: unexpected error during HTTP request ({exc})."
 
     return ChatMessage(role=Role.ASSISTANT, content=result)
 
 async def handle_multistep(user_input: str, engine) -> ChatMessage:
     """
-    Breaks a compound request into steps via the LLM planner, then executes
-    them in order.  Returns a clear step-by-step result summary.
-    If planning fails (unparseable JSON), returns a friendly fallback message.
+    Breaks a compound request into steps via the LLM planner, then runs the
+    plan preflight: every step's permission, missing info, and dependencies
+    are listed UP FRONT before anything executes.
+
+    - Any blocked step → the plan is never offered (the preview explains why).
+    - Any step needing approval or missing information → one approval prompt
+      for the whole plan (steps JSON in the pending action).
+    - All auto + complete → runs immediately with the preview as an intro.
     """
     steps = await plan_task(user_input, engine)
 
@@ -1036,9 +2280,41 @@ async def handle_multistep(user_input: str, engine) -> ChatMessage:
             )
         )
 
-    # Run each step in order, stopping immediately on any error.
+    from ultron.core.intelligence.planning import format_plan_preview, preflight_plan
+
+    # Classify every step exactly once; the preview reuses the result.
+    preflight = preflight_plan(steps)
+    preview = format_plan_preview(steps, preflight)
+    summary = preflight["summary"]
+
+    # A security-blocked step (secret exfiltration, unsafe URL, path
+    # escape) means the plan must not run at all — say why.
+    if summary["blocked"] > 0:
+        lines = [preview, "", "⛔ This plan contains blocked steps and will not run:"]
+        for index, action, reason in preflight["blocked"]:
+            lines.append(f"  • step {index} ({action}): {reason}")
+        return ChatMessage(role=Role.ASSISTANT, content="\n".join(lines))
+
+    # Any step needing approval (or missing information) → ask once, up
+    # front, for the whole chain instead of prompting mid-execution. The
+    # preview rides on the pending action so the CLI approval card shows it.
+    if summary["confirm"] > 0 or summary["missing"] > 0:
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=preview,
+            pending_action=PendingAction(
+                action_type="execute_plan",
+                target=json.dumps(steps),
+                content=preview,
+            ),
+        )
+
+    # Every step is auto-allowed and complete — run with the preview shown.
     step_results = await execute_plan(steps)
-    return ChatMessage(role=Role.ASSISTANT, content="\n".join(step_results))
+    return ChatMessage(
+        role=Role.ASSISTANT,
+        content=preview + "\n\n" + "\n".join(step_results),
+    )
 
 async def handle_llm_fallback(
     user_input: str,
@@ -1076,8 +2352,20 @@ async def handle_llm_fallback(
         "}\n"
         "```\n"
         "Do NOT include any extra conversational text before or after the JSON block when calling a tool.\n"
-        "4. If no tool is explicitly needed for the user's message, answer directly in natural conversational text."
+        "4. If no tool is explicitly needed for the user's message, answer directly in natural conversational text.\n"
+        f"{build_response_guidance()}"
     )
+
+    # Structured output enforcement: when the user asked for a machine-
+    # readable shape ("as JSON with fields …"), the exact schema is injected
+    # here so the model knows the required shape before generating.
+    from ultron.core.intelligence.structured_output import (
+        enforce_reply,
+        schema_prompt_block,
+    )
+    schema_block = schema_prompt_block(user_input)
+    if schema_block:
+        tool_instruction += "\n\n" + schema_block
 
     # Create a copy of the history list to avoid mutating original
     messages = list(history) if history else []
@@ -1130,6 +2418,10 @@ async def handle_llm_fallback(
                             target=cmd
                         )
                     )
+                elif tool_name == "run_parallel":
+                    cmds = [str(c) for c in arguments.get("commands", [])]
+                    return handle_parallel(cmds)
+
                 elif tool_name == "write_file":
                     fname = arguments.get("filename", "")
                     content = arguments.get("content", "")
@@ -1143,14 +2435,14 @@ async def handle_llm_fallback(
                     return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
                 try:
                     tool_result = func(**arguments)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 — arbitrary tool surface
                     tool_result = f"Error executing tool '{tool_name}': {exc}"
 
                 return ChatMessage(
                     role=Role.ASSISTANT,
                     content=f"Executed tool '[bold cyan]{tool_name}[/bold cyan]':\n\n{tool_result}"
                 )
-        except Exception as exc:
+        except (json.JSONDecodeError, IndexError, TypeError, ValueError) as exc:
             logger.debug(f"Failed to parse tool call JSON from LLM: {exc}")
 
     # Legacy TOOL_CALL: read_file: fallback compatibility — still gated by
@@ -1169,8 +2461,13 @@ async def handle_llm_fallback(
                     content=f"Here are the contents of '{file_path}':\n\n{tool_result}"
                 )
 
-    # Standard natural text response
-    return ChatMessage(role=Role.ASSISTANT, content=response_content)
+    # Standard natural text response — with structured-output enforcement:
+    # when a schema was requested, the reply is validated + deterministically
+    # repaired before it is shown ([structured] notes list every change).
+    return ChatMessage(
+        role=Role.ASSISTANT,
+        content=polish_response(enforce_reply(user_input, response_content)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1214,7 +2511,7 @@ async def classify_intent(user_input: str, engine) -> str:
         "- run_tests: user wants to run unit tests or pytest, e.g. 'test my code', 'run pytest'\n"
         "- lint: user wants to lint or check code quality, e.g. 'check for errors', 'run linter'\n"
         "- remember: user wants Ultron to store or remember a fact, e.g. 'remember that key is 123', 'please remember I like Python'\n"
-        "- memory_question: user asks what facts or information Ultron remembers, e.g. 'what do you know about databases', 'what did I tell you about FastAPI'\n"
+        "- memory_question: user asks what facts or information Ultron remembers, or a reasoning question about stored knowledge, e.g. 'what do you know about databases', 'what is the capital of France', 'what did I tell you about FastAPI'\n"
         "- none: none of the above categories apply\n\n"
         f"User message: {user_input}\n\n"
         "Respond with ONLY the single category word, nothing else. If none of these clearly apply, respond with 'none'."
@@ -1226,7 +2523,7 @@ async def classify_intent(user_input: str, engine) -> str:
         if category in valid_categories:
             return category
         return "none"
-    except Exception:
+    except (httpx.HTTPError, OSError, ValueError):
         return "none"
 
 
@@ -1287,6 +2584,18 @@ class SimpleAgent(BaseAgent):
                 if cmd:
                     return handle_command(cmd)
 
+            elif cat == "retrieve":
+                from ultron.core.tools.builtin.retrieval import extract_retrieval_url
+                url = extract_retrieval_url(user_input)
+                if url:
+                    return handle_retrieve(user_input, url)
+
+            elif cat == "api_schema":
+                action = pending.get("action", "learn")
+                url = extract_api_url(user_input)
+                if url:
+                    return handle_api_schema(action, url)
+
         # Clear any leftover pending state if execution reached here
         self._pending_clarification = None
 
@@ -1299,6 +2608,25 @@ class SimpleAgent(BaseAgent):
         # Step 0.5: greeting intent — fast-path conversational response bypassing tools/LLM
         if detect_greeting_intent(user_input):
             return handle_greeting()
+
+        # Step 0.9: image analysis — before file reads so "analyze chart.png"
+        #           routes to the vision model, not the raw-file reader.
+        image_path = detect_image_intent(user_input)
+        if image_path:
+            return await handle_image(image_path, user_input, self.engine)
+
+        # Step 0.95: inter-tool parallel batch — several independent sources
+        #           at once ("read X and Y", "check A and B and C",
+        #           "search for P and Q"). Runs BEFORE the single-target
+        #           detectors so the request is captured as one parallel unit
+        #           instead of being claimed by the first single match. The
+        #           command-parallel path (detect_parallel_intent) is exempt
+        #           inside the detector itself.
+        batch_req = detect_tool_batch_intent(user_input)
+        if batch_req:
+            if batch_req.get("calls"):
+                return await handle_parallel_tools(user_input, self.engine, calls=batch_req["calls"])
+            return await handle_parallel_tools(user_input, self.engine)
 
         # Step 1: file-read intent
         filename = detect_file_read_intent(user_input)
@@ -1315,11 +2643,35 @@ class SimpleAgent(BaseAgent):
         if fact:
             return handle_remember(fact)
 
+        # Step 3.4: knowledge-graph reasoning — answerable by deterministic
+        #           graph traversal (query_chain), so it runs before recall.
+        deduction_question = detect_deduction_question(user_input)
+        if deduction_question:
+            return handle_deduction_question(deduction_question)
+
         # Step 3.5: recall stored facts about a topic — handled in code (not AI)
         #           so only matching facts are shown and hallucination is impossible.
         topic = detect_memory_question(user_input)
         if topic:
             return handle_memory_question(topic)
+
+        # Step 3.55: personalized learning — cross-domain memory connections
+        #           ("what connections do you see", "how is X related to Y").
+        association = detect_association_intent(user_input)
+        if association:
+            return handle_association(
+                association["action"],
+                a=association.get("a", ""),
+                b=association.get("b", ""),
+                topic=association.get("topic", ""),
+            )
+
+        # Step 3.7: parallel command execution — before the single-command
+        #           detectors so an explicit "in parallel" request wins over
+        #           partial matches of its individual commands.
+        parallel_commands = detect_parallel_intent(user_input)
+        if parallel_commands:
+            return handle_parallel(parallel_commands)
 
         # Step 4: run tests
         if detect_test_intent(user_input):
@@ -1335,6 +2687,45 @@ class SimpleAgent(BaseAgent):
         #            code" maps to ruff rather than failing in the shell.
         if detect_lint_intent(user_input):
             return handle_lint()
+
+        # Step 3.45: API schema inference — learn / inspect / forget API
+        #           schemas. Before the memory-question detector so "what do
+        #           you know about the api at X" routes to schema knowledge,
+        #           and before the HTTP detector so "learn the schema for
+        #           http://..." is never mistaken for a plain GET.
+        schema_req = detect_api_schema_intent(user_input)
+        if schema_req:
+            action, url = schema_req["action"], schema_req["url"]
+            if url or action == "knowledge":
+                return handle_api_schema(action, url)
+            self._pending_clarification = {"category": "api_schema", "action": action}
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=(
+                    "Which API? Send me its base URL "
+                    "(e.g. http://localhost:8000 or example.com)."
+                ),
+            )
+
+        # Step 4.8: resource monitoring — system snapshots and command
+        #           forecasts ("how is my system", "will this be heavy").
+        resource_req = detect_resource_intent(user_input)
+        if resource_req:
+            return handle_resource(resource_req["action"], resource_req.get("command"))
+
+        # Step 4.84: unified retrieval — one entry point for "is X online",
+        #           "read X", or a combination; it plans the best networking
+        #           strategy (connectivity / fetch / search / both) instead of
+        #           guessing between separate web tools.
+        retrieval = detect_retrieval_intent(user_input)
+        if retrieval:
+            if retrieval["url"]:
+                return handle_retrieve(retrieval["request"], retrieval["url"])
+            self._pending_clarification = {"category": "retrieve"}
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content="Which website should I check? Send me the URL (or a domain like example.com).",
+            )
 
         # Step 4.85: HTTP intent — before generic command detector
         http_match = detect_http_intent(user_input)
@@ -1386,6 +2777,19 @@ class SimpleAgent(BaseAgent):
                     )
                 )
             return ChatMessage(role=Role.ASSISTANT, content=run_query(db_sql))
+
+        # Step 4.97: environmental-state debugging — "debug this",
+        #            "why is my script failing", "diagnose this error: …".
+        #            Runs before the generic command detector so debug
+        #            phrasing produces a diagnosis + environment report
+        #            instead of being passed to the shell verbatim.
+        debug_req = detect_debug_intent(user_input)
+        if debug_req:
+            return handle_debug(
+                debug_req.get("command", ""),
+                error=debug_req.get("error", ""),
+                expected=debug_req.get("expected", ""),
+            )
 
         # Step 5: generic shell command ("run X" / "execute X")
         command = detect_command_intent(user_input)
@@ -1496,6 +2900,11 @@ class SimpleAgent(BaseAgent):
                     return handle_remember(re_fact)
 
             elif category == "memory_question":
+                # Reasoning questions get the deterministic graph answer first;
+                # otherwise fall back to topic recall across both stores.
+                re_deduction = detect_deduction_question(user_input)
+                if re_deduction:
+                    return handle_deduction_question(re_deduction)
                 re_topic = detect_memory_question(user_input)
                 if re_topic:
                     return handle_memory_question(re_topic)

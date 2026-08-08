@@ -2,7 +2,8 @@ from ultron.core.config import settings
 from ultron.core.engine.base import BaseEngine
 from ultron.core.engine.ollama import OllamaEngine
 
-def get_engine(name: str = None) -> BaseEngine:
+
+def get_engine(name: str | None = None) -> BaseEngine:
     """
     Factory function to get the appropriate LLM engine backend.
     

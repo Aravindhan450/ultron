@@ -11,6 +11,7 @@ interactive CLI confirmation flow, which is out of scope here.
 """
 
 import asyncio
+import json
 
 from ultron.core.agents.react import ReActAgent, extract_tool_call
 from ultron.core.types import Role
@@ -194,6 +195,124 @@ def test_write_file_requires_confirmation(tmp_path, monkeypatch):
     assert msg.pending_action.content == "hi"
     # Nothing may be written to disk before the user confirms.
     assert not (tmp_path / "new.txt").exists()
+
+
+def test_tool_loop_run_tool_batch_then_answer(tmp_path, monkeypatch):
+    # ReAct drives run_tool_batch as one tool call; the synthesized report
+    # flows back as an Observation so the model can answer from it.
+    from ultron.core.tools import paths
+
+    monkeypatch.setattr(paths, "ALLOWED_BASE_DIR", tmp_path)
+
+    a = tmp_path / "a.txt"
+    b = tmp_path / "b.txt"
+    a.write_text("alpha content", encoding="utf-8")
+    b.write_text("beta content", encoding="utf-8")
+
+    calls_json = json.dumps(
+        [
+            {"tool": "read_file", "arguments": {"file_path": str(a)}},
+            {"tool": "read_file", "arguments": {"file_path": str(b)}},
+        ]
+    )
+    tool_block = json.dumps(
+        {"tool": "run_tool_batch", "arguments": {"calls_json": calls_json}}
+    )
+    engine = FakeEngine(
+        [
+            f"```json\n{tool_block}\n```",
+            "The files say alpha and beta.",
+        ]
+    )
+    agent = ReActAgent(engine)
+    msg = _run(agent.run("read both files"))
+    assert msg.content == "The files say alpha and beta."
+
+    second_call = engine.calls[1]
+    observations = [m for m in second_call if m.get("role") == "tool"]
+    assert len(observations) == 1
+    assert observations[0]["name"] == "run_tool_batch"
+    assert "Parallel batch" in observations[0]["content"]
+    assert "alpha content" in observations[0]["content"]
+    assert "beta content" in observations[0]["content"]
+
+
+def test_run_tool_batch_routes_directly_without_outer_url_scan(monkeypatch):
+    # A valid batch whose member carries an http:// URL must NOT be blocked by
+    # an outer content scan — run_tool_batch routes directly and the per-member
+    # gate decides (check_connectivity on an http URL would be a member-level
+    # guardrail call, not a blanket batch block).
+    from ultron.core.intelligence import parallel_tools as pt
+
+    captured = {}
+    real_execute = pt.execute_batch
+
+    def spy_execute(calls):
+        captured["calls"] = calls
+        return real_execute(calls)
+
+    monkeypatch.setattr(pt, "execute_batch", spy_execute)
+
+    calls_json = json.dumps(
+        [
+            {"tool": "check_connectivity", "arguments": {"url": "http://example.com"}},
+            {"tool": "read_file", "arguments": {"file_path": "README.md"}},
+        ]
+    )
+    tool_block = json.dumps(
+        {"tool": "run_tool_batch", "arguments": {"calls_json": calls_json}}
+    )
+    engine = FakeEngine(
+        [
+            f"```json\n{tool_block}\n```",
+            "done",
+        ]
+    )
+    agent = ReActAgent(engine)
+    msg = _run(agent.run("check the site and read readme"))
+    assert "done" in msg.content
+    # The batch reached the executor with both members intact.
+    assert captured["calls"][0]["tool"] == "check_connectivity"
+    assert captured["calls"][1]["tool"] == "read_file"
+
+
+def test_run_tool_batch_missing_calls_json_is_observation():
+    engine = FakeEngine(
+        ['```json\n{"tool": "run_tool_batch", "arguments": {}}\n```', "ok"]
+    )
+    agent = ReActAgent(engine)
+    _run(agent.run("batch something"))
+    # The error is fed back as an Observation so the loop can recover.
+    second_call = engine.calls[1]
+    observations = [m for m in second_call if m.get("role") == "tool"]
+    assert len(observations) == 1
+    assert "calls_json" in observations[0]["content"]
+
+
+def test_run_tool_batch_accepts_calls_list_argument():
+    # The model may emit a structured list under 'calls' instead of a JSON
+    # string under 'calls_json' — both spellings must work.
+    calls_list = [
+        {"tool": "read_file", "arguments": {"file_path": "README.md"}},
+        {"tool": "read_file", "arguments": {"file_path": "pyproject.toml"}},
+    ]
+    tool_block = json.dumps(
+        {"tool": "run_tool_batch", "arguments": {"calls": calls_list}}
+    )
+    engine = FakeEngine(
+        [
+            f"```json\n{tool_block}\n```",
+            "done",
+        ]
+    )
+    agent = ReActAgent(engine)
+    _run(agent.run("read readme and pyproject"))
+    # The synthesized batch report flows back as an Observation.
+    second_call = engine.calls[1]
+    observations = [m for m in second_call if m.get("role") == "tool"]
+    assert len(observations) == 1
+    assert "Parallel batch" in observations[0]["content"]
+    assert "README.md" in observations[0]["content"]
 
 
 def test_max_iterations_stops_loop():

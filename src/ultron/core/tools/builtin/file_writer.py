@@ -1,6 +1,7 @@
 import os
-from pathlib import Path
+
 from ultron.core.tools.paths import is_path_safe
+
 
 def write_file(file_path: str, content: str, overwrite: bool = False) -> str:
     """
@@ -31,8 +32,8 @@ def write_file(file_path: str, content: str, overwrite: bool = False) -> str:
         is_safe, resolved_path = is_path_safe(file_path)
         if not is_safe:
             return "Error: access denied, that file is outside the allowed project folder."
-    except Exception as e:
-        return f"Error resolving file path: {str(e)}"
+    except (OSError, ValueError) as e:
+        return f"Error resolving file path: {e!s}"
 
     # Guard 3: resolved path must not be a directory (catches edge cases after symlink resolution)
     if resolved_path.is_dir():
@@ -47,5 +48,5 @@ def write_file(file_path: str, content: str, overwrite: bool = False) -> str:
         with open(resolved_path, "w", encoding="utf-8") as f:
             f.write(content)
         return f"Successfully wrote {len(content)} characters to '{resolved_path}'."
-    except Exception as e:
-        return f"Error writing to file: {str(e)}"
+    except (OSError, ValueError) as e:
+        return f"Error writing to file: {e!s}"

@@ -1,5 +1,6 @@
 from ultron.core.tools.paths import is_path_safe
 
+
 def read_file(file_path: str) -> str:
     """
     Reads the content of a file on the disk and returns it as a string.
@@ -12,8 +13,8 @@ def read_file(file_path: str) -> str:
         is_safe, resolved_path = is_path_safe(file_path)
         if not is_safe:
             return "Error: access denied, file is outside the allowed directory"
-    except Exception as e:
-        return f"Error resolving file path: {str(e)}"
+    except (OSError, ValueError) as e:
+        return f"Error resolving file path: {e!s}"
 
     # Check if the file actually exists on the computer
     if not resolved_path.exists():
@@ -33,6 +34,6 @@ def read_file(file_path: str) -> str:
             return content[:5000] + "...[truncated]"
             
         return content
-    except Exception as e:
+    except (OSError, ValueError) as e:
         # If any other error happens (like permission denied), return the error message
-        return f"Error reading file: {str(e)}"
+        return f"Error reading file: {e!s}"

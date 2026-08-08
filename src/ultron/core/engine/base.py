@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
+
 
 class BaseEngine(ABC):
     """
@@ -11,11 +13,9 @@ class BaseEngine(ABC):
         """
         Generate a complete text response for a given list of chat messages.
         """
-        pass
 
     @abstractmethod
     async def stream(self, messages: list[dict[str, Any]], **kwargs: Any) -> AsyncIterator[str]:
         """
         Stream text response chunks for a given list of chat messages.
         """
-        pass

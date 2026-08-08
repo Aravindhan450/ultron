@@ -13,14 +13,21 @@ from rich.table import Table
 from rich.text import Text
 
 from ultron.core.state import CLIState
+from ultron.ui.theme import console
 
 
-def build_header(state: CLIState) -> RenderableType:
+def build_header(state: CLIState, width: int | None = None) -> RenderableType:
     """
     Dynamically compiles top header banner using state.
     Uses overflow='ellipsis' and no_wrap=True on header table cells so window
     minimization or resizing never breaks box borders or splits ASCII lines.
+
+    On narrow terminals the layout degrades from a side-by-side grid (logo +
+    info) to a stacked single column so the 43-column ASCII wordmark keeps its
+    shape instead of being crushed.
     """
+    wide = (width if width is not None else console.width) >= 96
+
     logo_lines = [
         "██╗   ██╗██╗  ████████╗██████╗  ██████╗ ███╗   ██╗",
         "██║   ██║██║  ╚══██╔══╝██╔══██╗██╔═══██╗████╗  ██║",
@@ -38,9 +45,9 @@ def build_header(state: CLIState) -> RenderableType:
     # Meta Context Details
     info_table = Table.grid(padding=(0, 1), expand=True)
     info_table.add_column(justify="left", no_wrap=True, overflow="ellipsis")
-    
+
     info_table.add_row(Text(f"ULTRON AI {state.version}", style="bold #ffcc00", no_wrap=True, overflow="ellipsis"))
-    
+
     model_text = Text(no_wrap=True, overflow="ellipsis")
     model_text.append("Model: ", style="dim white")
     model_text.append(state.active_model, style="bold #ff9500")
@@ -56,11 +63,17 @@ def build_header(state: CLIState) -> RenderableType:
     status_text.append(state.status, style="bold green" if state.status == "Ready" else "bold yellow")
     info_table.add_row(status_text)
 
-    # Grid table combining Logo & Info
+    # Grid table combining Logo & Info (side-by-side on wide terminals,
+    # stacked on narrow ones)
     grid = Table.grid(expand=True)
-    grid.add_column(ratio=2, no_wrap=True, overflow="ellipsis")
-    grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
-    grid.add_row(logo_text, info_table)
+    if wide:
+        grid.add_column(ratio=2, no_wrap=True, overflow="ellipsis")
+        grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        grid.add_row(logo_text, info_table)
+    else:
+        grid.add_column(no_wrap=True, overflow="ellipsis")
+        grid.add_row(logo_text)
+        grid.add_row(info_table)
 
     return Panel(
         grid,
@@ -70,17 +83,19 @@ def build_header(state: CLIState) -> RenderableType:
         subtitle_align="right"
     )
 
-def build_status_bar(state: CLIState) -> RenderableType:
+def build_status_bar(state: CLIState, width: int | None = None) -> RenderableType:
     """
     Renders the bottom status / prompt guidelines bar.
+    Drops the trailing hint on narrow terminals to avoid wrapping.
     """
     bar_text = Text(no_wrap=True, overflow="ellipsis")
     bar_text.append("⚡ ", style="bold #ffcc00")
     bar_text.append(f"Model: {state.active_model}", style="bold #ff9500")
     bar_text.append(" | ", style="dim white")
     bar_text.append(f"Status: {state.status}", style="bold white")
-    bar_text.append(" | ", style="dim white")
-    bar_text.append("Press Esc to cancel active task", style="dim grey50")
+    if (width if width is not None else console.width) >= 82:
+        bar_text.append(" | ", style="dim white")
+        bar_text.append("Press Esc to cancel active task", style="dim grey50")
 
     return Panel(
         bar_text,
@@ -88,25 +103,28 @@ def build_status_bar(state: CLIState) -> RenderableType:
         border_style="grey35"
     )
 
-def build_layout(state: CLIState, chat_renderable: RenderableType = None) -> Layout:
+def build_layout(state: CLIState, chat_renderable: RenderableType = None, width: int | None = None) -> Layout:
     """
     Constructs a Rich Layout with three distinct viewport regions:
-      - Header Panel (Fixed Top, ratio=10 or size fixed)
+      - Header Panel (Fixed Top, size varies with terminal width)
       - Chat Viewport (Flex Center)
       - Status / Input Bar (Fixed Bottom)
     """
+    term_width = width if width is not None else console.width
+    header_size = 12 if term_width < 96 else 9
+
     layout = Layout()
     layout.split(
-        Layout(name="header", size=9),
+        Layout(name="header", size=header_size),
         Layout(name="body", ratio=1),
         Layout(name="footer", size=3),
     )
 
-    layout["header"].update(build_header(state))
+    layout["header"].update(build_header(state, width=term_width))
     if chat_renderable is not None:
         layout["body"].update(chat_renderable)
     else:
         layout["body"].update(Panel("Ultron CLI Ready.", box=box.SIMPLE))
-    layout["footer"].update(build_status_bar(state))
+    layout["footer"].update(build_status_bar(state, width=term_width))
 
     return layout

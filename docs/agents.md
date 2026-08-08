@@ -62,6 +62,13 @@ Key details:
   a `PendingAction` so the CLI shows an interactive confirmation first.
 - A `max_iterations` cap (default 10) prevents runaway loops if the model
   keeps calling tools without ever reaching a final answer.
+- **Parallel batching:** when the model needs several independent read-only
+  lookups at once, it can emit a single `run_tool_batch` call whose
+  `calls_json` is a JSON array of `{"tool", "arguments"}` — the batch runs
+  auto-allowed members concurrently, gates each member through the same
+  security boundary (deny never runs, confirm never runs silently), and
+  returns one synthesized report as the Observation. See
+  [docs/parallel-tools.md](docs/parallel-tools.md).
 
 ### Selecting the ReAct agent
 
@@ -89,7 +96,9 @@ The agent writes Python (or shell) code, runs it in a sandbox, sees the output, 
 - Agents **never** bypass the Permission & Approval system.
 - High/Critical risk tools always require human confirmation.
 - Sandboxed agents run in containers or WASM when possible.
-- All tool calls and decisions are audited.
+- All tool calls and decisions are audited: every allow/confirm/deny verdict is
+  appended to the JSON-lines trail at `~/.ultron/security_audit.jsonl` (UTC
+  timestamp, tier, decision, mode, reason, guardrail findings).
 
 ## Adding a New Agent
 

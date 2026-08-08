@@ -1,11 +1,16 @@
 import asyncio
+
 import typer
+
 from ultron import __version__
 from ultron.core.config import settings
+from ultron.core.intelligence.prompt_assembly import build_response_guidance
 from ultron.core.logging import get_logger
+from ultron.ui.layout import build_header, build_status_bar
 from ultron.ui.theme import UI, console
-from ultron.ui.layout import build_header, build_status_bar, build_layout
 
+# Base system prompt: identity + the shared response-style guidance.
+_BASE_SYSTEM_PROMPT = "You are Ultron, a helpful local AI assistant.\n\n" + build_response_guidance().rstrip()
 
 logger = get_logger("ultron.cli")
 
@@ -33,7 +38,6 @@ def main(
     """
     Ultron AI Assistant - Local-first JARVIS-style system.
     """
-    pass
 
 @app.command()
 def run():
@@ -81,7 +85,7 @@ def print_banner(model_name: str) -> None:
     UI.render_banner(model=model_name, cwd_short=_short_cwd())
 
 
-def render_status_bar(model_name: str, cwd_short: str = None) -> None:
+def render_status_bar(model_name: str, cwd_short: str | None = None) -> None:
     """
     Renders a compact single-line status bar for model_name.
     """
@@ -180,6 +184,7 @@ async def handle_slash_command(
         import questionary
         from rich import box
         from rich.panel import Panel
+
         from ultron.core.config import settings, update_env_file
 
         models: list[str] = []
@@ -345,10 +350,77 @@ async def handle_slash_command(
 
         return True, False
 
+    if clean_cmd == "/memory" or clean_cmd.startswith("/memory "):
+        from rich import box
+        from rich.panel import Panel
+        from rich.table import Table
+
+        from ultron.core.tools.memory import graph
+
+        sub = clean_cmd[len("/memory"):].strip()
+
+        # /memory clear — drop every graph edge (corrects bad memories).
+        if sub == "clear":
+            console.print(graph.clear_all_triples())
+            console.print()
+            return True, False
+
+        # /memory remove <subject> <predicate> <object> — drop one edge.
+        if sub.startswith("remove "):
+            parts = sub[len("remove "):].split()
+            if len(parts) >= 3:
+                subject = parts[0]
+                object = parts[-1]
+                predicate = " ".join(parts[1:-1])
+                console.print(graph.remove_triple(subject, predicate, object))
+            else:
+                console.print(
+                    "[bold yellow]Usage: /memory remove <subject> <predicate> <object>[/bold yellow]\n"
+                    "[dim]e.g. /memory remove Paris is the capital of France[/dim]\n"
+                )
+            console.print()
+            return True, False
+
+        stats = graph.get_graph_stats()
+        triples = graph.get_all_triples()
+
+        console.print(
+            f"[bold #ffcc00]🧠 Memory graph[/bold #ffcc00] — "
+            f"[cyan]{stats['entities']}[/] entities · "
+            f"[magenta]{stats['triples']}[/] triples · "
+            f"[dim]{stats['facts']}[/] flat facts\n"
+        )
+
+        table = Table(box=box.ROUNDED, expand=False)
+        table.add_column("Stat", style="bold #ffcc00")
+        table.add_column("Count", style="bold white")
+        table.add_row("Entities (nodes)", str(stats["entities"]))
+        table.add_row("Triples (edges)", str(stats["triples"]))
+        table.add_row("Flat facts", str(stats["facts"]))
+
+        console.print(
+            Panel(
+                table,
+                title="[bold #ffcc00]🧠 Memory graph[/bold #ffcc00]",
+                border_style="#ff8700",
+                box=box.ROUNDED,
+            )
+        )
+        if triples:
+            console.print("[dim]Stored knowledge:[/dim]")
+            for edge in triples:
+                console.print(f"  [dim]-[/dim] {edge}")
+        else:
+            console.print(
+                "[dim]No triples stored yet — try 'remember that Paris is the capital of France'.[/dim]"
+            )
+        console.print()
+        return True, False
+
     if clean_cmd == "/clear":
         from ultron.core.types import ChatMessage, Role
         history.clear()
-        history.append(ChatMessage(role=Role.SYSTEM, content="You are Ultron, a helpful local AI assistant."))
+        history.append(ChatMessage(role=Role.SYSTEM, content=_BASE_SYSTEM_PROMPT))
         if layout and state:
             layout["header"].update(build_header(state))
             layout["footer"].update(build_status_bar(state))
@@ -363,19 +435,20 @@ async def handle_slash_command(
         # does not update existing object instances in-place; recreating the agent ensures
         # predictable behavior without lingering old code references.
         import importlib
+
         from ultron.core.types import ChatMessage, Role
 
         try:
             # Reload core modules in dependency order
+            import ultron.core.agents
+            import ultron.core.agents.simple
+            import ultron.core.tools.builtin.command_runner
             import ultron.core.tools.builtin.file_reader
             import ultron.core.tools.builtin.file_writer
-            import ultron.core.tools.builtin.command_runner
             import ultron.core.tools.builtin.http_client
             import ultron.core.tools.builtin.web_search
             import ultron.core.tools.memory.sqlite
             import ultron.core.tools.registry
-            import ultron.core.agents.simple
-            import ultron.core.agents
 
             importlib.reload(ultron.core.tools.builtin.file_reader)
             importlib.reload(ultron.core.tools.builtin.file_writer)
@@ -397,7 +470,7 @@ async def handle_slash_command(
 
             # Reset history back to initial SYSTEM message
             history.clear()
-            history.append(ChatMessage(role=Role.SYSTEM, content="You are Ultron, a helpful local AI assistant."))
+            history.append(ChatMessage(role=Role.SYSTEM, content=_BASE_SYSTEM_PROMPT))
 
             if layout and state:
                 layout["header"].update(build_header(state))
@@ -413,7 +486,7 @@ async def handle_slash_command(
             if session is not None:
                 session.reloaded_agent = fresh_agent
 
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — reloads arbitrary user modules
             console.print(f"[bold red]✗ Failed to reload modules:[/bold red] {exc}\n[dim]Continuing with existing working agent session.[/dim]\n")
 
         return True, False
@@ -446,7 +519,7 @@ def summarize_pytest_output(raw_output: str) -> str:
 
         summary_lines.append("\n[dim]# Note: Run again with --raw to see full output[/dim]")
         return "\n".join(summary_lines)
-    except Exception:
+    except (IndexError, TypeError, ValueError):
         return raw_output
 
 def summarize_lint_output(raw_output: str) -> str:
@@ -499,19 +572,23 @@ def summarize_lint_output(raw_output: str) -> str:
             summary_lines.extend(issues)
 
         return "\n".join(summary_lines)
-    except Exception:
+    except (IndexError, TypeError, ValueError):
         return raw_output
 
 async def async_chat(agent_type: str = "simple"):
     """
-    Asynchronous runner for the interactive chat session powered by Rich Live & Layout.
+    Asynchronous runner for the interactive chat session.
+
+    The prompt is a live, terminal-width-aware ChatSession: a persistent
+    bottom toolbar (model / agent / status / security mode) re-flows
+    automatically when the window is resized, and all output rendering is
+    width-adaptive.
     """
-    from ultron.core.state import CLIState
-    from ultron.core.agents import get_agent
-    from ultron.ui.layout import build_header, build_status_bar, build_layout
-    from rich.live import Live
     from prompt_toolkit import PromptSession
-    from prompt_toolkit.formatted_text import HTML
+
+    from ultron.core.agents import get_agent
+    from ultron.core.state import CLIState
+    from ultron.ui.session import ChatSession
 
     state = CLIState(
         active_model=settings.model,
@@ -520,15 +597,33 @@ async def async_chat(agent_type: str = "simple"):
         status="Ready",
     )
 
+    def _security_mode() -> str:
+        """
+        Live security mode for the toolbar; falls back to settings.
+
+        This runs on every prompt render (keystroke / resize), so a failure
+        here must never take the whole chat UI down with it.
+        """
+        try:
+            from ultron.core.agents.security import get_security
+            return getattr(get_security(), "mode", None) or settings.security_mode
+        except (ImportError, AttributeError, OSError, ValueError):
+            return settings.security_mode
+
     session = PromptSession()
     session.active_model = state.active_model
     session.active_agent_type = agent_type
 
-    layout = build_layout(state)
+    chat_ui = ChatSession(
+        state=state,
+        session=session,
+        agent_tag=lambda: getattr(session, "active_agent_type", agent_type),
+        security_mode=_security_mode,
+    )
 
     try:
         agent = get_agent(agent_type)
-    except Exception as e:
+    except (ValueError, OSError) as e:
         logger.error(f"Failed to initialize agent: {e}")
         console.print(f"[bold red]Initialization Error[/bold red]: {e}")
         return
@@ -538,7 +633,7 @@ async def async_chat(agent_type: str = "simple"):
     from ultron.core.types import ChatMessage, Role, truncate_history
 
     history: list[ChatMessage] = [
-        ChatMessage(role=Role.SYSTEM, content="You are Ultron, a helpful local AI assistant.")
+        ChatMessage(role=Role.SYSTEM, content=_BASE_SYSTEM_PROMPT)
     ]
 
     # Render the initial banner once at session start
@@ -548,10 +643,7 @@ async def async_chat(agent_type: str = "simple"):
         try:
             state.status = "Ready"
 
-            agent_tag = getattr(session, "active_agent_type", agent_type)
-            user_input = await session.prompt_async(
-                HTML(f"<b><cyan>[{state.active_model} | {agent_tag}]</cyan> <blue>You</blue></b>: ")
-            )
+            user_input = await chat_ui.prompt_async()
             trimmed_input = user_input.strip()
 
             if not trimmed_input:
@@ -588,13 +680,16 @@ async def async_chat(agent_type: str = "simple"):
             import threading
 
             def _listen_for_esc(cancel_evt: threading.Event):
-                import sys, tty, termios, select
+                import select
+                import sys
+                import termios
+                import tty
                 if not sys.stdin.isatty():
                     return
                 try:
                     fd = sys.stdin.fileno()
                     old_settings = termios.tcgetattr(fd)
-                except Exception:
+                except (OSError, ValueError):
                     return
                 try:
                     tty.setcbreak(fd)
@@ -609,22 +704,23 @@ async def async_chat(agent_type: str = "simple"):
                                     break
                                 else:
                                     sys.stdin.read(10)
-                except Exception:
-                    pass
+                except (OSError, ValueError) as exc:
+                    logger.debug("ESC listener failed: %s", exc)
                 finally:
                     try:
                         termios.tcflush(fd, termios.TCIFLUSH)
-                    except Exception:
-                        pass
+                    except (OSError, ValueError) as exc:
+                        logger.debug("termios tcflush failed: %s", exc)
                     try:
                         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                    except Exception:
-                        pass
+                    except (OSError, ValueError) as exc:
+                        logger.debug("termios tcsetattr failed: %s", exc)
 
             cancel_event = threading.Event()
             esc_thread = threading.Thread(target=_listen_for_esc, args=(cancel_event,), daemon=True)
             esc_thread.start()
 
+            state.status = "Thinking..."
             agent_task = asyncio.create_task(agent.run(trimmed_input, truncated_history))
 
             with console.status("[dim]Thinking... (Press Esc to cancel)[/dim]"):
@@ -651,6 +747,7 @@ async def async_chat(agent_type: str = "simple"):
 
             if response_msg.pending_action:
                 import questionary
+
                 from ultron.core.tools.registry import get_tool
 
                 action = response_msg.pending_action
@@ -703,6 +800,20 @@ async def async_chat(agent_type: str = "simple"):
                         title="Database Warning: Confirmation Required",
                         action="Execute database query",
                         target=action.target,
+                    )
+                elif action.action_type == "execute_plan":
+                    # Proactive plan approval: the full step + permission
+                    # preview was shown by the agent; here the user approves
+                    # the whole chain in one card instead of being prompted
+                    # per step mid-execution.
+                    import json as _json
+
+                    steps = _json.loads(action.target or "[]")
+                    UI.render_action_card(
+                        title="Plan Approval Required",
+                        action=f"Execute {len(steps)}-step plan",
+                        target=action.target or "",
+                        preview=(action.content or "")[:500],
                     )
                 else:
                     UI.render_action_card(
@@ -760,9 +871,23 @@ async def async_chat(agent_type: str = "simple"):
                         fetch_func = get_tool("fetch_page_text")
                         result = fetch_func(action.target) if fetch_func else "Error: Tool 'fetch_page_text' not found."
 
+                    elif action.action_type == "run_parallel":
+                        commands = [c for c in (action.target or "").splitlines() if c.strip()]
+                        parallel_func = get_tool("run_parallel")
+                        result = parallel_func(commands) if parallel_func else "Error: Tool 'run_parallel' not found."
+
                     elif action.action_type == "db_query":
                         query_func = get_tool("run_query")
                         result = query_func(action.target) if query_func else "Error: Tool 'run_query' not found."
+
+                    elif action.action_type == "execute_plan":
+                        import json as _json
+
+                        from ultron.core.agents.simple import execute_plan
+
+                        steps = _json.loads(action.target or "[]")
+                        results = await execute_plan(steps)
+                        result = "\n".join(results)
 
                     else:
                         result = f"Error: Unrecognised action type '{action.action_type}'."
@@ -789,7 +914,7 @@ async def async_chat(agent_type: str = "simple"):
         except KeyboardInterrupt:
             UI.render_status("Chat interrupted. Goodbye.", status="warning")
             break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — CLI boundary: never crash the chat
             logger.error(f"Error during chat execution: {e}")
             UI.render_error(str(e), title="Runtime Error")
 
@@ -816,6 +941,7 @@ def logs(
     View or stream the Ultron log file.
     """
     import time
+
     from ultron.core.logging import LOG_FILE
 
     if not LOG_FILE.exists():

@@ -195,6 +195,8 @@ def test_plan_confirm_step_skipped_in_strict(tmp_path, monkeypatch):
 
 
 def test_multistep_user_request_gated(tmp_path, monkeypatch):
+    import json
+
     from ultron.core.tools import paths
 
     monkeypatch.setattr(paths, "ALLOWED_BASE_DIR", tmp_path)
@@ -203,5 +205,16 @@ def test_multistep_user_request_gated(tmp_path, monkeypatch):
     engine = FakeEngine(['[{"action": "write_file", "filename": "a.txt", "content": "hello"}]'])
     agent = SimpleAgent(engine)
     msg = _run(agent.run("create a.txt with hello, then read it back"))
-    assert (tmp_path / "a.txt").read_text() == "hello"
+
+    # Proactive gate: a write_file step (HIGH) is listed upfront and the
+    # whole plan waits for one approval — nothing has executed yet.
     assert msg.role == Role.ASSISTANT
+    assert msg.pending_action is not None
+    assert msg.pending_action.action_type == "execute_plan"
+    assert not (tmp_path / "a.txt").exists()
+    assert "📋 Plan" in msg.content
+
+    # Simulate the CLI approving the plan: it executes the approved steps.
+    steps = json.loads(msg.pending_action.target)
+    _run(execute_plan(steps))
+    assert (tmp_path / "a.txt").read_text() == "hello"

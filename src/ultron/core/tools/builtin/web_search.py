@@ -1,6 +1,8 @@
 import httpx
 from bs4 import BeautifulSoup
 from ddgs import DDGS
+from ddgs.exceptions import DDGSException
+
 from ultron.core.tools.builtin.http_client import check_url_safety
 
 
@@ -34,7 +36,7 @@ def search_web(query: str, max_results: int = 3) -> str:
 
         return "\n\n".join(formatted_output)
 
-    except Exception as exc:
+    except (DDGSException, httpx.HTTPError, OSError, ValueError) as exc:
         return f"Error: search failed ({exc})."
 
 
@@ -91,5 +93,5 @@ def fetch_page_text(url: str) -> str:
         return f"Error: HTTP request failed with status code {exc.response.status_code}."
     except httpx.RequestError as exc:
         return f"Error: connection or request failed ({exc})."
-    except Exception as exc:
+    except (httpx.HTTPError, UnicodeDecodeError, ValueError) as exc:
         return f"Error: failed to fetch or parse web page ({exc})."

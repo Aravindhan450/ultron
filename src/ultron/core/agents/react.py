@@ -47,6 +47,11 @@ from ultron.core.agents.simple import (
     execute_tool,
     handle_file_write,
     handle_http,
+    handle_parallel,
+)
+from ultron.core.intelligence.prompt_assembly import (
+    build_response_guidance,
+    polish_response,
 )
 from ultron.core.logging import get_logger
 from ultron.core.tools.registry import get_tool, get_tools_schema
@@ -91,6 +96,12 @@ def build_system_prompt() -> str:
         "user for confirmation automatically — still emit the tool call "
         "normally when one is needed.\n"
         "7. Use the fewest tool calls needed to answer well.\n"
+        "8. When several independent read-only lookups are needed at once "
+        "(multiple files, sites, or searches), prefer a single "
+        "`run_tool_batch` call whose `calls_json` argument is a JSON array "
+        "of {\"tool\": ..., \"arguments\": {...}} — it executes them "
+        "concurrently and synthesizes the results into one observation.\n"
+        f"\n\n{build_response_guidance()}"
     )
 
 
@@ -165,6 +176,17 @@ class ReActAgent(BaseAgent):
         messages = list(history) if history else []
         system_prompt = build_system_prompt()
 
+        # Structured output enforcement: inject the exact schema when the
+        # user asked for a machine-readable shape, and enforce it on the
+        # final answer below.
+        from ultron.core.intelligence.structured_output import (
+            enforce_reply,
+            schema_prompt_block,
+        )
+        schema_block = schema_prompt_block(user_input)
+        if schema_block:
+            system_prompt += "\n\n" + schema_block
+
         # Inject the ReAct system prompt at the front of the conversation,
         # preserving any existing system context (e.g. persona instructions).
         if messages and messages[0].role == Role.SYSTEM:
@@ -181,9 +203,14 @@ class ReActAgent(BaseAgent):
             response = (await self.engine.generate(history_to_openai_format(messages))) or ""
             tool_call = extract_tool_call(response)
 
-            # No tool call → the model is answering directly; that's the answer.
+            # No tool call → the model is answering directly; that's the
+            # answer (structured output is enforced when a schema was asked
+            # for — repaired + [structured] notes, never silent deviation).
             if tool_call is None:
-                return ChatMessage(role=Role.ASSISTANT, content=response)
+                return ChatMessage(
+                    role=Role.ASSISTANT,
+                    content=polish_response(enforce_reply(user_input, response)),
+                )
 
             tool_name = tool_call.get("tool")
             arguments = tool_call.get("arguments") or {}
@@ -252,6 +279,42 @@ class ReActAgent(BaseAgent):
                 pending_action=PendingAction(action_type="run_command", target=cmd),
             )
 
+
+        if tool_name == "run_parallel":
+            # A parallel batch is gated command-by-command (any denial blocks
+            # the whole batch; any confirmation routes it through a single
+            # interactive approval listing every command). Tolerate a stray
+            # string argument the same way the tool itself does.
+            cmds_arg = arguments.get("commands", [])
+            if isinstance(cmds_arg, str):
+                cmds_arg = [cmds_arg]
+            cmds = [str(c).strip() for c in cmds_arg]
+            cmds = [c for c in cmds if c]
+            if not cmds:
+                return "Error: run_parallel requires a non-empty 'commands' list."
+            return handle_parallel(cmds)
+
+        if tool_name == "run_tool_batch":
+            # Inter-tool parallel batch. Like run_parallel this routes
+            # directly: every member is gated individually *inside* the tool
+            # (deny never runs, confirm never runs silently), so the batch is
+            # only as safe as its most dangerous member. Routing here instead
+            # of the generic path avoids a redundant outer content scan of the
+            # raw calls_json (which could false-flag an http:// member URL).
+            from ultron.core.intelligence.parallel_tools import (
+                run_tool_batch as _run_batch,
+            )
+
+            calls_json = arguments.get("calls_json") or arguments.get("calls")
+            if isinstance(calls_json, (list, tuple)):
+                calls_json = json.dumps(calls_json)
+            if not calls_json:
+                return (
+                    "Error: run_tool_batch requires a 'calls_json' argument — "
+                    "a JSON array of {\"tool\": ..., \"arguments\": {...}}."
+                )
+            return _run_batch(str(calls_json))
+
         if tool_name == "write_file":
             # handle_file_write runs the same boundary gate: deny → blocked,
             # allow (permissive mode) → direct write, confirm → PendingAction.
@@ -296,6 +359,6 @@ class ReActAgent(BaseAgent):
 
         try:
             return func(**arguments)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — arbitrary tool surface
             logger.debug(f"Tool '{tool_name}' raised an exception: {exc}")
             return f"Error executing tool '{tool_name}': {exc}"

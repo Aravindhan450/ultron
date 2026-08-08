@@ -1,7 +1,8 @@
 import logging
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
+
 from rich.logging import RichHandler
+
 from ultron.core.config import settings
 
 # Path to the persistent log file

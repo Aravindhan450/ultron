@@ -37,6 +37,8 @@ import re
 from ultron.core.config import settings
 from ultron.core.logging import get_logger
 from ultron.core.tools.builtin.database import is_readonly_query
+from ultron.security.audit import AuditLog, get_audit_log
+from ultron.security.file_policy import is_protected
 from ultron.security.guardrails import DANGEROUS_COMMAND_PATTERNS, GuardrailsEngine
 from ultron.security.models import BoundaryResult, Decision, RiskTier
 
@@ -60,34 +62,19 @@ _READONLY_COMMAND = re.compile(
 _SHELL_SIDE_EFFECTS = re.compile(r"[>|;&`]|\$\(")
 
 
-# Path markers that make a write/overwrite CRITICAL — touching system
-# configuration, credential stores, or boot/security files.
-_SYSTEM_PATH_MARKERS = (
-    "/etc/",
-    "/etc/passwd",
-    "/etc/shadow",
-    "/boot/",
-    "/System/",
-    "/Library/LaunchDaemons",
-    ".ssh/",
-    "id_rsa",
-    "id_ed25519",
-    "id_dsa",
-    ".aws/",
-    ".git-credentials",
-    ".htpasswd",
-    "authorized_keys",
-    "key.pem",
-    "wallet",
-    "secrets.json",
-    ".env",
-)
+# Protected system/credential markers now live in
+# ``ultron.security.file_policy`` (SYSTEM_PATH_MARKERS) — the single source
+# of truth for the path policy.
 
 # State-changing HTTP methods (POST/PUT/DELETE/PATCH) — require confirmation.
 _STATE_CHANGING_HTTP = {"POST", "PUT", "DELETE", "PATCH"}
 
 # SQL verbs that can destroy or restructure data.
 _DESTRUCTIVE_SQL = re.compile(r"\b(?:drop|truncate|alter|grant|revoke)\b", re.IGNORECASE)
+
+# Ordering of the risk tiers, used to combine per-command verdicts into a
+# batch verdict (the batch takes the worst tier).
+_TIER_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 
 class SecurityBoundary:
@@ -98,11 +85,19 @@ class SecurityBoundary:
         mode: Security mode — ``permissive``, ``interactive`` (default),
             or ``strict``. Falls back to ``settings.security_mode``.
         engine: The GuardrailsEngine used by :meth:`check`.
+        audit_log: The :class:`~ultron.security.audit.AuditLog` every verdict
+            is recorded to (JSON-lines file). Defaults to the shared log.
     """
 
-    def __init__(self, mode: str | None = None, engine: GuardrailsEngine | None = None) -> None:
+    def __init__(
+        self,
+        mode: str | None = None,
+        engine: GuardrailsEngine | None = None,
+        audit_log: AuditLog | None = None,
+    ) -> None:
         self.mode = mode or settings.security_mode
         self.engine = engine or GuardrailsEngine()
+        self.audit_log = audit_log or get_audit_log()
 
     # ------------------------------------------------------------------
     # Risk classification
@@ -121,10 +116,38 @@ class SecurityBoundary:
         if action in {
             "read_file",
             "web_search",
+            "retrieve",
+            "check_connectivity",
             "fetch_page_text",
+            "learn_api_schema",
+            "api_usage_hint",
+            "get_api_knowledge",
+            "forget_api",
+            "check_resources",
+            "resource_forecast",
+            "memory_connections",
+            "related_facts",
+            "discover_connections",
+            "explain_relation",
+            "enforce_schema",
+            "schema_validate",
+            "list_schemas",
+            "preflight_plan",
+            "analyze_dependencies",
+            "list_plan_actions",
+            "get_debug_context",
+            "diagnose_failure",
+            "check_dependency",
+            "run_tool_batch",
+            "synthesize_analysis",
             "get_all_memories",
             "search_memories",
             "add_memory",
+            "add_triple",
+            "query_triples",
+            "query_chain",
+            "search_triples",
+            "get_all_triples",
         }:
             return RiskTier.LOW
 
@@ -154,11 +177,21 @@ class SecurityBoundary:
         # metacharacter (redirection, pipe, chaining, substitution) that could
         # turn e.g. `echo` or `cat` into a state-changing write.
         if action == "run_command":
-            if any(pattern.search(target) for _rule, pattern in DANGEROUS_COMMAND_PATTERNS):
-                return RiskTier.CRITICAL
-            if _READONLY_COMMAND.match(target or "") and not _SHELL_SIDE_EFFECTS.search(target or ""):
-                return RiskTier.LOW
-            return RiskTier.HIGH
+            return self._classify_command(target)
+
+        # Parallel command batches are at least as dangerous as their most
+        # dangerous command: classify each command individually (newline-
+        # separated in the target) and take the worst tier. A single
+        # state-changing or destructive command escalates the whole batch.
+        if action == "run_parallel":
+            worst = RiskTier.LOW
+            for cmd in (target or "").splitlines():
+                if not cmd.strip():
+                    continue
+                tier = self._classify_command(cmd)
+                if _TIER_RANK[tier.value] > _TIER_RANK[worst.value]:
+                    worst = tier
+            return worst
 
         # Unknown actions default to HIGH.
         return RiskTier.HIGH
@@ -230,13 +263,14 @@ class SecurityBoundary:
         self._audit(result)
         return result
 
-    @staticmethod
-    def _audit(result: BoundaryResult) -> None:
+    def _audit(self, result: BoundaryResult) -> None:
         """
-        Records every verdict to the application log.
+        Records every verdict to the application log and the JSON-lines audit
+        trail (``~/.ultron/security_audit.jsonl`` by default).
 
         Denials are logged as warnings, confirmations as info, and automatic
-        allowances at debug level to avoid log spam.
+        allowances at debug level to avoid log spam. The audit file records
+        all three without filtering.
         """
         line = f"action={result.action_type} tier={result.tier.value} decision={result.decision.value}"
         if result.decision == Decision.DENY:
@@ -246,9 +280,30 @@ class SecurityBoundary:
         else:
             logger.debug("%s", line)
 
+        try:
+            self.audit_log.record(result, mode=self.mode)
+        except Exception:
+            # Auditing must never break the gate — log and move on.
+            logger.exception("audit: failed to record verdict")
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _classify_command(command: str) -> RiskTier:
+        """
+        Classifies a single shell command by the shared command rules.
+
+        Dangerous patterns (rm -rf /, curl | sh, …) are CRITICAL; read-only
+        commands without shell metacharacters are LOW; everything else is
+        treated as state-changing and therefore HIGH.
+        """
+        if any(pattern.search(command) for _rule, pattern in DANGEROUS_COMMAND_PATTERNS):
+            return RiskTier.CRITICAL
+        if _READONLY_COMMAND.match(command or "") and not _SHELL_SIDE_EFFECTS.search(command or ""):
+            return RiskTier.LOW
+        return RiskTier.HIGH
 
     @staticmethod
     def _http_method(target: str, content: str | None) -> str:
@@ -265,9 +320,13 @@ class SecurityBoundary:
 
     @staticmethod
     def _touches_system_path(target: str) -> bool:
-        """True when a file target references a system/credential path."""
-        text = (target or "").lower()
-        return any(marker in text for marker in _SYSTEM_PATH_MARKERS)
+        """
+        True when a file target references a system/credential path.
+
+        Delegates to the shared file policy so the marker list lives in one
+        place (``ultron.security.file_policy``).
+        """
+        return is_protected(target)
 
 
 def get_boundary() -> SecurityBoundary:

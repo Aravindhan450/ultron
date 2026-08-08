@@ -1,25 +1,102 @@
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
+
+from ultron.core.intelligence.debug_context import (
+    check_dependency,
+    diagnose_failure,
+    get_debug_context,
+)
+from ultron.core.intelligence.parallel_tools import (
+    run_tool_batch,
+    synthesize_analysis,
+)
+from ultron.core.intelligence.planning import (
+    analyze_dependencies,
+    list_plan_actions,
+    preflight_plan_tool,
+)
+from ultron.core.intelligence.structured_output import (
+    enforce_schema,
+    list_schemas,
+    schema_validate,
+)
+from ultron.core.learning.api_schema import (
+    api_usage_hint,
+    forget_api,
+    get_api_knowledge,
+    learn_api_schema,
+)
+from ultron.core.learning.associations import (
+    discover_connections,
+    explain_relation,
+    memory_connections,
+    related_facts,
+)
+from ultron.core.tools.builtin.command_runner import run_command, run_parallel
+from ultron.core.tools.builtin.database import run_query
 from ultron.core.tools.builtin.file_reader import read_file
 from ultron.core.tools.builtin.file_writer import write_file
-from ultron.core.tools.builtin.command_runner import run_command
 from ultron.core.tools.builtin.http_client import make_http_request
+from ultron.core.tools.builtin.retrieval import check_connectivity, retrieve
 from ultron.core.tools.builtin.web_search import fetch_page_text, search_web
-from ultron.core.tools.builtin.database import run_query
-from ultron.core.tools.memory.sqlite import add_memory, get_all_memories, search_memories
+from ultron.core.tools.memory.graph import (
+    add_triple,
+    get_all_triples,
+    query_triples,
+    search_triples,
+    store_memory_text,
+)
+from ultron.core.tools.memory.sqlite import (
+    get_all_memories,
+    search_memories,
+)
+from ultron.core.tools.resource_monitor import check_resources, resource_forecast
 
 # A dictionary that maps a tool's name (as a string) to the actual Python function.
 # This makes it easy to lookup and call tools dynamically by their names.
+#
+# ``add_memory`` is the unified memory write: it extracts subject/predicate/
+# object triples from the sentence when possible (knowledge graph) and falls
+# back to the flat fact store otherwise — see ultron/core/tools/memory/graph.py.
 TOOLS: dict[str, Callable[..., Any]] = {
     "read_file": read_file,
     "write_file": write_file,
     "run_command": run_command,
+    "run_parallel": run_parallel,
     "make_http_request": make_http_request,
+    "retrieve": retrieve,
+    "check_connectivity": check_connectivity,
+    "learn_api_schema": learn_api_schema,
+    "api_usage_hint": api_usage_hint,
+    "get_api_knowledge": get_api_knowledge,
+    "forget_api": forget_api,
+    "check_resources": check_resources,
+    "resource_forecast": resource_forecast,
+    "memory_connections": memory_connections,
+    "related_facts": related_facts,
+    "discover_connections": discover_connections,
+    "explain_relation": explain_relation,
+    "enforce_schema": enforce_schema,
+    "schema_validate": schema_validate,
+    "list_schemas": list_schemas,
+    "preflight_plan": preflight_plan_tool,
+    "analyze_dependencies": analyze_dependencies,
+    "list_plan_actions": list_plan_actions,
+    "get_debug_context": get_debug_context,
+    "diagnose_failure": diagnose_failure,
+    "check_dependency": check_dependency,
+    "run_tool_batch": run_tool_batch,
+    "synthesize_analysis": synthesize_analysis,
     "search_web": search_web,
     "fetch_page_text": fetch_page_text,
     "run_query": run_query,
-    "add_memory": add_memory,
+    "add_memory": store_memory_text,
+    "add_triple": add_triple,
     "get_all_memories": get_all_memories,
     "search_memories": search_memories,
+    "query_triples": query_triples,
+    "search_triples": search_triples,
+    "get_all_triples": get_all_triples,
 }
 
 def get_tool(name: str) -> Callable[..., Any] | None:

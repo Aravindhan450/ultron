@@ -23,10 +23,13 @@ dependencies = [
 
 [project.optional-dependencies]
 postgres = ["psycopg2-binary>=2.9"]
-dev = ["pytest>=7.0", "ruff>=0.6"]
+dev = ["pytest>=7.0", "ruff==0.16.1"]
 
 [project.scripts]
 ultron = "ultron.main:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ultron"]
+
+[tool.ruff]
+target-version = "py311"

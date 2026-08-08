@@ -1,6 +1,6 @@
 import re
 import sqlite3
-from typing import Any
+
 from ultron.core.config import settings
 
 
@@ -56,7 +56,6 @@ def run_query(sql: str) -> str:
                 # Extract column headers from cursor description
                 columns = [desc[0] for desc in (cursor.description or [])]
                 rows = cursor.fetchmany(50)
-                total_fetched = len(rows)
 
                 # Check if there are more rows beyond 50
                 has_more = cursor.fetchone() is not None
@@ -72,7 +71,7 @@ def run_query(sql: str) -> str:
 
                 output = [header_line, separator] + data_lines
                 if has_more:
-                    output.append(f"\n[Note: showing first 50 rows of results]")
+                    output.append("\n[Note: showing first 50 rows of results]")
 
                 return "\n".join(output)
 
@@ -88,38 +87,43 @@ def run_query(sql: str) -> str:
             except ImportError:
                 return "Error: psycopg2 module not found. Install psycopg2-binary to connect to PostgreSQL."
 
-            conn = psycopg2.connect(db_url)
-            cursor = conn.cursor()
-            cursor.execute(sql)
+            try:
+                conn = psycopg2.connect(db_url)
+                cursor = conn.cursor()
+                cursor.execute(sql)
 
-            if is_select:
-                columns = [desc[0] for desc in (cursor.description or [])]
-                rows = cursor.fetchmany(50)
-                has_more = cursor.fetchone() is not None
+                if is_select:
+                    columns = [desc[0] for desc in (cursor.description or [])]
+                    rows = cursor.fetchmany(50)
+                    has_more = cursor.fetchone() is not None
 
-                conn.close()
+                    conn.close()
 
-                if not columns and not rows:
-                    return "Query returned no results."
+                    if not columns and not rows:
+                        return "Query returned no results."
 
-                header_line = " | ".join(columns) if columns else "Result"
-                separator = "-" * max(len(header_line), 20)
-                data_lines = [" | ".join(str(val) for val in row) for row in rows]
+                    header_line = " | ".join(columns) if columns else "Result"
+                    separator = "-" * max(len(header_line), 20)
+                    data_lines = [" | ".join(str(val) for val in row) for row in rows]
 
-                output = [header_line, separator] + data_lines
-                if has_more:
-                    output.append(f"\n[Note: showing first 50 rows of results]")
+                    output = [header_line, separator] + data_lines
+                    if has_more:
+                        output.append("\n[Note: showing first 50 rows of results]")
 
-                return "\n".join(output)
+                    return "\n".join(output)
 
-            else:
-                affected = cursor.rowcount
-                conn.commit()
-                conn.close()
-                return f"Query executed successfully. Rows affected: {affected if affected >= 0 else 'N/A'}"
+                else:
+                    affected = cursor.rowcount
+                    conn.commit()
+                    conn.close()
+                    return f"Query executed successfully. Rows affected: {affected if affected >= 0 else 'N/A'}"
+            except (psycopg2.Error, OSError, ValueError) as exc:
+                # psycopg2 is an optional extra, so its error type can only be
+                # referenced inside the postgres branch.
+                return f"Error: {exc}"
 
         else:
             return f"Error: unsupported DATABASE_TYPE '{db_type}'. Must be 'sqlite' or 'postgres'."
 
-    except Exception as exc:
+    except (sqlite3.Error, OSError, ValueError) as exc:
         return f"Error: {exc}"

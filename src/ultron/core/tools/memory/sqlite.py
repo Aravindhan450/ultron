@@ -1,4 +1,5 @@
 import sqlite3
+
 from ultron.core.tools.paths import ALLOWED_BASE_DIR
 
 # Path to the SQLite database file inside the project root folder
@@ -19,7 +20,7 @@ def init_memory_db() -> None:
                 )
             """)
             conn.commit()
-    except Exception as e:
+    except (sqlite3.Error, OSError) as e:
         # Print warning to console if DB initialization fails
         print(f"Warning: Failed to initialize memory DB: {e}")
 
@@ -33,8 +34,8 @@ def add_memory(fact: str) -> str:
             cursor.execute("INSERT INTO memories (fact) VALUES (?)", (fact,))
             conn.commit()
         return f"Remembered: {fact}"
-    except Exception as e:
-        return f"Error storing memory: {str(e)}"
+    except (sqlite3.Error, OSError) as e:
+        return f"Error storing memory: {e!s}"
 
 def get_all_memories() -> list[str]:
     """
@@ -46,7 +47,7 @@ def get_all_memories() -> list[str]:
             cursor.execute("SELECT fact FROM memories ORDER BY created_at ASC")
             rows = cursor.fetchall()
             return [row[0] for row in rows]
-    except Exception:
+    except (sqlite3.Error, OSError):
         return []
 
 def clear_all_memories() -> str:
@@ -59,8 +60,8 @@ def clear_all_memories() -> str:
             cursor.execute("DELETE FROM memories")
             conn.commit()
         return "All memories cleared successfully."
-    except Exception as e:
-        return f"Error clearing memories: {str(e)}"
+    except (sqlite3.Error, OSError) as e:
+        return f"Error clearing memories: {e!s}"
 
 def search_memories(keyword: str) -> list[str]:
     """
@@ -84,7 +85,7 @@ def search_memories(keyword: str) -> list[str]:
             )
             rows = cursor.fetchall()
             return [row[0] for row in rows]
-    except Exception:
+    except (sqlite3.Error, OSError):
         # Return empty list on any DB error — the caller treats this the same
         # as "no results found".
         return []

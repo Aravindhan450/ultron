@@ -1,6 +1,9 @@
 import json
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
+
 import httpx
+
 from ultron.core.engine.base import BaseEngine
 from ultron.core.logging import get_logger
 
@@ -27,6 +30,31 @@ class OllamaEngine(BaseEngine):
         """Dynamically update the active model for LLM generation requests."""
         self.default_model = new_model
 
+    async def supports_images(self, model: str | None = None) -> bool | None:
+        """
+        Returns whether the given model is multimodal (accepts image input).
+
+        Queries Ollama's /api/show and checks the model's ``capabilities``.
+
+        Returns None when the capability could not be determined (server
+        unreachable, no capabilities field) — callers should treat that as
+        "couldn't check" and let the real request surface any error, rather
+        than showing the "no vision" hint for the wrong reason.
+        """
+        model = model or self.default_model
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.post(
+                    f"{self.base_url}/api/show",
+                    json={"model": model},
+                    timeout=10.0,
+                )
+                resp.raise_for_status()
+                caps = resp.json().get("capabilities", [])
+            except (httpx.HTTPError, OSError, ValueError):
+                return None
+        return "vision" in caps
+
     async def list_models(self) -> list[str]:
         """
         Fetch available local model names from Ollama.
@@ -37,7 +65,8 @@ class OllamaEngine(BaseEngine):
                 if resp.status_code == 200:
                     tags = resp.json()
                     return [m["name"] for m in tags.get("models", [])]
-            except Exception as e:
+            # ValueError covers JSONDecodeError from resp.json() on non-JSON bodies.
+            except (httpx.HTTPError, ValueError) as e:
                 logger.error(f"Failed to fetch model list from Ollama: {e}")
         return []
 
@@ -59,8 +88,9 @@ class OllamaEngine(BaseEngine):
                             f"ULTRON_MODEL in your environment/.env to use an available model."
                         )
                         return
-            except Exception:
-                pass
+            # ValueError covers JSONDecodeError from resp.json() on non-JSON bodies.
+            except (httpx.HTTPError, OSError, ValueError) as exc:
+                logger.debug("Could not fetch available models for error hint: %s", exc)
         logger.error(f"Ollama API request failed: {e}")
 
     async def generate(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:

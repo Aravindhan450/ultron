@@ -20,13 +20,14 @@ Palette
 from __future__ import annotations
 
 from typing import Any
+
+from rich import box as richbox
+from rich.columns import Columns
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
-from rich.columns import Columns
-from rich.markdown import Markdown
-from rich import box as richbox
 
 # ---------------------------------------------------------------------------
 # Shared console — import this everywhere instead of creating a new Console()
@@ -37,9 +38,39 @@ console = Console()
 _MIN_WIDTH = 40
 
 
-def _safe_expand() -> bool:
+def _term_width() -> int:
+    """Return the current terminal width (Rich re-measures on every access)."""
+    return console.width
+
+
+def _safe_expand(width: int | None = None) -> bool:
     """Return True when the terminal is wide enough to expand panels."""
-    return console.width >= _MIN_WIDTH
+    return (width if width is not None else _term_width()) >= _MIN_WIDTH
+
+
+def _panel_padding(width: int | None = None) -> tuple[int, int]:
+    """
+    Return (vertical, horizontal) panel padding.
+
+    Narrow terminals get zero horizontal padding so content keeps more of the
+    viewport; wide terminals keep the comfortable breathing room.
+    """
+    return (0, 0) if (width if width is not None else _term_width()) < 60 else (0, 2)
+
+
+def _banner_mode(width: int) -> str:
+    """
+    Pick a banner layout for the terminal width.
+
+    - "side":  ASCII logo beside the session details (wide terminals)
+    - "stack": ASCII logo above the details (medium terminals)
+    - "text":  single-line wordmark, no ASCII art (very narrow terminals)
+    """
+    if width >= 116:
+        return "side"
+    if width >= 46:
+        return "stack"
+    return "text"
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +160,7 @@ class UI:
                 border_style="#ff8700",
                 box=richbox.ROUNDED,
                 expand=_safe_expand(),
-                padding=(0, 2),
+                padding=_panel_padding(),
             )
         )
         console.print()
@@ -153,7 +184,7 @@ class UI:
                 border_style="grey50",
                 box=richbox.SQUARE,
                 expand=_safe_expand(),
-                padding=(0, 1),
+                padding=_panel_padding(),
             )
         )
 
@@ -197,7 +228,7 @@ class UI:
                 border_style="#ff8700",
                 box=richbox.ROUNDED,
                 expand=_safe_expand(),
-                padding=(0, 1),
+                padding=_panel_padding(),
             )
         )
 
@@ -216,7 +247,7 @@ class UI:
                 border_style="red",
                 box=richbox.HEAVY,
                 expand=_safe_expand(),
-                padding=(0, 2),
+                padding=_panel_padding(),
             )
         )
         console.print()
@@ -228,9 +259,18 @@ class UI:
     @staticmethod
     def render_banner(model: str, cwd_short: str) -> None:
         """
-        Side-by-side header using Rich Columns with the complete ULTRON wordmark logo.
-        Automatically scales on narrow terminals without banner line wrapping bugs.
+        Header banner that adapts to the terminal width:
+
+        - wide terminals: the full ULTRON ASCII wordmark beside the session
+          details (Rich Columns, side-by-side)
+        - medium terminals: the wordmark stacked above the details
+        - very narrow terminals: a compact single-line wordmark with no ASCII
+          art, so nothing ever wraps or overflows the viewport
         """
+        from ultron import __version__
+
+        mode = _banner_mode(_term_width())
+
         logo_lines = [
             "██╗   ██╗██╗  ████████╗██████╗  ██████╗ ███╗   ██╗",
             "██║   ██║██║  ╚══██╔══╝██╔══██╗██╔═══██╗████╗  ██║",
@@ -247,24 +287,39 @@ class UI:
 
         # Meta Context Details Stack
         info_text = Text()
-        info_text.append("\nUltron CLI v1.0.0\n", style="bold #ffcc00")
+        info_text.append(f"\nUltron CLI v{__version__}\n", style="bold #ffcc00")
         info_text.append(f"Model: {model}\n", style="bold white")
         info_text.append(f"Directory: {cwd_short}", style="dim white")
 
         console.print()
-        # Render full logo and details side-by-side
-        console.print(Columns([logo_text, info_text], padding=(0, 2), equal=False))
+        if mode == "side":
+            # Render full logo and details side-by-side
+            console.print(Columns([logo_text, info_text], padding=(0, 2), equal=False))
+        elif mode == "stack":
+            console.print(logo_text)
+            console.print(info_text)
+        else:
+            console.print(
+                f"[bold #ffcc00]⚡ ULTRON AI[/] v{__version__}  "
+                f"[dim]Model:[/] [bold #ff9500]{model}[/]  "
+                f"[dim]Dir:[/] [bold cyan]{cwd_short}[/]"
+            )
         console.print()
 
     @staticmethod
     def render_status_bar(model: str, cwd_short: str = "") -> None:
         """
-        Renders a compact single-line status bar displaying current version, active model, and directory.
+        Renders a compact single-line status bar.  On narrow terminals the
+        directory segment is dropped so the line never wraps.
         """
-        dir_str = cwd_short or "~"
-        console.print(
-            f"[bold cyan]⚡ Ultron CLI v1.0.0[/] | [dim]Model:[/] [bold magenta]{model}[/] | [dim]Dir:[/] [bold yellow]{dir_str}[/]"
-        )
+        from ultron import __version__
+
+        width = _term_width()
+        line = f"[bold cyan]⚡ Ultron CLI v{__version__}[/] | [dim]Model:[/] [bold magenta]{model}[/]"
+        if width >= 90:
+            dir_str = cwd_short or "~"
+            line += f" | [dim]Dir:[/] [bold yellow]{dir_str}[/]"
+        console.print(line)
 
     # ------------------------------------------------------------------
     # Help table
@@ -288,6 +343,7 @@ class UI:
 
         table.add_row("/help",          "Show this help table.")
         table.add_row("/model",         "Select an available LLM model interactively.")
+        table.add_row("/memory",        "Show the knowledge-graph memory stats and stored triples.")
         table.add_row("/agent",         "Switch agent type (simple or react); use /agent <type> to skip the picker.")
         table.add_row("/security",      "Show security mode + tier policy; use /security <permissive|interactive|strict> to switch.")
         table.add_row("/clear",         "Reset conversation history to start fresh.")

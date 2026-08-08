@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
+
 from ultron.core.engine.base import BaseEngine
 from ultron.core.types import ChatMessage
+
 
 class BaseAgent(ABC):
     """
@@ -15,4 +17,3 @@ class BaseAgent(ABC):
         """
         Execute the agent logic given user input and conversation history.
         """
-        pass

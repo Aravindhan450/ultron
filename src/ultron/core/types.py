@@ -1,7 +1,9 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Literal
+
 from pydantic import BaseModel, Field
+
 
 class Role(str, Enum):
     """
@@ -23,12 +25,14 @@ class PendingAction(BaseModel):
     # When adding a new tool that uses PendingAction, add its action_type string here too.
     action_type: Literal[
         "run_command",
+        "run_parallel",
         "overwrite_file",
         "read_file",
         "write_file",
         "web_search",
         "fetch_page",
         "db_query",
+        "execute_plan",
     ]
     target: str          # The command string OR the filename/query/URL to act upon
     content: str | None = None  # Content to write if action_type is "write_file" or "overwrite_file"
@@ -42,7 +46,7 @@ class ChatMessage(BaseModel):
     name: str | None = None
     tool_call_id: str | None = None
     pending_action: PendingAction | None = None  # Optional interactive confirmation request payload
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     def to_openai_format(self) -> dict[str, Any]:
         """

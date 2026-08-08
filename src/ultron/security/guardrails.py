@@ -28,7 +28,7 @@ in one place.
 import re
 
 from ultron.core.tools.builtin.http_client import check_url_safety
-from ultron.core.tools.paths import is_path_safe
+from ultron.security.file_policy import get_file_policy
 from ultron.security.models import GuardrailFinding, GuardrailsResult
 from ultron.security.scanners.pii import scan_pii
 from ultron.security.scanners.secret import mask_matches, scan_secrets
@@ -110,6 +110,11 @@ class GuardrailsEngine:
     def check_path(self, path: str) -> GuardrailFinding | None:
         """
         Returns a blocking finding when *path* escapes the allowed base dir.
+
+        The confinement check is delegated to the shared file policy
+        (``FilePolicy.is_path_safe``), which keeps the same contract as the
+        underlying ``core.tools.paths.is_path_safe`` — including honoring a
+        patched ``ALLOWED_BASE_DIR`` at call time.
         """
         if not path or not str(path).strip():
             return GuardrailFinding(
@@ -118,7 +123,7 @@ class GuardrailsEngine:
                 location="path",
                 message="File target is empty",
             )
-        is_safe, _resolved = is_path_safe(path)
+        is_safe, _resolved = get_file_policy().is_path_safe(path)
         if not is_safe:
             return GuardrailFinding(
                 rule="path_escape",
@@ -163,8 +168,19 @@ class GuardrailsEngine:
                 sanitized = mask_matches(content, [*secret_hits, *pii_hits])
 
         # --- Command targets --------------------------------------------
+        # A run_parallel batch carries its commands newline-joined in the
+        # target; every command is scanned individually so one dangerous or
+        # credential-bearing command denies the whole batch.
         if action_type == "run_command":
-            danger = self.check_command(target)
+            command_segments = [target or ""]
+        elif action_type == "run_parallel":
+            command_segments = [
+                seg for seg in (target or "").splitlines() if seg.strip()
+            ]
+        else:
+            command_segments = []
+        for segment in command_segments:
+            danger = self.check_command(segment)
             if danger:
                 findings.append(danger)
             # Commands that would carry a credential out of the machine are
@@ -172,7 +188,7 @@ class GuardrailsEngine:
             # docstring). This covers e.g. `grep <aws-key> file` or
             # `curl ... -d '{"token": ...}'` even though callers pass the
             # command as the *target* rather than as content.
-            command_secrets = scan_secrets(target or "")
+            command_secrets = scan_secrets(segment)
             if command_secrets:
                 findings.extend(command_secrets)
                 blocked = True
@@ -182,13 +198,34 @@ class GuardrailsEngine:
                 )
 
         # --- URL targets ------------------------------------------------
-        if action_type in {"make_http_request", "fetch_page_text"}:
+        # Network actions get the URL safety scan. learn_api_schema fetches an
+        # OpenAPI document, so it is scanned like any other outbound request.
+        # The other schema tools (api_usage_hint / get_api_knowledge /
+        # forget_api) only read/write the LOCAL knowledge store — they never
+        # touch the network, so a host key is not a URL to police.
+        if action_type in {
+            "make_http_request",
+            "fetch_page_text",
+            "check_connectivity",
+            "learn_api_schema",
+        }:
             url = _extract_url(target)
             bad_url = self.check_url(url)
             if bad_url:
                 findings.append(bad_url)
                 blocked = True
                 block_reason = block_reason or bad_url.message
+        elif action_type == "retrieve":
+            # The orchestrator also carries bare search queries (no URL). Only
+            # enforce URL safety when the target actually contains a URL — a
+            # plain search query is not a URL and must not be blocked as one.
+            if re.search(r"https?://\S+", target or ""):
+                url = _extract_url(target)
+                bad_url = self.check_url(url)
+                if bad_url:
+                    findings.append(bad_url)
+                    blocked = True
+                    block_reason = block_reason or bad_url.message
 
         # --- File targets -----------------------------------------------
         if action_type in {"read_file", "write_file", "overwrite_file"}:

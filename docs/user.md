@@ -43,7 +43,15 @@ Every action is risk-classified:
 | High        | Explicit confirm required         | Delete files, send emails         |
 | Critical    | Explicit + extra verification     | System changes, financial actions |
 
-You always have the final say. Every approval/denial is logged.
+You always have the final say. Every approval/denial is logged: each security
+verdict (allow/confirm/deny) is appended to the JSON-lines audit trail at
+`~/.ultron/security_audit.jsonl`.
+
+The same permission model applies when several tools run at once: a parallel
+batch ("read config.json and notes.txt", "check example.com and example.org")
+never executes a member the boundary would deny or confirm — only auto-allowed
+calls run concurrently, and the results are synthesized into one analysis. See
+[docs/parallel-tools.md](docs/parallel-tools.md).
 
 ## Memory
 

@@ -14,5 +14,5 @@ def is_path_safe(file_path: str | Path) -> tuple[bool, Path]:
         # Check if the resolved path is relative to or equal to ALLOWED_BASE_DIR
         path_obj.relative_to(ALLOWED_BASE_DIR)
         return True, path_obj
-    except (ValueError, Exception):
+    except (OSError, ValueError):
         return False, Path(file_path)

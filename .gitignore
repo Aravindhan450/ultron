@@ -106,3 +106,8 @@ env/
 .env
 .env.*
 !.env.example
+
+# Runtime data stores created during test runs
+.ultron_resources.db
+.ultron_api_schema.db
+.ultron_connections.db
