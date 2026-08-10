@@ -6,56 +6,77 @@ All Rich-based rendering helpers live here so the rest of the codebase
 can import a single, consistent UI surface instead of scattering inline
 Panel/Rule/Text calls across modules.
 
-Palette
--------
-  Accent / borders   : orange3  (#ff8700)
-  Headers / titles   : bold #ffcc00
-  Labels / dim text  : dim / grey50
-  Success            : bold green
-  Error              : bold red
-  Info / neutral     : bold cyan
-  User input label   : bold cyan
+The visual language is deliberately minimal, in the spirit of Claude Code's
+terminal UI: the conversation flows as quiet text, meta information is muted
+gray, and color is used sparingly — a molten-orange brand accent, a status
+dot, and semantic green/red/yellow for outcomes.  Assistant replies render
+inside a thin orange-bordered panel, and the startup banner carries the full
+flame gradient.  On terminal resize the whole screen re-renders at the live
+width (via ``ultron.ui.responsive``), so every renderable here is
+width-adaptive.
+
+Palette (GitHub-dark inspired + Ultron molten flame)
+-----------------------------------------------------
+  Text            : #e6edf3  near-white body text
+  Muted / meta    : #8b949e  gray — labels and secondary info
+  Faint           : #5f6b7a  barely-visible hints
+  Accent (sparse) : #FB6C00  orange — the primary brand colour
+  Flame gradient  : #E73F1E → #FB6C00 → #F9B637 → #FFDD9C (logo)
+  Success         : #3fb950
+  Error           : #f85149
+  Warning         : #d29922
+  Info            : #58a6ff  soft blue
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from rich import box as richbox
+from rich import box
 from rich.columns import Columns
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.rule import Rule
+from rich.table import Table
 from rich.text import Text
 
 # ---------------------------------------------------------------------------
 # Shared console — import this everywhere instead of creating a new Console()
 # ---------------------------------------------------------------------------
-console = Console()
+# highlight=False: rich's automatic syntax highlighting would paint fragments
+# of plain strings (numbers, paths, URLs inside model names / versions / cwd)
+# in unrelated colours — e.g. "gemma4:e4b" became "gemm" + green "a4:e4b".
+# The theme controls every colour explicitly, so auto-highlighting is off.
+console = Console(highlight=False)
 
-# Minimum safe terminal width: below this we skip expansion to avoid wrapping
-_MIN_WIDTH = 40
+# Claude Code-inspired neutrals + Ultron molten-flame brand palette
+TEXT = "#e6edf3"     # near-white body text
+MUTED = "#8b949e"    # dim gray — meta information
+FAINT = "#5f6b7a"    # barely-visible hints
+GREEN = "#3fb950"
+RED = "#f85149"
+YELLOW = "#d29922"
+BLUE = "#58a6ff"
+
+# The four Ultron brand colours — the molten flame gradient.
+EMBER = "#E73F1E"    # red-orange — deepest flame
+ORANGE = "#FB6C00"   # orange — the primary brand accent
+AMBER = "#F9B637"    # amber — mid gradient
+GOLD = "#FFDD9C"     # pale gold — lightest flame tip
+
+# Primary brand accent — sparse highlights (replaces the old warm amber).
+ACCENT = ORANGE
+
+_PREFIX = {"success": "✓", "error": "✗", "warning": "!"}
+_STATUS_COLOR = {"info": MUTED, "success": GREEN, "error": RED, "warning": YELLOW}
 
 
 def _term_width() -> int:
-    """Return the current terminal width (Rich re-measures on every access)."""
-    return console.width
-
-
-def _safe_expand(width: int | None = None) -> bool:
-    """Return True when the terminal is wide enough to expand panels."""
-    return (width if width is not None else _term_width()) >= _MIN_WIDTH
-
-
-def _panel_padding(width: int | None = None) -> tuple[int, int]:
-    """
-    Return (vertical, horizontal) panel padding.
-
-    Narrow terminals get zero horizontal padding so content keeps more of the
-    viewport; wide terminals keep the comfortable breathing room.
-    """
-    return (0, 0) if (width if width is not None else _term_width()) < 60 else (0, 2)
+    """Current terminal width, falling back to a sane default."""
+    width = console.width
+    return width if width and width > 0 else 100
 
 
 def _banner_mode(width: int) -> str:
@@ -98,18 +119,33 @@ class UI:
 
     @staticmethod
     def render_user_prompt(text: str) -> None:
-        """Render the user prompt line cleanly with matching Antigravity style."""
-        console.print(f"[bold #ffcc00]>[/bold #ffcc00] {text}")
+        """
+        Render the user's message with the Claude Code ``❯`` marker.
+
+        The text is markup-escaped so user input containing ``[`` / ``]`` can
+        never be parsed as Rich markup.
+        """
+        console.print(UI.user_prompt_markup(text))
+
+    @staticmethod
+    def user_prompt_markup(text: str) -> str:
+        """
+        Rich markup for a user-message line (``❯ text``), markup-escaped.
+
+        Extracted so the resize-reflow transcript can record the exact same
+        line that ``render_user_prompt`` prints.
+        """
+        return f"[{MUTED}]❯[/{MUTED}] {escape(text)}"
 
     # ------------------------------------------------------------------
     # Dividers / structure
     # ------------------------------------------------------------------
 
     @staticmethod
-    def render_divider(title: str = "", *, style: str = "#ff8700") -> None:
-        """Render a full-width Rule divider with an optional title."""
+    def render_divider(title: str = "", *, style: str = FAINT) -> None:
+        """Render a full-width Rule divider with an optional muted title."""
         if title:
-            console.print(Rule(f"[bold {style}]{title}[/bold {style}]", style=style, align="right"))
+            console.print(Rule(f"[dim {MUTED}]{title}[/dim {MUTED}]", style=style, align="right"))
         else:
             console.print(Rule(style=style))
 
@@ -121,72 +157,62 @@ class UI:
     def render_status(message: str, status: str = "info") -> None:
         """
         Print a one-line status message styled by *status*.
+
+        Success / error / warning get a colored ✓ / ✗ / ! prefix; plain
+        status (info, goodbye) renders as muted text.
         """
-        _style_map = {
-            "info":    "bold cyan",
-            "success": "bold green",
-            "error":   "bold red",
-            "warning": "bold yellow",
-        }
-        style = _style_map.get(status, "white")
-        prefix_map = {
-            "success": "✓",
-            "error":   "✗",
-            "warning": "!",
-        }
-        prefix = prefix_map.get(status, "")
+        prefix = _PREFIX.get(status)
+        color = _STATUS_COLOR.get(status, TEXT)
         if prefix:
-            console.print(f"[{style}]{prefix}[/{style}]  {message}")
+            console.print(f"[{color}]{prefix}[/{color}]  {message}")
         else:
-            console.print(f"[{style}]{message}[/{style}]")
+            console.print(f"[{color}]{message}[/{color}]")
 
     # ------------------------------------------------------------------
-    # Ultron AI response panel
+    # Assistant response — plain flowing text, no box
     # ------------------------------------------------------------------
 
     @staticmethod
     def render_response(content: str) -> None:
         """
-        Render the main Ultron AI response inside a clean 4-sided ROUNDED panel.
-        Supports Markdown parsing so LLM outputs and code snippets render properly.
+        Render the assistant reply inside a quiet boxed panel.
+
+        A thin #FB6C00 (orange) border marks the response — the brand flame
+        colour — while the content itself renders as plain Markdown.  The
+        header carries only the ``ULTRON`` wordmark (caps, matching the
+        logo): the model, version and directory are established once in the
+        startup banner, so repeating them on every reply would be noise.
+        The panel re-flows with the window (the resize reflow re-renders the
+        recorded Panel at the live width on every resize).
         """
         renderable = Markdown(content) if isinstance(content, str) else content
-
         console.print(
             Panel(
                 renderable,
-                title="[bold black on #ff8700] ULTRON [/bold black on #ff8700]",
+                box=box.ROUNDED,
+                border_style=ORANGE,
+                padding=(0, 1),
+                title=f"[bold {ACCENT}]ULTRON[/bold {ACCENT}]",
                 title_align="center",
-                border_style="#ff8700",
-                box=richbox.ROUNDED,
-                expand=_safe_expand(),
-                padding=_panel_padding(),
             )
         )
         console.print()
 
     # ------------------------------------------------------------------
-    # Tool Calls / Memory Logs (Claude Code Style)
+    # Tool calls — compact chip lines
     # ------------------------------------------------------------------
 
     @staticmethod
     def render_tool_execution(tool_name: str, output: Any) -> None:
         """
-        Render tool execution outputs (like memory retrieval) inside a minimal dim box.
+        Render a tool call as a compact Claude Code-style chip line, with the
+        output below in muted gray — no box.
         """
-        body = Text(overflow="fold")
-        body.append(f"Executed tool '{tool_name}':\n\n", style="bold #ffcc00")
-        body.append(f"{output}", style="dim white")
-
-        console.print(
-            Panel(
-                body,
-                border_style="grey50",
-                box=richbox.SQUARE,
-                expand=_safe_expand(),
-                padding=_panel_padding(),
-            )
-        )
+        console.print(f"[{ACCENT}]✻[/{ACCENT}] [bold {TEXT}]{tool_name}[/bold {TEXT}]")
+        body = str(output)
+        if body:
+            console.print(f"[{MUTED}]{body}[/{MUTED}]")
+        console.print()
 
     # ------------------------------------------------------------------
     # Confirmation / action cards
@@ -200,60 +226,37 @@ class UI:
         preview: str = "",
     ) -> None:
         """
-        Render a confirmation action card with structured label rows.
+        Render a pending-action confirmation as clean lines: a faint title,
+        the ``✻ action — target`` chip, and an optional faint preview.
+
+        Deliberately quiet: the decision prompt (questionary) is the focal
+        point, not a loud bordered card.
         """
-        body = Text(overflow="fold")
-
-        body.append(" Action  ", style="bold #ff9500")
-        body.append("│ ", style="dim")
-        body.append(f"{action}\n", style="white")
-
+        if title:
+            console.print(f"[{FAINT}]{title}[/{FAINT}]")
+        line = f"[{ACCENT}]✻[/{ACCENT}] [bold {TEXT}]{action}[/bold {TEXT}]"
         if target:
-            body.append(" Target  ", style="bold #ffcc00")
-            body.append("│ ", style="dim")
-            body.append(f"{target}\n", style="bold white")
-
+            line += f"  [{MUTED}]—[/{MUTED}] {target}"
+        console.print(line)
         if preview:
-            body.append(" Preview ", style="bold dim")
-            body.append("│ ", style="dim")
-            body.append(f"{preview}", style="italic grey50")
-
-        console.print(
-            Panel(
-                body,
-                title=f"[bold #ffcc00]⚡ {title}[/bold #ffcc00]",
-                title_align="left",
-                subtitle="[dim]answer below[/dim]",
-                subtitle_align="right",
-                border_style="#ff8700",
-                box=richbox.ROUNDED,
-                expand=_safe_expand(),
-                padding=_panel_padding(),
-            )
-        )
+            console.print(f"  [{FAINT}]{preview}[/{FAINT}]")
+        console.print()
 
     # ------------------------------------------------------------------
-    # Error / fallback panel
+    # Error / fallback
     # ------------------------------------------------------------------
 
     @staticmethod
     def render_error(message: str, title: str = "Error") -> None:
-        """Render a red error panel."""
-        console.print(
-            Panel(
-                f"[bold red]{message}[/bold red]",
-                title=f"[bold red]✗ {title}[/bold red]",
-                title_align="left",
-                border_style="red",
-                box=richbox.HEAVY,
-                expand=_safe_expand(),
-                padding=_panel_padding(),
-            )
-        )
+        """Render an error as a single red line — no heavy panel."""
+        if title and title != "Error":
+            console.print(f"[{RED}]✗[/{RED}] [bold {RED}]{title}:[/bold {RED}] {message}")
+        else:
+            console.print(f"[{RED}]✗[/{RED}] {message}")
         console.print()
 
     # ------------------------------------------------------------------
-    # Startup helpers (Full Logo Antigravity Side-by-Side Layout)
+    # Startup header — ASCII logo, adaptive to terminal width
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -279,77 +282,61 @@ class UI:
             "╚██████╔╝███████╗██║   ██║  ██║╚██████╔╝██║ ╚████║",
             " ╚═════╝ ╚══════╝╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝",
         ]
-        colors = ["#ffcc00", "#ff9500", "#ff5500", "#ff5500", "#ff2200", "#cc0000"]
+        # Molten-flame gradient — the four brand colours across the six logo
+        # lines, each colour used twice so the transition reads smooth:
+        # red-orange, red-orange, orange, orange, amber, pale gold.
+        logo_colors = [EMBER, EMBER, ORANGE, ORANGE, AMBER, GOLD]
 
         logo_text = Text()
-        for line, color in zip(logo_lines, colors):
+        for line, color in zip(logo_lines, logo_colors):
             logo_text.append(f"{line}\n", style=f"bold {color}")
 
-        # Meta Context Details Stack
         info_text = Text()
-        info_text.append(f"\nUltron CLI v{__version__}\n", style="bold #ffcc00")
-        info_text.append(f"Model: {model}\n", style="bold white")
-        info_text.append(f"Directory: {cwd_short}", style="dim white")
+        info_text.append(f"\n⚡ Ultron AI  v{__version__}\n", style=f"bold {ACCENT}")
+        info_text.append(f"Model: {model}\n", style=TEXT)
+        info_text.append(f"Dir: {cwd_short}", style=MUTED)
 
         console.print()
         if mode == "side":
-            # Render full logo and details side-by-side
             console.print(Columns([logo_text, info_text], padding=(0, 2), equal=False))
         elif mode == "stack":
             console.print(logo_text)
             console.print(info_text)
         else:
             console.print(
-                f"[bold #ffcc00]⚡ ULTRON AI[/] v{__version__}  "
-                f"[dim]Model:[/] [bold #ff9500]{model}[/]  "
-                f"[dim]Dir:[/] [bold cyan]{cwd_short}[/]"
+                f"[bold {ACCENT}]⚡ Ultron AI[/bold {ACCENT}]  "
+                f"[dim {FAINT}]v{__version__}[/dim {FAINT}]"
             )
+            console.print(f"[{MUTED}]Model:[/{MUTED}] {model}   [{MUTED}]Dir:[/{MUTED}] {cwd_short}")
         console.print()
 
-    @staticmethod
-    def render_status_bar(model: str, cwd_short: str = "") -> None:
-        """
-        Renders a compact single-line status bar.  On narrow terminals the
-        directory segment is dropped so the line never wraps.
-        """
-        from ultron import __version__
-
-        width = _term_width()
-        line = f"[bold cyan]⚡ Ultron CLI v{__version__}[/] | [dim]Model:[/] [bold magenta]{model}[/]"
-        if width >= 90:
-            dir_str = cwd_short or "~"
-            line += f" | [dim]Dir:[/] [bold yellow]{dir_str}[/]"
-        console.print(line)
-
     # ------------------------------------------------------------------
-    # Help table
+    # Help — borderless aligned list
     # ------------------------------------------------------------------
 
     @staticmethod
     def render_help_table() -> None:
-        """Print a formatted table of available slash commands."""
-        from rich.table import Table
+        """Print the available slash commands as a clean borderless list."""
+        # expand=True so the list spans exactly the console width — uniform
+        # with every other panel in the chat screen (and re-flows on resize).
+        table = Table(show_header=False, box=None, expand=True, padding=(0, 2))
+        table.add_column(style=f"bold {ACCENT}", no_wrap=True)
+        table.add_column(style=TEXT)
 
-        table = Table(
-            title="[bold orange3]Available Commands[/bold orange3]",
-            show_header=True,
-            header_style="bold #ff9500",
-            box=richbox.ROUNDED,
-            border_style="orange3",
-            expand=_safe_expand(),
-        )
-        table.add_column("Command", style="bold #ffcc00", no_wrap=True)
-        table.add_column("Description", style="white")
+        rows = [
+            ("/help", "Show this help table."),
+            ("/model", "Select an available LLM model interactively."),
+            ("/memory", "Show the knowledge-graph memory stats and stored triples."),
+            ("/agent", "Switch agent type (simple or react); use /agent <type> to skip the picker."),
+            ("/security", "Show security mode + tier policy; use /security <permissive|interactive|strict> to switch."),
+            ("/clear", "Reset conversation history to start fresh."),
+            ("/reload", "Best-effort code reload without restarting (may not catch all changes; restart if unsure)."),
+            ("/exit, /quit", "Exit the chat session."),
+            ("Esc", "Cancel current task execution while model is thinking."),
+        ]
 
-        table.add_row("/help",          "Show this help table.")
-        table.add_row("/model",         "Select an available LLM model interactively.")
-        table.add_row("/memory",        "Show the knowledge-graph memory stats and stored triples.")
-        table.add_row("/agent",         "Switch agent type (simple or react); use /agent <type> to skip the picker.")
-        table.add_row("/security",      "Show security mode + tier policy; use /security <permissive|interactive|strict> to switch.")
-        table.add_row("/clear",         "Reset conversation history to start fresh.")
-        table.add_row("/reload",        "Best-effort code reload without restarting (may not catch all changes; restart if unsure).")
-        table.add_row("/exit, /quit",   "Exit the chat session.")
-        table.add_row("Esc",            "Cancel current task execution while model is thinking.")
-
+        console.print(f"[bold {ACCENT}]Available Commands[/bold {ACCENT}]")
+        for command, description in rows:
+            table.add_row(command, description)
         console.print(table)
         console.print()

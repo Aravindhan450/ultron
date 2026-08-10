@@ -19,6 +19,7 @@ from ultron.core.intelligence.prompt_assembly import (
 )
 from ultron.core.logging import get_logger
 from ultron.core.types import ChatMessage, PendingAction, Role, history_to_openai_format
+from ultron.ui.theme import ACCENT
 
 logger = get_logger("ultron.agents.simple")
 
@@ -2440,7 +2441,7 @@ async def handle_llm_fallback(
 
                 return ChatMessage(
                     role=Role.ASSISTANT,
-                    content=f"Executed tool '[bold cyan]{tool_name}[/bold cyan]':\n\n{tool_result}"
+                    content=f"Executed tool '[bold {ACCENT}]{tool_name}[/bold {ACCENT}]':\n\n{tool_result}"
                 )
         except (json.JSONDecodeError, IndexError, TypeError, ValueError) as exc:
             logger.debug(f"Failed to parse tool call JSON from LLM: {exc}")

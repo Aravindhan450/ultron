@@ -6,8 +6,18 @@ from ultron import __version__
 from ultron.core.config import settings
 from ultron.core.intelligence.prompt_assembly import build_response_guidance
 from ultron.core.logging import get_logger
-from ultron.ui.layout import build_header, build_status_bar
-from ultron.ui.theme import UI, console
+from ultron.ui.theme import (
+    ACCENT,
+    BLUE,
+    FAINT,
+    GREEN,
+    MUTED,
+    RED,
+    TEXT,
+    UI,
+    YELLOW,
+    console,
+)
 
 # Base system prompt: identity + the shared response-style guidance.
 _BASE_SYSTEM_PROMPT = "You are Ultron, a helpful local AI assistant.\n\n" + build_response_guidance().rstrip()
@@ -49,7 +59,7 @@ def run():
     # Generate configuration summary excluding secrets and print-filtered parameters
     exclude_keys = {"log_level", "data_dir", "memory_backend"}
     config_details = [
-        f"[blue]{key}[/blue]={value}"
+        f"[{BLUE}]{key}[/{BLUE}]={value}"
         for key, value in settings.model_dump(mode="json").items()
         if key not in exclude_keys and not any(secret_word in key.lower() for secret_word in ["key", "token", "secret", "password"])
     ]
@@ -85,22 +95,6 @@ def print_banner(model_name: str) -> None:
     UI.render_banner(model=model_name, cwd_short=_short_cwd())
 
 
-def render_status_bar(model_name: str, cwd_short: str | None = None) -> None:
-    """
-    Renders a compact single-line status bar for model_name.
-    """
-    from ultron.ui.theme import UI
-    UI.render_status_bar(model=model_name, cwd_short=cwd_short or _short_cwd())
-
-
-def render_screen(active_model: str) -> None:
-    """
-    Clears the terminal screen and draws the logo header banner for active_model.
-    """
-    console.clear()
-    print_banner(active_model)
-
-
 def print_help_table(console):
     """
     Prints a formatted table of available slash commands.
@@ -114,19 +108,11 @@ def render_security_status(console, mode: str) -> None:
     Prints the active security mode and how each risk tier maps to a decision
     under that mode, plus the guardrail summary.
     """
-    from rich import box
-    from rich.panel import Panel
-    from rich.table import Table
-
     from ultron.security import Decision, RiskTier, SecurityBoundary
 
     policy = SecurityBoundary(mode=mode)
 
-    table = Table(box=box.ROUNDED, expand=False)
-    table.add_column("Risk tier", style="bold #ffcc00")
-    table.add_column("Decision", style="bold white")
-    table.add_column("What happens", style="dim")
-
+    console.print(f"[bold {ACCENT}]🔒 Security mode:[/bold {ACCENT}] {mode}")
     for tier in RiskTier:
         decision = policy.decide(tier)
         note = {
@@ -136,20 +122,15 @@ def render_security_status(console, mode: str) -> None:
         }[decision]
         if tier == RiskTier.MEDIUM:
             note += " (reserved — no action maps to it yet)"
-        table.add_row(tier.value, decision.value, note)
+        console.print(
+            f"  [{MUTED}]{tier.value:<9}[/{MUTED}] "
+            f"[bold {TEXT}]{decision.value:<9}[/bold {TEXT}] {note}"
+        )
 
     console.print(
-        Panel(
-            table,
-            title=f"[bold #ffcc00]🔒 Security mode: {mode}[/bold #ffcc00]",
-            border_style="#ff8700",
-            box=box.ROUNDED,
-        )
-    )
-    console.print(
-        "[dim]Guardrails always hard-block leaked credentials, unsafe URLs, and "
-        "path escapes. "
-        f"Switch anytime with /security <{'|'.join(SECURITY_MODES)}>.[/dim]\n"
+        f"[{MUTED}]Guardrails always hard-block leaked credentials, unsafe URLs, and "
+        f"path escapes. "
+        f"Switch anytime with /security <{'|'.join(SECURITY_MODES)}>.[/{MUTED}]"
     )
 
 
@@ -160,8 +141,7 @@ async def handle_slash_command(
     agent=None,
     session=None,
     state=None,
-    live=None,
-    layout=None,
+    reflow=None,
 ) -> tuple[bool, bool]:
     """
     Handles slash commands entered by the user.
@@ -182,8 +162,6 @@ async def handle_slash_command(
 
     if clean_cmd == "/model":
         import questionary
-        from rich import box
-        from rich.panel import Panel
 
         from ultron.core.config import settings, update_env_file
 
@@ -192,7 +170,7 @@ async def handle_slash_command(
             models = await agent.engine.list_models()
 
         if not models:
-            console.print("[bold red]No local models found or failed to fetch model list from Ollama.[/bold red]\n")
+            console.print(f"[bold {RED}]No local models found or failed to fetch model list from Ollama.[/bold {RED}]\n")
             return True, False
 
         old_model = state.active_model if state else (getattr(session, "active_model", settings.model) if session else settings.model)
@@ -218,24 +196,21 @@ async def handle_slash_command(
                     agent.engine.default_model = selected_model
                     agent.engine.model = selected_model
             update_env_file("ULTRON_MODEL", selected_model)
-            render_screen(selected_model)
+            # Refresh the banner in place: the resize reflow replays it from a
+            # rebuild block that reads the current model, so re-running that
+            # block shows the new model without wiping the conversation.
+            if reflow is not None:
+                reflow.rebuild()
 
             console.print(
-                Panel(
-                    f"[bold green]✓ Switched model to '{selected_model}'[/bold green]\n"
-                    f"[dim]{old_model}[/] ➔ [bold magenta]{selected_model}[/]",
-                    box=box.ROUNDED,
-                    expand=False,
-                )
+                f"[{GREEN}]✓[/{GREEN}] Switched model  "
+                f"[{MUTED}]{old_model}[/{MUTED}] → [bold {ACCENT}]{selected_model}[/bold {ACCENT}]"
             )
-            console.print()
 
         return True, False
 
     if clean_cmd == "/agent" or clean_cmd.startswith("/agent "):
         import questionary
-        from rich import box
-        from rich.panel import Panel
 
         from ultron.core.agents import SUPPORTED_AGENTS, get_agent
 
@@ -257,7 +232,7 @@ async def handle_slash_command(
 
         if selected not in SUPPORTED_AGENTS:
             console.print(
-                f"[bold red]Unknown agent type:[/bold red] [cyan]{selected}[/cyan]. "
+                f"[bold {RED}]Unknown agent type:[/bold {RED}] [{ACCENT}]{selected}[/{ACCENT}]. "
                 f"Available: {', '.join(SUPPORTED_AGENTS)}.\n"
             )
             return True, False
@@ -268,7 +243,7 @@ async def handle_slash_command(
             # class from the single SUPPORTED_AGENTS contract.
             new_agent = get_agent(selected, engine=getattr(agent, "engine", None))
         except ValueError as exc:
-            console.print(f"[bold red]✗ Failed to switch agent:[/bold red] {exc}\n")
+            console.print(f"[bold {RED}]✗ Failed to switch agent:[/bold {RED}] {exc}\n")
             return True, False
 
         old_type = getattr(session, "active_agent_type", type(agent).__name__ if agent else "none")
@@ -279,17 +254,12 @@ async def handle_slash_command(
             session.next_agent = new_agent
             session.active_agent_type = selected
             console.print(
-                Panel(
-                    f"[bold green]✓ Switched agent to '{selected}'[/bold green]\n"
-                    f"[dim]{old_type}[/] ➔ [bold magenta]{selected}[/]",
-                    box=box.ROUNDED,
-                    expand=False,
-                )
+                f"[{GREEN}]✓[/{GREEN}] Switched agent  "
+                f"[{MUTED}]{old_type}[/{MUTED}] → [bold {ACCENT}]{selected}[/bold {ACCENT}]"
             )
-            console.print()
         else:
             console.print(
-                "[bold yellow]⚠ Switched agent, but no active session to apply it to.[/bold yellow]\n"
+                f"[bold {YELLOW}]⚠ Switched agent, but no active session to apply it to.[/bold {YELLOW}]\n"
             )
         return True, False
 
@@ -297,8 +267,6 @@ async def handle_slash_command(
         import os
 
         import questionary
-        from rich import box
-        from rich.panel import Panel
 
         from ultron.core.agents.security import get_security
         from ultron.core.config import settings, update_env_file
@@ -314,7 +282,7 @@ async def handle_slash_command(
             selected = requested
             if selected not in SECURITY_MODES:
                 console.print(
-                    f"[bold red]Unknown security mode:[/bold red] [cyan]{selected}[/cyan]. "
+                    f"[bold {RED}]Unknown security mode:[/bold {RED}] [{ACCENT}]{selected}[/{ACCENT}]. "
                     "Available: "
                     f"{', '.join(SECURITY_MODES)}.\n"
                 )
@@ -337,22 +305,15 @@ async def handle_slash_command(
             update_env_file("ULTRON_SECURITY_MODE", selected)
 
             console.print(
-                Panel(
-                    f"[bold green]✓ Switched security mode:[/bold green] "
-                    f"[dim]{current}[/] ➔ [bold magenta]{selected}[/]\n"
-                    f"[dim]persisted to ULTRON_SECURITY_MODE in .env[/dim]",
-                    box=box.ROUNDED,
-                    expand=False,
-                )
+                f"[{GREEN}]✓[/{GREEN}] Switched security mode  "
+                f"[{MUTED}]{current}[/{MUTED}] → [bold {ACCENT}]{selected}[/bold {ACCENT}]"
             )
-            console.print()
+            console.print(f"[{MUTED}]persisted to ULTRON_SECURITY_MODE in .env[/{MUTED}]")
             render_security_status(console, selected)
 
         return True, False
 
     if clean_cmd == "/memory" or clean_cmd.startswith("/memory "):
-        from rich import box
-        from rich.panel import Panel
         from rich.table import Table
 
         from ultron.core.tools.memory import graph
@@ -375,8 +336,8 @@ async def handle_slash_command(
                 console.print(graph.remove_triple(subject, predicate, object))
             else:
                 console.print(
-                    "[bold yellow]Usage: /memory remove <subject> <predicate> <object>[/bold yellow]\n"
-                    "[dim]e.g. /memory remove Paris is the capital of France[/dim]\n"
+                    f"[bold {YELLOW}]Usage: /memory remove <subject> <predicate> <object>[/bold {YELLOW}]\n"
+                    f"[{FAINT}]e.g. /memory remove Paris is the capital of France[/{FAINT}]\n"
                 )
             console.print()
             return True, False
@@ -385,34 +346,26 @@ async def handle_slash_command(
         triples = graph.get_all_triples()
 
         console.print(
-            f"[bold #ffcc00]🧠 Memory graph[/bold #ffcc00] — "
-            f"[cyan]{stats['entities']}[/] entities · "
-            f"[magenta]{stats['triples']}[/] triples · "
-            f"[dim]{stats['facts']}[/] flat facts\n"
+            f"[bold {ACCENT}]🧠 Memory graph[/bold {ACCENT}] — "
+            f"[{TEXT}]{stats['entities']}[/] entities · "
+            f"[{TEXT}]{stats['triples']}[/] triples · "
+            f"[{MUTED}]{stats['facts']}[/] flat facts"
         )
 
-        table = Table(box=box.ROUNDED, expand=False)
-        table.add_column("Stat", style="bold #ffcc00")
-        table.add_column("Count", style="bold white")
+        table = Table(box=None, show_header=False, expand=True, padding=(0, 2))
+        table.add_column(style=f"bold {ACCENT}")
+        table.add_column(style=TEXT)
         table.add_row("Entities (nodes)", str(stats["entities"]))
         table.add_row("Triples (edges)", str(stats["triples"]))
         table.add_row("Flat facts", str(stats["facts"]))
-
-        console.print(
-            Panel(
-                table,
-                title="[bold #ffcc00]🧠 Memory graph[/bold #ffcc00]",
-                border_style="#ff8700",
-                box=box.ROUNDED,
-            )
-        )
+        console.print(table)
         if triples:
-            console.print("[dim]Stored knowledge:[/dim]")
+            console.print(f"[{MUTED}]Stored knowledge:[/{MUTED}]")
             for edge in triples:
-                console.print(f"  [dim]-[/dim] {edge}")
+                console.print(f"  [{MUTED}]-[/{MUTED}] {edge}")
         else:
             console.print(
-                "[dim]No triples stored yet — try 'remember that Paris is the capital of France'.[/dim]"
+                f"[{MUTED}]No triples stored yet — try 'remember that Paris is the capital of France'.[/{MUTED}]"
             )
         console.print()
         return True, False
@@ -420,13 +373,12 @@ async def handle_slash_command(
     if clean_cmd == "/clear":
         from ultron.core.types import ChatMessage, Role
         history.clear()
+        if reflow is not None:
+            # The resize reflow replays the recorded transcript; /clear must
+            # drop it too, or a resize would resurrect the wiped conversation.
+            reflow.reset()
         history.append(ChatMessage(role=Role.SYSTEM, content=_BASE_SYSTEM_PROMPT))
-        if layout and state:
-            layout["header"].update(build_header(state))
-            layout["footer"].update(build_status_bar(state))
-            if live:
-                live.update(layout, refresh=True)
-        console.print("[bold green]Conversation history cleared.[/bold green]\n")
+        console.print(f"[{GREEN}]✓[/{GREEN}] Conversation history cleared.")
         return True, False
 
     if clean_cmd == "/reload":
@@ -472,26 +424,20 @@ async def handle_slash_command(
             history.clear()
             history.append(ChatMessage(role=Role.SYSTEM, content=_BASE_SYSTEM_PROMPT))
 
-            if layout and state:
-                layout["header"].update(build_header(state))
-                layout["footer"].update(build_status_bar(state))
-                if live:
-                    live.update(layout, refresh=True)
-
             console.print(
-                "[bold green]✓ Reloaded — fresh agent and tools loaded. Conversation history reset.[/bold green]\n"
-                "[dim]Note: reload is best-effort. If your changes don't appear, exit (/exit) and restart 'ultron chat' for a guaranteed clean reload.[/dim]\n"
+                f"[bold {GREEN}]✓ Reloaded — fresh agent and tools loaded. Conversation history reset.[/bold {GREEN}]\n"
+                f"[{FAINT}]Note: reload is best-effort. If your changes don't appear, exit (/exit) and restart 'ultron chat' for a guaranteed clean reload.[/{FAINT}]\n"
             )
             # Store fresh agent reference on session object or return indication if needed
             if session is not None:
                 session.reloaded_agent = fresh_agent
 
         except Exception as exc:  # noqa: BLE001 — reloads arbitrary user modules
-            console.print(f"[bold red]✗ Failed to reload modules:[/bold red] {exc}\n[dim]Continuing with existing working agent session.[/dim]\n")
+            console.print(f"[bold {RED}]✗ Failed to reload modules:[/bold {RED}] {exc}\n[{FAINT}]Continuing with existing working agent session.[/{FAINT}]\n")
 
         return True, False
 
-    console.print(f"[bold yellow]Unknown command:[/bold yellow] [cyan]{cmd}[/cyan]. Type [bold cyan]/help[/bold cyan] to see available commands.\n")
+    console.print(f"[bold {YELLOW}]Unknown command:[/bold {YELLOW}] [{ACCENT}]{cmd}[/{ACCENT}]. Type [bold {ACCENT}]/help[/bold {ACCENT}] to see available commands.\n")
     return True, False
 
 def summarize_pytest_output(raw_output: str) -> str:
@@ -509,7 +455,7 @@ def summarize_pytest_output(raw_output: str) -> str:
             return raw_output
 
         if failed_count == 0:
-            return f"All {passed_count} tests passed! ✅\n\n[dim]# Note: Run again with --raw to see full output[/dim]"
+            return f"All {passed_count} tests passed! ✅\n\n[{FAINT}]# Note: Run again with --raw to see full output[/{FAINT}]"
 
         summary_lines = [f"Test Results: {passed_count} passed, {failed_count} failed\n\nFailed tests:"]
         for test in failed_tests:
@@ -517,7 +463,7 @@ def summarize_pytest_output(raw_output: str) -> str:
             clean_test = test.strip().split()[-1] if test.strip() else test.strip()
             summary_lines.append(f"  - {clean_test}")
 
-        summary_lines.append("\n[dim]# Note: Run again with --raw to see full output[/dim]")
+        summary_lines.append(f"\n[{FAINT}]# Note: Run again with --raw to see full output[/{FAINT}]")
         return "\n".join(summary_lines)
     except (IndexError, TypeError, ValueError):
         return raw_output
@@ -625,7 +571,7 @@ async def async_chat(agent_type: str = "simple"):
         agent = get_agent(agent_type)
     except (ValueError, OSError) as e:
         logger.error(f"Failed to initialize agent: {e}")
-        console.print(f"[bold red]Initialization Error[/bold red]: {e}")
+        console.print(f"[bold {RED}]Initialization Error[/bold {RED}]: {e}")
         return
 
     logger.debug("Initializing chat session with SimpleAgent...")
@@ -636,8 +582,15 @@ async def async_chat(agent_type: str = "simple"):
         ChatMessage(role=Role.SYSTEM, content=_BASE_SYSTEM_PROMPT)
     ]
 
-    # Render the initial banner once at session start
-    print_banner(state.active_model)
+    # Record every renderable printed during the session and, on terminal
+    # resize while the chat prompt is live, re-render the whole conversation
+    # at the window's new width — so every response box, tool panel and table
+    # follows the resize, not just the startup banner.
+    from ultron.ui.responsive import ResizeReflow
+
+    reflow = ResizeReflow(console, app=session.app)
+    reflow.add(lambda: print_banner(state.active_model))
+    reflow.start()
 
     while True:
         try:
@@ -650,8 +603,14 @@ async def async_chat(agent_type: str = "simple"):
                 continue
 
             if trimmed_input.lower() in ("/exit", "/quit", "exit", "quit"):
+                reflow.stop()
                 UI.render_status("Goodbye.", status="info")
                 break
+
+            # Echo the user's message into the transcript (Claude Code style), so
+            # the conversation reads as a natural exchange. Recorded by the resize
+            # reflow like every other printed line.
+            UI.render_user_prompt(trimmed_input)
 
             if trimmed_input.startswith("/"):
                 handled, should_exit = await handle_slash_command(
@@ -661,6 +620,7 @@ async def async_chat(agent_type: str = "simple"):
                     agent=agent,
                     session=session,
                     state=state,
+                    reflow=reflow,
                 )
                 if hasattr(session, "reloaded_agent") and session.reloaded_agent is not None:
                     agent = session.reloaded_agent
@@ -670,6 +630,7 @@ async def async_chat(agent_type: str = "simple"):
                     agent = session.next_agent
                     session.next_agent = None
                 if should_exit:
+                    reflow.stop()
                     UI.render_status("Goodbye.", status="info")
                     break
                 if handled:
@@ -723,7 +684,7 @@ async def async_chat(agent_type: str = "simple"):
             state.status = "Thinking..."
             agent_task = asyncio.create_task(agent.run(trimmed_input, truncated_history))
 
-            with console.status("[dim]Thinking... (Press Esc to cancel)[/dim]"):
+            with console.status(f"[{FAINT}]Thinking... (Press Esc to cancel)[/{FAINT}]"):
                 while not agent_task.done():
                     if cancel_event.is_set():
                         agent_task.cancel()
@@ -812,7 +773,9 @@ async def async_chat(agent_type: str = "simple"):
                     UI.render_action_card(
                         title="Plan Approval Required",
                         action=f"Execute {len(steps)}-step plan",
-                        target=action.target or "",
+                        # The full plan is shown in the preview; dumping the raw
+                        # JSON into the chip line would wreck the layout.
+                        target="",
                         preview=(action.content or "")[:500],
                     )
                 else:
@@ -900,11 +863,15 @@ async def async_chat(agent_type: str = "simple"):
             state.status = "Ready"
 
             import re
-            tool_match = re.match(r"^Executed tool '(?:\[bold cyan\])?([^'\]]+)(?:\[/bold cyan\])?':\n\n(.*)$", response_msg.content, re.DOTALL)
+            tool_match = re.match(
+                r"^Executed tool '(?:\[[^']*\])?([^'\]]+)(?:\[/[^']*\])?':\n\n(.*)$",
+                response_msg.content,
+                re.DOTALL,
+            )
             if tool_match:
-                tool_name = tool_match.group(1)
-                tool_output = tool_match.group(2)
-                UI.render_tool_execution(tool_name, tool_output)
+                # Every print is recorded by the resize reflow, so tool
+                # executions and plain responses reflow automatically.
+                UI.render_tool_execution(tool_match.group(1), tool_match.group(2))
             else:
                 UI.render_response(response_msg.content)
 
@@ -912,6 +879,7 @@ async def async_chat(agent_type: str = "simple"):
             history.append(ChatMessage(role=Role.ASSISTANT, content=response_msg.content))
 
         except KeyboardInterrupt:
+            reflow.stop()
             UI.render_status("Chat interrupted. Goodbye.", status="warning")
             break
         except Exception as e:  # noqa: BLE001 — CLI boundary: never crash the chat

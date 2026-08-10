@@ -66,3 +66,31 @@ jobs:
         # search_web action-name mismatch that silently broke batched searches.
         # The harness exits non-zero on any failed check.
         run: python _stress_audit.py
+
+  reflow-e2e:
+    name: resize-reflow e2e (pty harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Fresh install (proven flow)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run resize-reflow pty harness
+        # Starts the real `ultron chat` CLI in a pty, builds a conversation,
+        # resizes the window mid-session, and asserts the whole transcript
+        # re-renders exactly once at each new width. Catches regressions in
+        # the terminal-resize reflow that the unit suite cannot exercise
+        # (e.g. banner/response boxes stuck at a stale width).
+        run: python _reflow_e2e.py

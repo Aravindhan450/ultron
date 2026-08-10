@@ -1,8 +1,8 @@
 # Ultron — Stress Test & Audit Report
 
-**Date:** 2026-08-08
-**Scope:** All recently implemented intelligence, learning, security, and tool features.
-**Harness:** `_stress_audit.py` (reproducible; 29/29 checks) + full pytest suite + ruff.
+**Date:** 2026-08-08 (original) · refreshed 2026-08-09
+**Scope:** All recently implemented intelligence, learning, security, and tool features, plus the UI/UX hardening pass.
+**Harness:** `_stress_audit.py` (reproducible; 29/29 checks) + full pytest suite + ruff + `_reflow_e2e.py`.
 
 ---
 
@@ -10,9 +10,10 @@
 
 | Metric | Result |
 |---|---|
-| Full test suite | **600 passed** (3 consecutive runs, no flakes) |
+| Full test suite | **619 passed** (2026-08-09 run; 600 on 2026-08-08) |
 | Lint (ruff, with & without config) | **Clean** |
 | Stress harness (`_stress_audit.py`) | **29/29 checks passed** |
+| Resize reflow e2e (`_reflow_e2e.py`) | **PASS** |
 | Registered tools | 38 |
 | Feature code under audit | ~4,070 LOC across 7 modules |
 | Feature test code | ~3,040 LOC across 7 test files |
@@ -159,11 +160,14 @@ integrity itself was verified against an isolated `AuditLog`.
 
 ```bash
 # Full suite + lint
-.venv/bin/python -m pytest -q          # 596 passed
+.venv/bin/python -m pytest -q          # 619 passed
 .venv/bin/ruff check . --isolated      # clean
 
 # Stress harness (29 checks, uses throwaway temp DBs only)
-.venv/bin/python _stress_audit.py
+.venv/bin/python _stress_audit.py      # SUMMARY: 29/29 checks passed
+
+# Resize reflow e2e (spawns the real CLI in a pty)
+.venv/bin/python _reflow_e2e.py        # RESULT: PASS
 ```
 
 ---
@@ -194,3 +198,35 @@ documented latent inconsistencies, and no concurrency, integrity, or security
 failures under load. The test suite is green across repeated runs and the lint
 surface is clean. The ReAct agent and CI now exercise the parallel-batch path
 and the stress harness automatically.
+
+## 9. Post-report hardening pass (2026-08-09)
+
+A UI/UX + cleanup pass landed after the original report; the full suite now
+stands at **619 passed**, ruff clean, stress 29/29, and the new resize e2e
+harness green. Changes:
+
+1. **Molten-flame brand palette** — the CLI now uses the four-colour flame
+   gradient `#E73F1E → #FB6C00 → #F9B637 → #FFDD9C`: the ASCII logo gradient,
+   the orange (`#FB6C00`) primary accent for every accent usage (help table,
+   confirmation/tool chips, status messages, Live-TUI header), and the response
+   panel border. `ACCENT` aliases `ORANGE` so all consumers swap at once.
+2. **Boxed responses with a clean `ULTRON` header** — assistant replies render
+   in a rounded panel with a `#FB6C00` border and the single `ULTRON` wordmark
+   (caps, matching the logo); the model, version, and timestamp never repeat in
+   the header (that context is established once in the startup banner).
+3. **Responsive resize reflow (`ui/responsive.py`)** — every printed block is
+   recorded and re-rendered at the live console width on resize; all panels and
+   tables span exactly the console width (`expand=True`). Verified by the new
+   `_reflow_e2e.py` pty harness, now a `reflow-e2e` CI job.
+4. **Old Live/Layout system fully removed** — `ui/layout.py` (build_header /
+   build_status_bar / build_layout), the dead `render_status_bar` helpers, the
+   unreachable `if layout and state:` blocks in `/clear` & `/reload`, and the
+   unused `live`/`layout` params on `handle_slash_command` were all deleted.
+   The chat is simple sequential printing; nothing references the old system
+   (verified repo-wide, including CI scripts and running processes).
+5. **Shared console highlight disabled** — rich auto-highlight painted random
+   colours into plain strings (model names, versions, paths); the theme now
+   controls every colour explicitly (`highlight=False`).
+
+Regression coverage added for the palette (logo gradient order, exact border
+truecolor), the clean response header, and the width-adaptive tables.
