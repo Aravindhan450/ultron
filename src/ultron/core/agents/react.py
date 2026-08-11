@@ -55,7 +55,16 @@ from ultron.core.intelligence.prompt_assembly import (
 )
 from ultron.core.logging import get_logger
 from ultron.core.tools.registry import get_tool, get_tools_schema
-from ultron.core.types import ChatMessage, PendingAction, Role, history_to_openai_format
+from ultron.core.types import (
+    ChatMessage,
+    FailureStrategy,
+    PendingAction,
+    PlanStep,
+    Role,
+    StepStatus,
+    TaskState,
+    history_to_openai_format,
+)
 
 logger = get_logger("ultron.agents.react")
 
@@ -151,6 +160,472 @@ def extract_tool_call(text: str) -> dict[str, Any] | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# TaskState integration helpers
+# ---------------------------------------------------------------------------
+
+def _observation_succeeded(observation: str) -> bool:
+    """
+    Conservative success check for a tool observation.
+
+    ``run_command`` reports failures as ``Exit code: 1`` (no ``Error`` prefix),
+    so a bare startswith("Error") check would record a failed command as
+    success and poison the verification evidence.
+    """
+    text = str(observation)
+    if text.startswith(("Error", "Blocked by security")):
+        return False
+    if "cancelled by user" in text.lower():
+        return False
+    match = re.search(r"Exit code:\s*(\d+)", text)
+    if match:
+        return match.group(1) == "0"
+    return True
+
+
+def _needs_verification(task: TaskState | None) -> bool:
+    """
+    True when a final-looking answer must be verified against the TaskState
+    before it can be accepted — the task is actively tracked and not yet
+    explicitly complete.
+
+    With a structured plan attached, verification is always required until
+    the task is explicitly complete: an unverified final answer can never
+    complete a planned task, and completion is only ever decided by
+    TaskState + the plan — never by the model's word alone.
+    """
+    if task is None or task.is_complete():
+        return False
+    if task.plan is not None:
+        return True
+    return task.requires_verification or bool(task.remaining_requirements())
+
+
+def _activate_plan_step(task: TaskState) -> None:
+    """
+    Marks the plan's next runnable step RUNNING (if a plan is attached).
+
+    The current step is the RUNNING step when one exists, otherwise the next
+    PENDING step whose dependencies are satisfied. Starting a step also
+    records it as the task's ``current_step``.
+    """
+    if task.plan is None:
+        return
+    step = task.current_plan_step()
+    if step is None or step.status is not StepStatus.PENDING:
+        return
+    step.status = StepStatus.RUNNING
+    task.set_current_step(step.id)
+
+
+def _resume_task(task: TaskState) -> TaskState:
+    """
+    Closes an interrupted confirmation turn: records the confirmed action's
+    observation into the task transcript/history and resumes the task.
+
+    Called by run() when a task is passed back in after main.py executed the
+    pending action. The observation becomes a TOOL message the model sees, so
+    it understands e.g. "TodoList exists, but the application is not complete".
+
+    With a structured plan attached, the current plan step returns from
+    WAITING_CONFIRMATION back to RUNNING so execution continues on the same
+    step — never a restart from step 1.
+    """
+    observation = task.last_observation
+    if observation is not None:
+        action_type = task.pending_action.action_type if task.pending_action else "tool"
+        target = task.pending_action.target if task.pending_action else ""
+        task.context.append(
+            ChatMessage(role=Role.TOOL, name=action_type, content=observation)
+        )
+        task.record_tool_execution(
+            tool_name=action_type,
+            target=target,
+            success=_observation_succeeded(observation),
+            detail=str(observation),
+        )
+        if task.plan is not None:
+            step = next(
+                (
+                    s
+                    for s in task.plan.steps
+                    if s.status is StepStatus.WAITING_CONFIRMATION
+                ),
+                None,
+            )
+            if step is not None:
+                step.status = StepStatus.RUNNING
+                task.set_current_step(step.id)
+        else:
+            task.set_current_step(len(task.execution_history))
+        task.last_observation = None
+        task.pending_action = None
+        task.resume()
+    return task
+
+
+def _activate_task(
+    task: TaskState | None,
+    goal: str,
+    messages: list[ChatMessage],
+    task_start: int,
+    response: str,
+    action: PendingAction,
+) -> TaskState:
+    """
+    Creates (or reuses) the task for a gated state-changing action.
+
+    On first use the transcript is seeded from the messages after the user's
+    goal message; the current assistant tool-call response is appended so the
+    transcript survives the confirmation round-trip. The task is set to
+    WAITING_CONFIRMATION and flagged for verification.
+    """
+    if task is None:
+        task = TaskState(goal=goal)
+        task.context = list(messages[task_start:])
+        task.requires_verification = True
+        _seed_task_history(task, messages, task_start)
+    if task.plan is not None:
+        step = task.current_plan_step()
+        if step is not None and step.status is StepStatus.RUNNING:
+            step.status = StepStatus.WAITING_CONFIRMATION
+    task.context.append(ChatMessage(role=Role.ASSISTANT, content=response))
+    task.pending_action = action
+    task.wait_for_confirmation()
+    return task
+
+
+def _seed_task_history(
+    task: TaskState, messages: list[ChatMessage], task_start: int
+) -> None:
+    """
+    Copies tool observations that predate task creation into the history.
+
+    When a task is created at the first gated action, any earlier read-only
+    tool work in the transcript is part of the evidence — mirror it into
+    ``execution_history`` so verification sees the complete picture.
+    """
+    for i in range(task_start, len(messages)):
+        msg = messages[i]
+        if msg.role != Role.TOOL or not msg.name or msg.name == "task_verification":
+            continue
+        target = ""
+        if i - 1 >= task_start and messages[i - 1].role == Role.ASSISTANT:
+            call = extract_tool_call(messages[i - 1].content)
+            if isinstance(call, dict) and isinstance(call.get("arguments"), dict):
+                target, _ = _generic_target_content(msg.name, call["arguments"])
+        task.record_tool_execution(
+            tool_name=msg.name,
+            target=target,
+            success=_observation_succeeded(msg.content),
+            detail=str(msg.content),
+        )
+    task.set_current_step(len(task.execution_history))
+
+
+def _task_messages(
+    task: TaskState, history: list[ChatMessage] | None
+) -> list[ChatMessage]:
+    """
+    Rebuilds the model context for a resumed task: the persisted transcript,
+    prefixed with the caller's leading SYSTEM message (persona) when present.
+    """
+    base = list(task.context)
+    if history and history[0].role == Role.SYSTEM:
+        base.insert(0, history[0])
+    return base
+
+
+def _build_task_context_block(task: TaskState | None) -> str:
+    """
+    Explicit continuation context: goal, status, requirements, completed work.
+    Injected into the system prompt so the model always knows the overall task
+    is not finished until TaskState says so.
+    """
+    if task is None:
+        return ""
+    lines = [
+        "CURRENT TASK (you are working toward this goal; do not stop until it is complete):",
+        f"Goal: {task.goal}",
+        f"Status: {task.status.value}",
+        f"Step: {task.current_step}/{task.total_steps or '?'} completed",
+        f"Requirements: {len(task.completed_requirements)}/{len(task.requirements)} complete",
+    ]
+    for requirement in task.requirements:
+        mark = "[x]" if requirement.completed else "[ ]"
+        lines.append(f"  {mark} {requirement.description}")
+    if task.execution_history:
+        lines.append("Work completed so far:")
+        for entry in task.execution_history:
+            status = "ok" if entry.success else "FAILED"
+            lines.append(
+                f"  - {entry.tool_name}({entry.target or ''}) [{status}] "
+                f"{entry.detail[:200]}"
+            )
+    plan_block = _build_plan_context_block(task)
+    if plan_block:
+        lines.append("")
+        lines.append(plan_block)
+    return "\n".join(lines)
+
+
+def _build_plan_context_block(task: TaskState) -> str:
+    """
+    Structured-plan context injected when the task carries a validated plan.
+
+    The plan is the source of truth: the model sees the CURRENT step (with
+    its dependencies and completion criteria), the completed steps, and the
+    remaining steps. It is instructed to work only on the current step — a
+    step completes only when its criteria are verified, and a single tool
+    call never completes a step or the task.
+    """
+    plan = task.plan
+    if plan is None:
+        return ""
+    step = task.current_plan_step()
+    lines = [
+        "STRUCTURED PLAN (source of truth):",
+        f"Task type: {task.task_type.value if task.task_type else 'unknown'}",
+        f"Workspace: {plan.workspace.value}",
+    ]
+    if step is not None:
+        lines.append(f"Current step {step.id}/{len(plan.steps)}: {step.description}")
+        if step.purpose:
+            lines.append(f"  Purpose: {step.purpose}")
+        if step.expected_outcome:
+            lines.append(f"  Expected outcome: {step.expected_outcome}")
+        if step.dependencies:
+            lines.append(
+                f"  Depends on: {', '.join(f'step {d}' for d in step.dependencies)}"
+            )
+        lines.append("  Completion criteria (all must be verified to finish this step):")
+        for criterion in step.completion_criteria:
+            lines.append(f"    [ ] {criterion}")
+        retry = f" (retry x{step.retry_policy})" if step.retry_policy else ""
+        lines.append(f"  Failure policy: {step.failure_strategy.value}{retry}")
+    else:
+        lines.append("Current step: none (all steps terminal)")
+    completed = plan.completed_steps()
+    if completed:
+        lines.append("Completed steps:")
+        for s in completed:
+            lines.append(f"  [x] {s.id}. {s.description}")
+    remaining = [s for s in plan.remaining_steps() if step is None or s.id != step.id]
+    if remaining:
+        lines.append("Remaining steps:")
+        for s in remaining:
+            deps = (
+                f" (after {', '.join(str(d) for d in s.dependencies)})"
+                if s.dependencies
+                else ""
+            )
+            lines.append(f"  [ ] {s.id}. {s.description}{deps}")
+    lines.append(
+        "INSTRUCTIONS: work ONLY on the current plan step. Do not skip ahead; "
+        "a step is complete only when all its completion criteria are verified "
+        "— a single tool call never completes a step or the task."
+    )
+    return "\n".join(lines)
+
+
+def _work_summary(task: TaskState) -> str:
+    """Compact list of recorded tool executions for verification prompts."""
+    if task.execution_history:
+        lines = []
+        for i, entry in enumerate(task.execution_history, start=1):
+            status = "succeeded" if entry.success else "FAILED"
+            lines.append(f"{i}. {entry.tool_name} -> {status}: {entry.detail[:300]}")
+        return "\n".join(lines)
+    return "(no tool executions recorded)"
+
+
+def _build_verification_prompt(task: TaskState, proposed_answer: str) -> str:
+    """
+    Asks the model to propose the goal's completion criteria and mark which
+    are satisfied by the work actually performed. TaskState stays the
+    authority: only criteria the model marks satisfied become completed
+    requirements, and the task completes only when ALL are satisfied.
+    """
+    return (
+        "You are verifying whether an autonomous assistant has completed the user's task.\n\n"
+        f"Goal: {task.goal}\n\n"
+        f"Work performed so far:\n{_work_summary(task)}\n\n"
+        f"The assistant's proposed answer: {proposed_answer}\n\n"
+        "Decide which completion criteria the goal implies, and mark each as satisfied "
+        "ONLY if the recorded work actually fulfills it. Do not invent work that was "
+        "not performed, and do not claim success while criteria remain unmet.\n"
+        "Respond with ONLY a JSON array, e.g.:\n"
+        '[{"description": "application files exist", "satisfied": true}, '
+        '{"description": "application can run", "satisfied": false}]'
+    )
+
+
+def _parse_requirements_json(text: str) -> list[dict] | None:
+    """Parses a verification JSON array, tolerating surrounding prose/fences."""
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        first = text.find("[")
+        last = text.rfind("]")
+        if first == -1 or last <= first:
+            return None
+        try:
+            data = json.loads(text[first : last + 1])
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(data, list):
+        return None
+    return [d for d in data if isinstance(d, dict)]
+
+
+def _build_plan_verification_prompt(task: TaskState, proposed_answer: str) -> str:
+    """
+    Plan-aware verification prompt: marks the CURRENT step's completion
+    criteria and the plan's overall criteria against the recorded work.
+
+    The plan is the source of truth — the model proposes which criteria are
+    satisfied, but the step only advances (SUCCEEDED) when ALL of its criteria
+    are marked satisfied, and the task completes only when every step is
+    terminal AND every overall requirement is complete.
+    """
+    step = task.current_plan_step()
+    lines = [
+        "You are verifying whether an autonomous assistant has completed the ",
+        "CURRENT PLAN STEP of the user's task.\n",
+        f"Goal: {task.goal}",
+        f"Task type: {task.task_type.value if task.task_type else 'unknown'}",
+        "",
+    ]
+    if step is not None:
+        lines.append(
+            f"Current plan step ({step.id}/{len(task.plan.steps)}): {step.description}"
+        )
+        if step.purpose:
+            lines.append(f"  Purpose: {step.purpose}")
+        if step.expected_outcome:
+            lines.append(f"  Expected outcome: {step.expected_outcome}")
+        lines.append("  Completion criteria:")
+        for criterion in step.completion_criteria:
+            lines.append(f"    - {criterion}")
+    else:
+        lines.append("Current plan step: none (all steps terminal).")
+    lines.extend(["", "Overall task completion criteria (all must be satisfied):"])
+    for requirement in task.requirements:
+        mark = "satisfied" if requirement.completed else "unsatisfied"
+        lines.append(f"  - [{mark}] {requirement.description}")
+    lines.extend(
+        [
+            "",
+            f"Work performed so far:\n{_work_summary(task)}",
+            "",
+            f"The assistant's proposed answer: {proposed_answer}",
+            "",
+            "Decide which completion criteria are satisfied ONLY if the recorded work ",
+            "actually fulfills them. Do not invent work. Do not claim a step complete ",
+            "while any of its criteria remain unmet.",
+            "Respond with ONLY a JSON object:",
+            '{"step_criteria": [{"description": "...", "satisfied": true}], ',
+            '"plan_criteria": [{"description": "...", "satisfied": true}], ',
+            '"step_failed": false, "plan_revision": null}',
+            "- step_criteria: the CURRENT step's completion criteria, each marked.",
+            "- plan_criteria: the overall task completion criteria above, each marked.",
+            "- step_failed: true only if the current step cannot be completed as planned.",
+            "- plan_revision: OPTIONAL replacement steps (same shape as plan steps: ",
+            "  id, description, purpose, dependencies, expected_outcome, ",
+            "  completion_criteria, failure_strategy, retry_policy) covering the ",
+            "  REMAINING work, or null. Never include completed steps.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _parse_plan_verification(text: str) -> dict | None:
+    """Parses a plan verification JSON object, tolerating prose/fences."""
+    data = _parse_json_object(str(text))
+    return data if isinstance(data, dict) else None
+
+
+def _parse_revision_steps(items) -> list[PlanStep] | None:
+    """
+    Parses a proposed adaptive plan revision into PlanStep objects.
+
+    Returns None when the payload is not a valid list of step objects, so
+    callers keep the current plan rather than executing an invalid revision.
+    """
+    if not isinstance(items, list):
+        return None
+    steps: list[PlanStep] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        try:
+            step_id = int(item.get("id", 0))
+            description = str(item.get("description", "")).strip()
+            if not step_id or not description:
+                return None
+            strategy = str(item.get("failure_strategy", "stop")).lower()
+            try:
+                failure_strategy = FailureStrategy(strategy)
+            except ValueError:
+                failure_strategy = FailureStrategy.STOP
+            steps.append(
+                PlanStep(
+                    id=step_id,
+                    description=description,
+                    purpose=str(item.get("purpose", "")).strip(),
+                    dependencies=[
+                        int(d)
+                        for d in item.get("dependencies", [])
+                        if isinstance(d, int)
+                    ],
+                    expected_outcome=str(item.get("expected_outcome", "")).strip(),
+                    completion_criteria=[
+                        str(c).strip()
+                        for c in item.get("completion_criteria", [])
+                        if str(c).strip()
+                    ],
+                    failure_strategy=failure_strategy,
+                    retry_policy=int(item.get("retry_policy", 0) or 0),
+                )
+            )
+        except (ValueError, TypeError):
+            return None
+    return steps or None
+
+
+def _retries_exhausted(step: PlanStep) -> bool:
+    """True when a RETRY step has consumed its retry budget."""
+    return (
+        step.failure_strategy is FailureStrategy.RETRY
+        and step.retry_policy > 0
+        and step.attempts >= step.retry_policy
+    )
+
+
+def _cascade_skipped(task: TaskState) -> None:
+    """
+    Marks PENDING steps that can no longer run as SKIPPED, transitively.
+
+    A step whose prerequisite was SKIPPED (or failed under a continue-style
+    policy) can never execute. Leaving it PENDING would strand the plan —
+    ``is_satisfied()`` could never become True and completion could never be
+    reached — so it is marked SKIPPED like its prerequisite.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for candidate in task.plan.steps:
+            if candidate.status is not StepStatus.PENDING:
+                continue
+            if any(
+                (dep := task.plan.step(d)) is not None
+                and dep.status in (StepStatus.SKIPPED, StepStatus.FAILED)
+                for d in candidate.dependencies
+            ):
+                candidate.status = StepStatus.SKIPPED
+                changed = True
+
+
 class ReActAgent(BaseAgent):
     """
     Reason + Act agent that loops over Thought/Action/Observation until it
@@ -165,15 +640,26 @@ class ReActAgent(BaseAgent):
         super().__init__(engine)
         self.max_iterations = max_iterations
 
-    async def run(self, user_input: str, history: list[ChatMessage] | None = None) -> ChatMessage:
+    async def run(
+        self,
+        user_input: str,
+        history: list[ChatMessage] | None = None,
+        task: TaskState | None = None,
+    ) -> ChatMessage:
         """
-        Executes the ReAct loop for a single user turn.
+        Executes the ReAct loop for a single user turn (or a task continuation).
 
         Returns a ChatMessage whose content is either the model's final answer
         or (for state-modifying actions) carries a PendingAction so the CLI
         can prompt the user for confirmation before anything executes.
+
+        Task integration: when ``task`` is passed in (after main.py executed a
+        confirmed action), the interrupted turn is closed with the action's
+        observation and the loop resumes from the persisted task transcript —
+        so a successful ``mkdir`` is an observation, never task completion.
+        A final-looking answer is only accepted once the task is explicitly
+        complete (see ``_verify_task``); otherwise the agent keeps working.
         """
-        messages = list(history) if history else []
         system_prompt = build_system_prompt()
 
         # Structured output enforcement: inject the exact schema when the
@@ -187,6 +673,26 @@ class ReActAgent(BaseAgent):
         if schema_block:
             system_prompt += "\n\n" + schema_block
 
+        fresh_turn = task is None or not task.context
+        if fresh_turn:
+            # Fresh turn (or a freshly prepared planned task with an empty
+            # transcript): seed the conversation from history, inject the
+            # system prompt, then append the user input last (so the task
+            # transcript slice below starts exactly at the user's goal).
+            messages = list(history) if history else []
+        else:
+            # Continuation after a confirmed action: close the interrupted
+            # turn with the observation, then resume from the task transcript.
+            task = _resume_task(task)
+            messages = _task_messages(task, history)
+
+        # Explicit continuation context: goal, status, requirements, completed
+        # work — so the model always knows the overall task is not finished
+        # until TaskState says it is.
+        task_block = _build_task_context_block(task)
+        if task_block:
+            system_prompt += "\n\n" + task_block
+
         # Inject the ReAct system prompt at the front of the conversation,
         # preserving any existing system context (e.g. persona instructions).
         if messages and messages[0].role == Role.SYSTEM:
@@ -197,19 +703,44 @@ class ReActAgent(BaseAgent):
         else:
             messages.insert(0, ChatMessage(role=Role.SYSTEM, content=system_prompt))
 
-        messages.append(ChatMessage(role=Role.USER, content=user_input))
+        if fresh_turn:
+            messages.append(ChatMessage(role=Role.USER, content=user_input))
+            # The task transcript starts at the user's goal message.
+            task_start = len(messages) - 1
+            if task is not None:
+                task.context = list(messages[task_start:])
+        else:
+            task_start = 0
+
+        # With a structured plan attached, mark the first runnable step as
+        # RUNNING so the model always has a concrete "current step".
+        if task is not None:
+            _activate_plan_step(task)
 
         for _ in range(self.max_iterations):
             response = (await self.engine.generate(history_to_openai_format(messages))) or ""
             tool_call = extract_tool_call(response)
 
-            # No tool call → the model is answering directly; that's the
-            # answer (structured output is enforced when a schema was asked
-            # for — repaired + [structured] notes, never silent deviation).
+            # No tool call → the model proposes a final answer. If the task is
+            # still being verified, do NOT accept the answer on the model's
+            # word alone — verify against TaskState first.
             if tool_call is None:
+                if _needs_verification(task):
+                    if task is not None and task.plan is not None:
+                        accepted, answer = await self._verify_plan_task(
+                            task, user_input, response, messages
+                        )
+                    else:
+                        accepted, answer = await self._verify_task(
+                            task, user_input, response, messages
+                        )
+                    if accepted:
+                        return answer
+                    continue
                 return ChatMessage(
                     role=Role.ASSISTANT,
                     content=polish_response(enforce_reply(user_input, response)),
+                    task_state=task,
                 )
 
             tool_name = tool_call.get("tool")
@@ -222,9 +753,18 @@ class ReActAgent(BaseAgent):
             outcome = self._route_tool(tool_name, arguments, user_input)
 
             # Confirmation-gated action — hand control back to the CLI with a
-            # PendingAction payload instead of executing anything silently.
+            # PendingAction payload AND the live task, so the original goal
+            # survives the confirmation round-trip.
             if isinstance(outcome, ChatMessage) and outcome.pending_action is not None:
-                return outcome
+                task = _activate_task(
+                    task, user_input, messages, task_start, response, outcome.pending_action
+                )
+                return ChatMessage(
+                    role=Role.ASSISTANT,
+                    content=outcome.content,
+                    pending_action=outcome.pending_action,
+                    task_state=task,
+                )
 
             # Read-only routes (e.g. a GET via handle_http) return a plain
             # ChatMessage; unwrap it so the result feeds back as an Observation
@@ -233,10 +773,66 @@ class ReActAgent(BaseAgent):
                 outcome = outcome.content
 
             # Record the assistant's action and the tool observation so the
-            # model can reason over its own previous steps.
+            # model can reason over its own previous steps — and mirror them
+            # into the task transcript + history when a task is active, so
+            # verification sees every piece of work performed.
             messages.append(ChatMessage(role=Role.ASSISTANT, content=response))
             messages.append(ChatMessage(role=Role.TOOL, name=tool_name, content=str(outcome)))
+            if task is not None:
+                task.context.append(ChatMessage(role=Role.ASSISTANT, content=response))
+                task.context.append(ChatMessage(role=Role.TOOL, name=tool_name, content=str(outcome)))
+                target, _ = _generic_target_content(tool_name, arguments)
+                succeeded = _observation_succeeded(str(outcome))
+                task.record_tool_execution(
+                    tool_name=tool_name,
+                    target=target,
+                    success=succeeded,
+                    detail=str(outcome),
+                )
+                if task.plan is not None and not succeeded:
+                    step = task.current_plan_step()
+                    if step is not None and step.status is StepStatus.RUNNING:
+                        step.attempts += 1
+                        step.error = str(outcome)[:300]
 
+        # Iteration budget exhausted with an active task — never claim success.
+        if task is not None and (
+            task.requires_verification
+            or task.remaining_requirements()
+            or (task.plan is not None and not task.plan.is_satisfied())
+        ):
+            remaining = task.remaining_requirements()
+            if task.plan is not None and not task.plan.is_satisfied():
+                # With a structured plan the plan is the source of truth —
+                # report the remaining plan steps first, then any unmet
+                # overall requirements as additional detail.
+                steps = task.plan.remaining_steps()
+                names = ", ".join(f"step {s.id} ({s.description})" for s in steps)
+                detail = f"The task is incomplete — remaining plan steps: {names}."
+                if remaining:
+                    reqs = ", ".join(r.description for r in remaining)
+                    detail += f" Unmet overall requirements: {reqs}."
+            elif remaining:
+                names = ", ".join(r.description for r in remaining)
+                detail = f"The task is incomplete — remaining requirements: {names}."
+            else:
+                detail = "The task is incomplete — requirements were never fully verified."
+            if task.plan is not None:
+                step = task.current_plan_step()
+                if step is not None and step.status is StepStatus.RUNNING:
+                    step.status = StepStatus.FAILED
+            task.record_failure(
+                f"Exceeded the maximum of {self.max_iterations} reasoning steps "
+                "with work remaining"
+            )
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=(
+                    f"I could not complete the task within {self.max_iterations} steps. "
+                    f"{detail}"
+                ),
+                task_state=task,
+            )
         return ChatMessage(
             role=Role.ASSISTANT,
             content=(
@@ -244,6 +840,356 @@ class ReActAgent(BaseAgent):
                 "without reaching a final answer. Please try rephrasing or "
                 "simplifying the request."
             ),
+            task_state=task,
+        )
+
+    async def _verify_task(
+        self,
+        task: TaskState,
+        user_input: str,
+        proposed_answer: str,
+        messages: list[ChatMessage],
+    ) -> tuple[bool, ChatMessage | None]:
+        """
+        One completion-verification pass against the TaskState.
+
+        The model proposes completion criteria and marks which are satisfied by
+        the recorded work; TaskState is the authority — the final answer is
+        only accepted when every requirement is marked complete
+        (``task.is_complete()``). Otherwise the model's proposal is recorded as
+        an observation and the loop continues toward the goal.
+
+        Returns ``(accepted, final_message)``.
+        """
+        from ultron.core.intelligence.structured_output import enforce_reply
+
+        prompt = _build_verification_prompt(task, proposed_answer)
+        raw = (await self.engine.generate([{"role": "user", "content": prompt}])) or ""
+        requirements = _parse_requirements_json(raw)
+
+        # Record the model's proposed answer either way, so a continuation has
+        # full context.
+        messages.append(ChatMessage(role=Role.ASSISTANT, content=proposed_answer))
+        task.context.append(ChatMessage(role=Role.ASSISTANT, content=proposed_answer))
+
+        def _note(content: str) -> None:
+            messages.append(
+                ChatMessage(role=Role.TOOL, name="task_verification", content=content)
+            )
+            task.context.append(
+                ChatMessage(role=Role.TOOL, name="task_verification", content=content)
+            )
+
+        if requirements is None:
+            _note(
+                "Task verification could not parse a completion-criteria response; "
+                "the task is still incomplete. Continue working toward the goal."
+            )
+            return False, None
+
+        for item in requirements:
+            description = str(item.get("description", "")).strip()
+            if not description:
+                continue
+            satisfied = bool(item.get("satisfied"))
+            try:
+                if satisfied:
+                    task.mark_requirement_complete(description)
+                else:
+                    task.mark_requirement_incomplete(description)
+            except ValueError:
+                # First time this criterion is proposed — add it, then mark it.
+                task.add_requirement(description)
+                if satisfied:
+                    task.mark_requirement_complete(description)
+
+        remaining = task.remaining_requirements()
+        if remaining:
+            names = ", ".join(f"'{r.description}'" for r in remaining)
+            _note(
+                f"Verification: task incomplete. Remaining requirements: {names}. "
+                "Continue working toward the goal."
+            )
+            return False, None
+
+        task.mark_complete()
+        return True, ChatMessage(
+            role=Role.ASSISTANT,
+            content=polish_response(enforce_reply(user_input, proposed_answer)),
+            task_state=task,
+        )
+
+    async def _verify_plan_task(
+        self,
+        task: TaskState,
+        user_input: str,
+        proposed_answer: str,
+        messages: list[ChatMessage],
+    ) -> tuple[bool, ChatMessage | None]:
+        """
+        Plan-aware completion verification against a structured TaskPlan.
+
+        The plan is the source of truth: the model marks the CURRENT step's
+        completion criteria and the plan's overall criteria against the
+        recorded work. A step advances to SUCCEEDED only when ALL of its
+        criteria are satisfied; the task completes only when every step is
+        terminal AND every overall requirement is complete. The model can
+        never claim "done" while plan work remains (no skipping A → F).
+
+        Failure policy: when a step is reported failed (or its retry budget is
+        exhausted) the step's ``failure_strategy`` decides the outcome —
+        STOP terminates the task, RETRY permits more attempts, SKIP skips the
+        step, CONTINUE records the failure and keeps going.
+
+        Adaptive planning: an optional ``plan_revision`` payload replaces the
+        remaining steps (validated by TaskState) while completed steps stay
+        recorded.
+
+        Returns ``(accepted, final_message)``.
+        """
+        from ultron.core.intelligence.structured_output import enforce_reply
+
+        prompt = _build_plan_verification_prompt(task, proposed_answer)
+        raw = (await self.engine.generate([{"role": "user", "content": prompt}])) or ""
+        data = _parse_plan_verification(raw)
+
+        # Record the model's proposed answer either way, so a continuation has
+        # full context.
+        messages.append(ChatMessage(role=Role.ASSISTANT, content=proposed_answer))
+        task.context.append(ChatMessage(role=Role.ASSISTANT, content=proposed_answer))
+
+        def _note(content: str) -> None:
+            messages.append(
+                ChatMessage(role=Role.TOOL, name="task_verification", content=content)
+            )
+            task.context.append(
+                ChatMessage(role=Role.TOOL, name="task_verification", content=content)
+            )
+
+        if data is None:
+            _note(
+                "Plan verification could not be parsed; the task is still "
+                "incomplete. Continue working toward the current plan step."
+            )
+            return False, None
+
+        # Mark the plan-level criteria against the task requirements.
+        for item in data.get("plan_criteria") or []:
+            if not isinstance(item, dict):
+                continue
+            description = str(item.get("description", "")).strip()
+            if not description:
+                continue
+            satisfied = bool(item.get("satisfied"))
+            try:
+                if satisfied:
+                    task.mark_requirement_complete(description)
+                else:
+                    task.mark_requirement_incomplete(description)
+            except ValueError:
+                task.add_requirement(description)
+                if satisfied:
+                    task.mark_requirement_complete(description)
+
+        step = task.current_plan_step()
+        if step is None:
+            # No runnable step: complete only when the plan is fully satisfied
+            # (every step terminal) AND every overall requirement is met.
+            # "No runnable step" can also mean stranded PENDING steps whose
+            # dependencies failed/skipped — those must not complete the task.
+            if not task.plan.is_satisfied():
+                pending = task.plan.remaining_steps()
+                names = ", ".join(
+                    f"step {s.id} ('{s.description}')" for s in pending
+                )
+                _note(
+                    f"Verification: task incomplete — plan steps are not all "
+                    f"terminal: {names}. Continue working toward the goal."
+                )
+                return False, None
+            remaining = task.remaining_requirements()
+            if remaining:
+                names = ", ".join(f"'{r.description}'" for r in remaining)
+                _note(
+                    f"Verification: task incomplete. Remaining requirements: "
+                    f"{names}. Continue working toward the goal."
+                )
+                return False, None
+            task.mark_complete()
+            return True, ChatMessage(
+                role=Role.ASSISTANT,
+                content=polish_response(enforce_reply(user_input, proposed_answer)),
+                task_state=task,
+            )
+
+        step_criteria = [
+            item
+            for item in (data.get("step_criteria") or [])
+            if isinstance(item, dict) and str(item.get("description", "")).strip()
+        ]
+        step_failed = bool(data.get("step_failed"))
+        # The CURRENT step advances only when ALL of ITS OWN completion
+        # criteria are marked satisfied — criteria from other steps are
+        # ignored, so the model can never skip ahead (A -> F).
+        satisfied_descriptions = {
+            str(item.get("description")).strip()
+            for item in step_criteria
+            if bool(item.get("satisfied"))
+        }
+        all_met = bool(step.completion_criteria) and all(
+            criterion in satisfied_descriptions
+            for criterion in step.completion_criteria
+        )
+
+        if step_failed or _retries_exhausted(step):
+            # Apply the step's failure strategy.
+            return self._apply_step_failure_strategy(
+                task, step, data, proposed_answer, _note, user_input
+            )
+
+        if not all_met:
+            unmet = [
+                criterion
+                for criterion in step.completion_criteria
+                if criterion not in satisfied_descriptions
+            ]
+            names = ", ".join(f"'{u}'" for u in (unmet or ["all criteria"]))
+            _note(
+                f"Verification: step {step.id} ('{step.description}') is not "
+                f"complete. Unmet step criteria: {names}. Continue working on "
+                "this step; do not claim completion until every criterion is "
+                "verified."
+            )
+            return False, None
+
+        # Current step complete — mark it SUCCEEDED first, THEN apply any
+        # adaptive revision so completed work is preserved, then advance.
+        task.plan.set_step_status(step.id, StepStatus.SUCCEEDED, result=proposed_answer[:300])
+
+        revision = data.get("plan_revision")
+        if isinstance(revision, list) and revision:
+            new_steps = _parse_revision_steps(revision)
+            if new_steps is not None and task.adapt_plan(new_steps):
+                _note(
+                    "Plan revised: remaining steps updated to "
+                    f"{len(new_steps)} replacement step(s). Continue with the "
+                    "updated plan."
+                )
+            else:
+                _note(
+                    "A proposed plan revision was rejected (structurally "
+                    "invalid); the current plan stays in force."
+                )
+
+        next_step = task.plan.next_step()
+        if next_step is not None:
+            next_step.status = StepStatus.RUNNING
+            task.set_current_step(next_step.id)
+            _note(
+                f"Verification: step {step.id} complete. Next step: "
+                f"{next_step.id} ('{next_step.description}'). Continue working "
+                "toward it."
+            )
+            return False, None
+
+        # All steps done: complete only when the plan is satisfied AND every
+        # overall requirement is met — never while a step is still stranded.
+        if not task.plan.is_satisfied():
+            pending = task.plan.remaining_steps()
+            names = ", ".join(
+                f"step {s.id} ('{s.description}')" for s in pending
+            )
+            _note(
+                f"Verification: task incomplete — plan steps are not all "
+                f"terminal: {names}. Continue working toward the goal."
+            )
+            return False, None
+        remaining = task.remaining_requirements()
+        if remaining:
+            names = ", ".join(f"'{r.description}'" for r in remaining)
+            _note(
+                f"Verification: all plan steps are complete but overall "
+                f"requirements remain: {names}. Continue working toward the "
+                "goal."
+            )
+            return False, None
+        task.mark_complete()
+        return True, ChatMessage(
+            role=Role.ASSISTANT,
+            content=polish_response(enforce_reply(user_input, proposed_answer)),
+            task_state=task,
+        )
+
+    def _apply_step_failure_strategy(
+        self,
+        task: TaskState,
+        step: PlanStep,
+        data: dict,
+        proposed_answer: str,
+        note,
+        user_input: str,
+    ) -> tuple[bool, ChatMessage | None]:
+        """
+        Applies a failed step's ``failure_strategy`` to the plan + task.
+
+        STOP (default) and exhausted RETRY terminate the task with an explicit
+        failure report — never a success claim. RETRY keeps the step RUNNING
+        while attempts remain. SKIP marks the step SKIPPED and advances. 
+        CONTINUE records the failure and advances.
+        """
+        strategy = step.failure_strategy
+        reason = str(data.get("step_failed_reason") or "step failed")[:300]
+
+        if strategy is FailureStrategy.RETRY and not _retries_exhausted(step):
+            note(
+                f"Step {step.id} failed but the plan allows retry "
+                f"(attempt {step.attempts}/{step.retry_policy}). Do not repeat "
+                "the identical failed action — inspect the failure and adjust "
+                "your approach."
+            )
+            return False, None
+
+        if strategy in (FailureStrategy.SKIP, FailureStrategy.CONTINUE):
+            # SKIP marks the step SKIPPED. CONTINUE records the failure (as a
+            # SKIPPED step with the error attached — the plan stays
+            # satisfiable) and keeps going with independent work. Either way,
+            # any PENDING step that depended on this one can never run, so it
+            # is cascaded to SKIPPED to keep the plan consistent.
+            status = StepStatus.SKIPPED
+            task.plan.set_step_status(step.id, status, error=reason)
+            _cascade_skipped(task)
+            next_step = task.plan.next_step()
+            if next_step is not None:
+                next_step.status = StepStatus.RUNNING
+                task.set_current_step(next_step.id)
+            word = "skipped" if strategy is FailureStrategy.SKIP else "failed"
+            note(
+                f"Step {step.id} {word} per plan policy ({reason}). "
+                + (
+                    f"Next step: {next_step.id} ('{next_step.description}'). "
+                    "Continue working toward it."
+                    if next_step is not None
+                    else "No remaining runnable steps."
+                )
+            )
+            return False, None
+
+        # STOP (default) or retries exhausted → the task cannot succeed.
+        task.plan.set_step_status(step.id, StepStatus.FAILED, error=reason)
+        remaining = task.remaining_steps()
+        task.record_failure(f"Plan step {step.id} ('{step.description}') failed: {reason}")
+        detail = ""
+        if remaining:
+            names = ", ".join(f"step {s.id} ({s.description})" for s in remaining)
+            detail = f" Remaining plan steps: {names}."
+        return True, ChatMessage(
+            role=Role.ASSISTANT,
+            content=(
+                f"I could not complete plan step {step.id} "
+                f"('{step.description}'): {reason}. The task is incomplete."
+                f"{detail}"
+            ),
+            task_state=task,
         )
 
     def _route_tool(self, tool_name: str, arguments: dict[str, Any], user_input: str) -> str | ChatMessage:

@@ -6,6 +6,7 @@ from ultron import __version__
 from ultron.core.config import settings
 from ultron.core.intelligence.prompt_assembly import build_response_guidance
 from ultron.core.logging import get_logger
+from ultron.core.types import ChatMessage, PendingAction, TaskState
 from ultron.ui.theme import (
     ACCENT,
     BLUE,
@@ -28,6 +29,12 @@ app = typer.Typer(name="ultron", help="Ultron AI Assistant CLI")
 
 # Valid security modes for the /security slash command.
 SECURITY_MODES = ("permissive", "interactive", "strict")
+
+# Maximum confirmation round-trips per user turn. The agent's own
+# max_iterations bounds reasoning inside each step; this bounds how many
+# consecutive state-changing steps a single turn may confirm, so a degenerate
+# model cannot trigger an unbounded confirmation loop.
+MAX_CONFIRMATIONS_PER_TURN = 20
 
 def version_callback(value: bool):
     if value:
@@ -521,6 +528,133 @@ def summarize_lint_output(raw_output: str) -> str:
     except (IndexError, TypeError, ValueError):
         return raw_output
 
+
+async def execute_pending_action(action: PendingAction) -> str:
+    """
+    Executes an approved PendingAction and returns its result string.
+
+    Extracted from the chat loop so the confirmation + execution lifecycle is
+    testable and shared with the task-continuation path.
+    """
+    from ultron.core.tools.registry import get_tool
+
+    result: str = "Error: Unknown action type."
+
+    if action.action_type == "run_command":
+        if action.target.startswith("http_request:"):
+            parts = action.target.split(":", 3)
+            method = parts[1]
+            url = parts[2]
+            body = parts[3] if len(parts) > 3 else None
+            http_tool = get_tool("make_http_request")
+            result = (
+                http_tool(method, url, body)
+                if http_tool
+                else "Error: Tool 'make_http_request' not found."
+            )
+        else:
+            run_cmd_func = get_tool("run_command")
+            result = (
+                run_cmd_func(action.target)
+                if run_cmd_func
+                else "Error: Tool 'run_command' not found."
+            )
+
+            if action.target.startswith("pytest"):
+                result = summarize_pytest_output(result)
+            elif action.target.startswith("ruff check"):
+                result = summarize_lint_output(result)
+
+    elif action.action_type == "read_file":
+        read_func = get_tool("read_file")
+        raw = read_func(action.target) if read_func else "Error: Tool 'read_file' not found."
+        if str(raw).startswith("Error"):
+            result = f"Sorry, I could not find or read the file '{action.target}'."
+        else:
+            result = f"Here are the contents of '{action.target}':\n\n{raw}"
+
+    elif action.action_type == "write_file":
+        write_func = get_tool("write_file")
+        result = (
+            write_func(action.target, action.content or "", overwrite=False)
+            if write_func
+            else "Error: Tool 'write_file' not found."
+        )
+
+    elif action.action_type == "overwrite_file":
+        write_func = get_tool("write_file")
+        result = (
+            write_func(action.target, action.content or "", overwrite=True)
+            if write_func
+            else "Error: Tool 'write_file' not found."
+        )
+
+    elif action.action_type == "web_search":
+        search_func = get_tool("search_web")
+        result = (
+            search_func(action.target)
+            if search_func
+            else "Error: Tool 'search_web' not found."
+        )
+
+    elif action.action_type == "fetch_page":
+        fetch_func = get_tool("fetch_page_text")
+        result = (
+            fetch_func(action.target)
+            if fetch_func
+            else "Error: Tool 'fetch_page_text' not found."
+        )
+
+    elif action.action_type == "run_parallel":
+        commands = [c for c in (action.target or "").splitlines() if c.strip()]
+        parallel_func = get_tool("run_parallel")
+        result = (
+            parallel_func(commands)
+            if parallel_func
+            else "Error: Tool 'run_parallel' not found."
+        )
+
+    elif action.action_type == "db_query":
+        query_func = get_tool("run_query")
+        result = (
+            query_func(action.target)
+            if query_func
+            else "Error: Tool 'run_query' not found."
+        )
+
+    elif action.action_type == "execute_plan":
+        import json as _json
+
+        from ultron.core.agents.simple import execute_plan
+
+        steps = _json.loads(action.target or "[]")
+        results = await execute_plan(steps)
+        result = "\n".join(results)
+
+    else:
+        result = f"Error: Unrecognised action type '{action.action_type}'."
+
+    return result
+
+
+async def continue_task_after_confirmation(
+    agent,
+    task: TaskState,
+    result: str,
+    history: list[ChatMessage],
+) -> ChatMessage:
+    """
+    Feeds a confirmed action's result back into the task as an observation and
+    re-invokes the agent so the original task continues.
+
+    The agent owns the transcript: on resume it records the observation,
+    resumes the task state, and keeps reasoning toward the goal. The security
+    boundary is not bypassed — every subsequent state-changing action still
+    flows through the same PendingAction confirmation path.
+    """
+    task.last_observation = result
+    return await agent.run(task.goal, history, task=task)
+
 async def async_chat(agent_type: str = "simple"):
     """
     Asynchronous runner for the interactive chat session.
@@ -533,6 +667,8 @@ async def async_chat(agent_type: str = "simple"):
     from prompt_toolkit import PromptSession
 
     from ultron.core.agents import get_agent
+    from ultron.core.agents.react import ReActAgent
+    from ultron.core.intelligence.task_planning import prepare_task_for_execution
     from ultron.core.state import CLIState
     from ultron.ui.session import ChatSession
 
@@ -681,8 +817,32 @@ async def async_chat(agent_type: str = "simple"):
             esc_thread = threading.Thread(target=_listen_for_esc, args=(cancel_event,), daemon=True)
             esc_thread.start()
 
+            # Plan-aware execution (ReAct agent only): understand + classify
+            # the request and, when it is a complex task type, prepare a
+            # TaskState carrying a validated structured plan before the agent
+            # runs. Informational / simple / file-operation requests return
+            # None and stay on the fast path (no plan, no extra LLM call). A
+            # request that genuinely needs clarification is surfaced to the
+            # user instead of executing blindly.
+            prepared_task = None
+
+            async def _plan_and_run(
+                _agent=agent,
+                _input=trimmed_input,
+                _history=truncated_history,
+            ):
+                nonlocal prepared_task
+                if isinstance(_agent, ReActAgent):
+                    prepared_task = await prepare_task_for_execution(
+                        _input, _agent.engine
+                    )
+                    if prepared_task is not None and prepared_task.clarification_required:
+                        return None
+                    return await _agent.run(_input, _history, task=prepared_task)
+                return await _agent.run(_input, _history)
+
             state.status = "Thinking..."
-            agent_task = asyncio.create_task(agent.run(trimmed_input, truncated_history))
+            agent_task = asyncio.create_task(_plan_and_run())
 
             with console.status(f"[{FAINT}]Thinking... (Press Esc to cancel)[/{FAINT}]"):
                 while not agent_task.done():
@@ -706,10 +866,53 @@ async def async_chat(agent_type: str = "simple"):
                 UI.render_status("Task execution cancelled by Esc key.", status="warning")
                 continue
 
-            if response_msg.pending_action:
-                import questionary
+            if response_msg is None:
+                # The request lacked information needed for safe planning —
+                # surface the questions instead of executing blindly.
+                questions = " ".join(
+                    prepared_task.clarification_questions or []
+                )
+                UI.render_response(
+                    "I need more information before I can plan this safely: "
+                    f"{questions}"
+                )
+                history.append(ChatMessage(role=Role.USER, content=trimmed_input))
+                continue
 
-                from ultron.core.tools.registry import get_tool
+            confirmations = 0
+            while response_msg.pending_action:
+                task = response_msg.task_state
+                # Adaptive per-turn cap: a known step count gets headroom,
+                # otherwise the constant applies — a degenerate model cannot
+                # ping-pong confirmations forever.
+                limit = MAX_CONFIRMATIONS_PER_TURN
+                if task is not None and task.total_steps > 0:
+                    limit = max(limit, task.total_steps + 2)
+                if confirmations >= limit:
+                    if task is not None:
+                        task.record_failure(
+                            "Exceeded the maximum number of confirmation steps in one turn"
+                        )
+                        remaining = task.remaining_requirements()
+                        if remaining:
+                            names = ", ".join(r.description for r in remaining)
+                            detail = f" Remaining requirements: {names}."
+                        else:
+                            detail = ""
+                    else:
+                        detail = ""
+                    response_msg = ChatMessage(
+                        role=Role.ASSISTANT,
+                        content=(
+                            "I stopped after too many confirmation steps; the task is "
+                            f"incomplete.{detail} Please continue with a more specific "
+                            "request."
+                        ),
+                    )
+                    break
+                confirmations += 1
+
+                import questionary
 
                 action = response_msg.pending_action
                 state.status = f"Executing Tool: {action.action_type}"
@@ -790,75 +993,24 @@ async def async_chat(agent_type: str = "simple"):
                     choices=["Yes, allow", "No, don't allow"],
                 ).ask_async()
 
-                result: str = "Error: Unknown action type."
-
                 if choice == "Yes, allow":
-                    if action.action_type == "run_command":
-                        if action.target.startswith("http_request:"):
-                            parts = action.target.split(":", 3)
-                            method = parts[1]
-                            url = parts[2]
-                            body = parts[3] if len(parts) > 3 else None
-                            http_tool = get_tool("make_http_request")
-                            result = http_tool(method, url, body) if http_tool else "Error: Tool 'make_http_request' not found."
-                        else:
-                            run_cmd_func = get_tool("run_command")
-                            result = run_cmd_func(action.target) if run_cmd_func else "Error: Tool 'run_command' not found."
-
-                            if action.target.startswith("pytest"):
-                                result = summarize_pytest_output(result)
-                            elif action.target.startswith("ruff check"):
-                                result = summarize_lint_output(result)
-
-                    elif action.action_type == "read_file":
-                        read_func = get_tool("read_file")
-                        raw = read_func(action.target) if read_func else "Error: Tool 'read_file' not found."
-                        if str(raw).startswith("Error"):
-                            result = f"Sorry, I could not find or read the file '{action.target}'."
-                        else:
-                            result = f"Here are the contents of '{action.target}':\n\n{raw}"
-
-                    elif action.action_type == "write_file":
-                        write_func = get_tool("write_file")
-                        result = write_func(action.target, action.content or "", overwrite=False) if write_func else "Error: Tool 'write_file' not found."
-
-                    elif action.action_type == "overwrite_file":
-                        write_func = get_tool("write_file")
-                        result = write_func(action.target, action.content or "", overwrite=True) if write_func else "Error: Tool 'write_file' not found."
-
-                    elif action.action_type == "web_search":
-                        search_func = get_tool("search_web")
-                        result = search_func(action.target) if search_func else "Error: Tool 'search_web' not found."
-
-                    elif action.action_type == "fetch_page":
-                        fetch_func = get_tool("fetch_page_text")
-                        result = fetch_func(action.target) if fetch_func else "Error: Tool 'fetch_page_text' not found."
-
-                    elif action.action_type == "run_parallel":
-                        commands = [c for c in (action.target or "").splitlines() if c.strip()]
-                        parallel_func = get_tool("run_parallel")
-                        result = parallel_func(commands) if parallel_func else "Error: Tool 'run_parallel' not found."
-
-                    elif action.action_type == "db_query":
-                        query_func = get_tool("run_query")
-                        result = query_func(action.target) if query_func else "Error: Tool 'run_query' not found."
-
-                    elif action.action_type == "execute_plan":
-                        import json as _json
-
-                        from ultron.core.agents.simple import execute_plan
-
-                        steps = _json.loads(action.target or "[]")
-                        results = await execute_plan(steps)
-                        result = "\n".join(results)
-
-                    else:
-                        result = f"Error: Unrecognised action type '{action.action_type}'."
-
+                    result = await execute_pending_action(action)
                 else:
                     result = "Action cancelled by user."
 
-                response_msg = ChatMessage(role=Role.ASSISTANT, content=result)
+                if task is not None:
+                    # The original task survives confirmation: the result is fed
+                    # back as an observation and the agent continues working
+                    # toward the goal until TaskState reports it complete.
+                    UI.render_tool_execution(action.action_type, result)
+                    response_msg = await continue_task_after_confirmation(
+                        agent, task, result, history
+                    )
+                else:
+                    # No task (e.g. SimpleAgent path) — behave exactly as before:
+                    # one confirmed action per turn, result shown directly.
+                    response_msg = ChatMessage(role=Role.ASSISTANT, content=result)
+                    break
 
             state.status = "Ready"
 
