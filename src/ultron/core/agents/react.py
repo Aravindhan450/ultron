@@ -1405,9 +1405,18 @@ class ReActAgent(BaseAgent):
         """
         # --- State-modifying actions: gated by the boundary verdict ---
         if tool_name == "run_command":
-            cmd = str(arguments.get("command", "")).strip()
-            if not cmd:
-                return "Error: run_command requires a non-empty 'command' argument."
+            # Never pass raw model text to the shell: normalize any
+            # natural-language wrapper and refuse prose that is not
+            # command-shaped ("Execute: pwd" -> ``pwd``).
+            from ultron.core.nlp.normalize import normalize_terminal_command
+            raw_cmd = str(arguments.get("command", "")).strip()
+            normalized = normalize_terminal_command(raw_cmd)
+            if not normalized:
+                return (
+                    "Error: run_command requires a command-shaped argument; "
+                    "the supplied text is not a shell command."
+                )
+            cmd = normalized
             verdict = check_action("run_command", cmd)
             if is_denied(verdict):
                 return blocked_message(verdict)

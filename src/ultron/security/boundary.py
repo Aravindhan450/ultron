@@ -51,6 +51,8 @@ _READONLY_COMMAND = re.compile(
     r"ls|cat|pwd|echo|head|tail|grep|find|which|whereis|env|whoami|date|uptime|df|du|"
     r"git\s+(?:status|diff|log|show)|"
     r"pytest|ruff|"
+    r"(?:[\w./-]*/)?(?:\\.venv|venv)?/?bin/python(?:3)?\s+-m\s+pytest|"
+    r"python(?:3)?\s+-m\s+pytest|"
     r"pip\s+(?:list|show)|"
     r"sqlite3\s+.*\s+'(?:select|with)"
     r")\b",

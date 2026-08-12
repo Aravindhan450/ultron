@@ -18,6 +18,8 @@ from ultron.core.intelligence.prompt_assembly import (
     polish_response,
 )
 from ultron.core.logging import get_logger
+from ultron.core.nlp.intent import route_request
+from ultron.core.nlp.normalize import detect_explicit_test_command
 from ultron.core.types import ChatMessage, PendingAction, Role, history_to_openai_format
 from ultron.ui.theme import ACCENT
 
@@ -386,14 +388,211 @@ def detect_file_write_intent(user_input: str) -> tuple[str, str] | None:
 
 def detect_command_intent(user_input: str) -> str | None:
     """
-    Detects if the user input requests running a command (e.g., "run <command>" or "execute <command>").
-    Returns the extracted command string if matched, otherwise None.
+    Detects if the user input requests running a command (e.g. "run <command>"
+    or "execute <command>") and returns the actual command.
+
+    Uses the NLP normalizer so natural-language wrappers never leak into the
+    shell: ``Execute: pwd``, ``Run the command `pwd` ``, ``Please execute
+    `pwd` ``, ``Can you execute pwd?`` all resolve to ``pwd``, while prose
+    (``run the tests``) is left to the test/lint detectors.  Returns None when
+    the text is not command-shaped.
     """
-    pattern = r'^\s*(?:run|execute)\s+(?P<command>.+)\s*$'
-    match = re.search(pattern, user_input, re.IGNORECASE)
-    if match:
-        return match.group("command").strip()
+    from ultron.core.nlp.normalize import normalize_terminal_command
+    return normalize_terminal_command(user_input)
+
+def handle_routed_intent(intent) -> ChatMessage | None:
+    """
+    Dispatches a routed UserIntent (from ultron.core.nlp.route_request) to its
+    dedicated tool handler.  Returns None for intents the caller should fall
+    through to the generic detectors.
+
+    Every execution still flows through the security boundary — the NLP layer
+    only decides *which* tool and *what* arguments; it never authorizes.
+    """
+    from ultron.core.nlp.observe import record_action
+
+    cat = intent.intent_type
+    args = intent.arguments or {}
+    security_decision = "pending"
+    confirmation_required = False
+
+    def _gated_readonly(tool_name: str, **kwargs) -> ChatMessage:
+        nonlocal security_decision, confirmation_required
+        # The most actionable security/audit target is the symbol or query
+        # (e.g. "find_definition → TaskState"), not the workspace root path
+        # that read-only code-intelligence tools also receive for indexing.
+        target = str(
+            kwargs.get("query")
+            or kwargs.get("name")
+            or kwargs.get("file_path")
+            or kwargs.get("path")
+            or ""
+        )
+        verdict = check_action(tool_name, target)
+        if is_denied(verdict):
+            security_decision = "deny"
+            return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+        if is_confirm(verdict):
+            security_decision, confirmation_required = "confirm", True
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=f"{tool_name} requested: '{target}'",
+                pending_action=PendingAction(action_type=tool_name, target=target),
+            )
+        security_decision = "allow"
+        return ChatMessage(role=Role.ASSISTANT, content=execute_tool(tool_name, **kwargs))
+
+    if cat.value == "terminal_execution":
+        cmd = str(args.get("command") or "").strip()
+        if not cmd:
+            return None
+        msg = handle_command(cmd)
+        record_action(
+            user_intent="terminal_execution", selected_tool="run_command",
+            extracted_arguments={"command": cmd},
+            normalized_arguments={"command": cmd},
+        )
+        return msg
+
+    if cat.value == "directory_list":
+        # Resolve natural-language locations ("current directory", "here",
+        # "this folder") and relative paths against the actual workspace root
+        # — never pass the literal phrase or the process CWD by accident.
+        from ultron.core.nlp.workspace import resolve_location_path
+        path = resolve_location_path(args.get("path", "."))
+        msg = _gated_readonly("list_directory", path=path)
+        record_action("directory_list", "list_directory",
+                      extracted_arguments=args, normalized_arguments={"path": path},
+                      security_decision=security_decision,
+                      confirmation_required=confirmation_required)
+        return msg
+
+    if cat.value == "file_search":
+        from ultron.core.nlp.workspace import resolve_location_path
+        path = resolve_location_path(args.get("path", "."))
+        msg = _gated_readonly("search_files", query=args.get("query", ""),
+                              path=path)
+        record_action("file_search", "search_files", extracted_arguments=args,
+                      normalized_arguments={"path": path},
+                      security_decision=security_decision,
+                      confirmation_required=confirmation_required)
+        return msg
+
+    if cat.value in {
+        "definition_lookup", "reference_lookup", "symbol_search",
+        "code_search", "semantic_search",
+    }:
+        # Code-intelligence tools search the workspace; pass the project root
+        # explicitly so they are never anchored to an arbitrary process CWD.
+        from ultron.core.nlp.workspace import resolve_workspace
+        ws_root = resolve_workspace().project_root
+        tool = {
+            "definition_lookup": "find_definition",
+            "reference_lookup": "find_references",
+            "symbol_search": "find_symbol",
+            "code_search": "code_search",
+            "semantic_search": "semantic_search",
+        }[cat.value]
+        kw = {"name": args.get("name", "")} if "name" in args else {"query": args.get("query", "")}
+        msg = _gated_readonly(tool, path=ws_root, **kw)
+        record_action(cat.value, tool, extracted_arguments=args,
+                      normalized_arguments={"path": ws_root, **kw},
+                      security_decision=security_decision,
+                      confirmation_required=confirmation_required)
+        return msg
+
+    if cat.value == "file_delete":
+        target = str(args.get("file_path") or "")
+        if not target:
+            return None
+        verdict = check_action("delete_file", target)
+        if is_denied(verdict):
+            security_decision = "deny"
+            msg = ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+        elif is_confirm(verdict):
+            security_decision, confirmation_required = "confirm", True
+            msg = ChatMessage(
+                role=Role.ASSISTANT,
+                content=f"Delete file — {target}",
+                pending_action=PendingAction(action_type="delete_file", target=target),
+            )
+        else:
+            security_decision = "allow"
+            msg = ChatMessage(role=Role.ASSISTANT,
+                              content=execute_tool("delete_file", file_path=target))
+        record_action("file_delete", "delete_file", extracted_arguments=args,
+                      security_decision=security_decision,
+                      confirmation_required=confirmation_required)
+        return msg
+
+    if cat.value == "file_rename":
+        old, new = str(args.get("file_path") or ""), str(args.get("new_path") or "")
+        if not old or not new:
+            return None
+        verdict = check_action("rename_file", old)
+        if is_denied(verdict):
+            security_decision = "deny"
+            msg = ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+        elif is_confirm(verdict):
+            security_decision, confirmation_required = "confirm", True
+            msg = ChatMessage(
+                role=Role.ASSISTANT,
+                content=f"Rename file — {old} to {new}",
+                pending_action=PendingAction(action_type="rename_file", target=old,
+                                             content=new),
+            )
+        else:
+            security_decision = "allow"
+            msg = ChatMessage(role=Role.ASSISTANT,
+                              content=execute_tool("rename_file", file_path=old, new_path=new))
+        record_action("file_rename", "rename_file", extracted_arguments=args,
+                      security_decision=security_decision,
+                      confirmation_required=confirmation_required)
+        return msg
+
+    if cat.value == "directory_create":
+        command = str(args.get("command") or "").strip()
+        if not command:
+            return None
+        msg = handle_command(command)
+        record_action("directory_create", "run_command",
+                      extracted_arguments={"command": command})
+        return msg
+
+    # Project-command requests: resolve against the repository, never invent.
+    if cat.value in {
+        "test_execution", "build", "lint", "typecheck", "format",
+        "application_start", "application_stop",
+    }:
+        from ultron.core.nlp.project import (
+            discover_project_command,
+            resolve_test_command,
+        )
+        what = str(args.get("what") or cat.value)
+        if what == "test":
+            resolved = resolve_test_command()
+            command = resolved.command() if resolved is not None else discover_project_command("test")
+        else:
+            command = discover_project_command(what)
+        if not command:
+            record_action(cat.value, "none", extracted_arguments=args,
+                          security_decision="pending",
+                          follow_up_action="clarify_command")
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=(
+                    f"I can't determine the '{what}' command for this project — "
+                    "no configuration evidence found. Tell me the exact command "
+                    "to run (e.g. 'run pytest tests/')."
+                ),
+            )
+        msg = handle_command(command)
+        record_action(cat.value, "run_command", extracted_arguments=args,
+                      normalized_arguments={"command": command})
+        return msg
+
     return None
+
 
 def _split_commands(text: str) -> list[str]:
     """
@@ -695,7 +894,22 @@ def detect_test_intent(user_input: str) -> bool:
     Detects if the user input requests running tests (e.g. "run tests", "test my code").
     Returns True if matched, otherwise False.
     """
-    pattern = r'\b(run\s+tests?|run\s+the\s+tests?|test\s+my\s+code|run\s+pytest)\b'
+    pattern = (
+        r'\b(run\s+tests?|run\s+the\s+tests?|test\s+my\s+code|run\s+pytest'
+        r'|run\s+(?:the\s+)?(?:full\s+)?test\s+suite|run\s+all\s+tests?'
+        r'|why\s+are\s+(?:the\s+)?tests?\s+failing)\b'
+    )
+    return bool(re.search(pattern, user_input, re.IGNORECASE))
+
+
+def detect_relevant_tests_intent(user_input: str) -> bool:
+    """
+    Detects "run the relevant / affected tests" — NOT the whole suite.
+
+    These route to affected-test selection (changed files → likely tests)
+    instead of ``handle_test``'s full-suite command.
+    """
+    pattern = r'\b(?:run|execute)\s+(?:the\s+)?(?:relevant|affected)\s+tests?\b'
     return bool(re.search(pattern, user_input, re.IGNORECASE))
 
 def detect_git_intent(user_input: str) -> str | None:
@@ -1719,21 +1933,74 @@ def handle_memory_question(topic: str) -> ChatMessage:
 
 def handle_test() -> ChatMessage:
     """
-    Runs pytest -v, gated by the security boundary.
+    Runs the project's test command, gated by the security boundary.
 
+    The command is discovered from repository configuration (pytest for
+    Python, npm test for Node, …) AND resolved to the project's environment
+    (virtualenv / poetry / uv) so a bare ``pytest`` on PATH is never assumed.
     pytest is a read-only command (LOW risk), so it auto-executes in every
     mode; a confirmation prompt only appears if the security mode classifies
     it otherwise.
     """
-    blocked = _gate_command("pytest -v")
+    from ultron.core.nlp.project import discover_project_command, resolve_test_command
+    resolved = resolve_test_command()
+    test_cmd = (
+        resolved.command()
+        if resolved is not None
+        else (discover_project_command("test") or "pytest -v")
+    )
+    blocked = _gate_command(test_cmd)
     if blocked is not None:
         return blocked
     return ChatMessage(
         role=Role.ASSISTANT,
-        content="Test execution requested: 'pytest -v'",
+        content=f"Test execution requested: '{test_cmd}'",
         pending_action=PendingAction(
             action_type="run_command",
-            target="pytest -v"
+            target=test_cmd
+        )
+    )
+
+
+def handle_relevant_tests() -> ChatMessage:
+    """
+    Runs only the tests likely affected by the current changes.
+
+    Flow: git changed files → affected-test selection (FIX #5) → the project's
+    resolved test command with the selected test paths.  Falls back to the
+    full suite when no changes or no matching tests are found.
+    """
+    from ultron.core.coding.test_selection import select_affected_tests
+    from ultron.core.nlp.project import resolve_test_command
+    from ultron.core.nlp.workspace import git_changed_files, resolve_workspace
+
+    workspace = resolve_workspace()
+    changed = git_changed_files()
+    if not changed:
+        return handle_test()
+
+    root = workspace.project_root
+    affected = select_affected_tests(changed, root)
+    if not affected:
+        # No convention-mapped tests — fall back to the full suite rather than
+        # inventing a target.
+        return handle_test()
+
+    resolved = resolve_test_command()
+    test_cmd = (
+        resolved.command(affected)
+        if resolved is not None
+        else f"pytest {' '.join(affected)}"
+    )
+    blocked = _gate_command(test_cmd)
+    if blocked is not None:
+        return blocked
+    return ChatMessage(
+        role=Role.ASSISTANT,
+        content=f"Affected tests requested: '{test_cmd}'",
+        pending_action=PendingAction(
+            action_type="run_command",
+            target=test_cmd
         )
     )
 
@@ -1759,20 +2026,24 @@ def handle_git(command: str) -> ChatMessage:
 
 def handle_lint() -> ChatMessage:
     """
-    Runs ruff in concise mode, gated by the security boundary.
+    Runs the project's lint command, gated by the security boundary.
 
-    ruff is a read-only command (LOW risk), so it auto-executes in every mode.
+    The command is discovered from repository configuration (ruff for this
+    project, npm run lint for Node, …) with a ruff fallback — never invented.
+    Linting is a read-only command (LOW risk), so it auto-executes in every
+    mode.
     """
-    ruff_cmd = "ruff check . --output-format=concise"
-    blocked = _gate_command(ruff_cmd)
+    from ultron.core.nlp.project import discover_project_command
+    lint_cmd = discover_project_command("lint") or "ruff check . --output-format=concise"
+    blocked = _gate_command(lint_cmd)
     if blocked is not None:
         return blocked
     return ChatMessage(
         role=Role.ASSISTANT,
-        content=f"Lint check requested: '{ruff_cmd}'",
+        content=f"Lint check requested: '{lint_cmd}'",
         pending_action=PendingAction(
             action_type="run_command",
-            target=ruff_cmd
+            target=lint_cmd
         )
     )
 
@@ -2434,7 +2705,27 @@ async def handle_llm_fallback(
                 # before execution — deny blocks, allow executes directly,
                 # confirm routes through the PendingAction flow.
                 if tool_name == "run_command":
-                    cmd = arguments.get("command", "")
+                    # Never pass raw model text to the shell: normalize any
+                    # natural-language wrapper first, and refuse prose that is
+                    # not command-shaped ("Execute: pwd" -> ``pwd``; "the
+                    # tests" -> refused, routed to the test detectors).
+                    from ultron.core.nlp.normalize import normalize_terminal_command
+                    raw_cmd = arguments.get("command", "")
+                    normalized = (
+                        normalize_terminal_command(str(raw_cmd))
+                        if isinstance(raw_cmd, str)
+                        else None
+                    )
+                    if not normalized:
+                        return ChatMessage(
+                            role=Role.ASSISTANT,
+                            content=(
+                                "I won't run that as a shell command — it looks "
+                                "like conversational text, not a command. Tell me "
+                                "the exact command to run (e.g. 'run pytest tests/')."
+                            ),
+                        )
+                    cmd = normalized
                     verdict = check_action("run_command", cmd)
                     if is_denied(verdict):
                         return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
@@ -2706,7 +2997,20 @@ class SimpleAgent(BaseAgent):
         if parallel_commands:
             return handle_parallel(parallel_commands)
 
-        # Step 4: run tests
+        # Step 4: run tests — an explicit test command WITH a target wins over
+        #           the generic "run the tests" so the target is never dropped
+        #           ("Run pytest tests/test_api.py" runs that file, not the
+        #           whole suite with a default invocation).  The explicit
+        #           command is resolved to the project environment so a bare
+        #           `pytest` on PATH is never assumed.
+        explicit_test = detect_explicit_test_command(user_input)
+        if explicit_test:
+            from ultron.core.nlp.project import resolve_explicit_test_command
+            return handle_command(resolve_explicit_test_command(explicit_test))
+        # "Run the relevant tests" — affected-test selection, before the
+        # generic test intent so it never degrades to the whole suite.
+        if detect_relevant_tests_intent(user_input):
+            return handle_relevant_tests()
         if detect_test_intent(user_input):
             return handle_test()
 
@@ -2823,6 +3127,19 @@ class SimpleAgent(BaseAgent):
                 error=debug_req.get("error", ""),
                 expected=debug_req.get("expected", ""),
             )
+
+        # Step 4.98: NLP routing layer (Fix #8) — filesystem / code
+        #           intelligence / project-command intents that the
+        #           specialised detectors above did not claim.  Runs before
+        #           the generic command detector so dedicated tools win over
+        #           the shell and natural-language wrappers never reach it
+        #           ("Execute: pwd" becomes the command ``pwd``, never the
+        #           literal text "Execute: pwd").
+        routed = route_request(user_input)
+        if routed is not None:
+            routed_msg = handle_routed_intent(routed)
+            if routed_msg is not None:
+                return routed_msg
 
         # Step 5: generic shell command ("run X" / "execute X")
         command = detect_command_intent(user_input)
