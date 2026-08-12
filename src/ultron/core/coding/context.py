@@ -13,19 +13,34 @@ it: it references the task goal, task type and current plan step id (copied
 at attach time), while the TaskState remains the runtime source of truth.
 This context object survives confirmation because it lives on the TaskState
 (the CLI hands the task back through continue_task_after_confirmation).
+
+FIX #6: the context also owns the workspace-scoped project memory store
+(root + lazy, serializable — same pattern as the intelligence bridge). The
+store is created on the FIRST ``attach_task`` for a workspace and rebuilt
+lazily after a ``model_dump_json`` round-trip, so it survives confirmations
+and (via the task snapshot store) process restarts without duplicating
+TaskState.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from ultron.core.coding.edits import ModificationTracker
 from ultron.core.coding.executor import CodingExecutor
 from ultron.core.coding.intelligence_bridge import CodeIntelligenceBridge
 from ultron.core.coding.observations import Observation, ObservationKind
-from ultron.core.coding.workspace import CodingWorkspace
+from ultron.core.coding.workspace import CodingWorkspace, _resolve_safe_path
+from ultron.core.memory.project_memory import ProjectMemoryStore
+
+# The Ultron repository root (src/ultron/core/coding/context.py -> parents:
+# [0]=coding, [1]=core, [2]=ultron, [3]=src, [4]=repo). Project memory is
+# never created inside Ultron's own repository — unit tests run from it and
+# must stay side-effect free, exactly like the intelligence bridge.
+_ULTRON_ROOT = Path(__file__).resolve().parents[4]
 
 
 class CodeContext(BaseModel):
@@ -42,6 +57,11 @@ class CodeContext(BaseModel):
     intelligence: CodeIntelligenceBridge = Field(
         default_factory=CodeIntelligenceBridge
     )
+
+    # FIX #6: workspace-scoped project memory. Only the root is serialized;
+    # the store itself is a lazy private handle rebuilt after round-trips.
+    project_memory_root: str | None = None
+    _project_memory: ProjectMemoryStore | None = PrivateAttr(default=None)
 
     # Task association (lightweight refs — TaskState stays the source of truth).
     task_goal: str | None = None
@@ -70,7 +90,51 @@ class CodeContext(BaseModel):
         self.task_type = getattr(task_type, "value", None)
         self.plan_step_id = self._current_step_id(task)
         self.ensure_intelligence()
+        if not self.project_memory_root:
+            self.project_memory_root = self._memory_root()
+        self.ensure_project_memory()
         return self
+
+    # ------------------------------------------------------------------
+    # Project memory (FIX #6)
+    # ------------------------------------------------------------------
+
+    def _memory_root(self) -> str | None:
+        """The workspace root for project memory, when safe.
+
+        Reuses the same gate as the intelligence bridge: the root must
+        resolve inside ``ALLOWED_BASE_DIR`` and must not be Ultron's own
+        repository. Returns None otherwise (silently — memory simply stays
+        disabled for that workspace).
+        """
+        if self.workspace is None:
+            return None
+        root = getattr(self.workspace, "project_root", None)
+        if not root:
+            return None
+        resolved = _resolve_safe_path(str(root))
+        if resolved is None:
+            return None
+        resolved = resolved.resolve()
+        if resolved == _ULTRON_ROOT or _ULTRON_ROOT in resolved.parents:
+            return None
+        return str(resolved)
+
+    def ensure_project_memory(self):
+        """
+        Builds (lazily) and returns the workspace-scoped project memory
+        store, recording the workspace's detected facts once on first build.
+
+        No-op when the workspace has no safe root. The store is idempotent,
+        so repeated calls (every reasoning turn) never churn the history.
+        """
+        if self._project_memory is None and self.project_memory_root:
+            from ultron.core.memory.formation import remember_workspace_facts
+
+            store = ProjectMemoryStore(self.project_memory_root)
+            remember_workspace_facts(store, self.workspace)
+            self._project_memory = store
+        return self._project_memory
 
     def ensure_intelligence(self) -> CodeIntelligenceBridge:
         """

@@ -444,6 +444,12 @@ async def handle_slash_command(
 
         return True, False
 
+    if clean_cmd in ("/resume", "/continue"):
+        # Fix #6: handled by the main turn loop, which loads the last
+        # persisted task for the workspace and continues it. Returning
+        # handled=False lets /resume flow through to the normal turn path.
+        return False, False
+
     console.print(f"[bold {YELLOW}]Unknown command:[/bold {YELLOW}] [{ACCENT}]{cmd}[/{ACCENT}]. Type [bold {ACCENT}]/help[/bold {ACCENT}] to see available commands.\n")
     return True, False
 
@@ -686,6 +692,7 @@ async def continue_task_after_confirmation(
     task: TaskState,
     result: str,
     history: list[ChatMessage],
+    session=None,
 ) -> ChatMessage:
     """
     Feeds a confirmed action's result back into the task as an observation and
@@ -694,10 +701,12 @@ async def continue_task_after_confirmation(
     The agent owns the transcript: on resume it records the observation,
     resumes the task state, and keeps reasoning toward the goal. The security
     boundary is not bypassed — every subsequent state-changing action still
-    flows through the same PendingAction confirmation path.
+    flows through the same PendingAction confirmation path. ``session`` (a
+    Fix #6 SessionMemory) is threaded through so session continuity survives
+    the confirmation round-trip.
     """
     task.last_observation = result
-    return await agent.run(task.goal, history, task=task)
+    return await agent.run(task.goal, history, task=task, session=session)
 
 async def async_chat(agent_type: str = "simple"):
     """
@@ -761,6 +770,16 @@ async def async_chat(agent_type: str = "simple"):
     history: list[ChatMessage] = [
         ChatMessage(role=Role.SYSTEM, content=_BASE_SYSTEM_PROMPT)
     ]
+
+    # Fix #6 session continuity: one bounded SessionMemory for this chat
+    # session — recent requests, decisions, the active workspace and task
+    # refs. It is threaded into every agent turn (and the /resume path) so a
+    # follow-up request can reuse project context instead of rediscovering
+    # the repository. It is never persisted raw; only distilled project
+    # facts reach disk via the workspace-scoped project-memory store.
+    from ultron.core.memory.session_memory import SessionMemory
+
+    memory_session = SessionMemory()
 
     # Record every renderable printed during the session and, on terminal
     # resize while the chat prompt is live, re-render the whole conversation
@@ -877,12 +896,43 @@ async def async_chat(agent_type: str = "simple"):
             ):
                 nonlocal prepared_task
                 if isinstance(_agent, ReActAgent):
+                    if _input in ("/resume", "/continue"):
+                        # Fix #6: restore the last persisted task for this
+                        # workspace (goal, plan, completed/remaining steps,
+                        # transcript) and continue it — never a fresh start.
+                        from pathlib import Path
+
+                        from ultron.core.coding.workspace import discover_workspace
+                        from ultron.core.memory.task_store import load_task
+
+                        # Tasks are saved under the workspace project root, so
+                        # resolve it the same way (cwd fallback for safety).
+                        try:
+                            resume_root = discover_workspace(
+                                str(Path.cwd())
+                            ).project_root
+                        except (OSError, ValueError):
+                            resume_root = str(Path.cwd())
+                        resumed = load_task(resume_root)
+                        if resumed is None:
+                            resumed = load_task(Path.cwd())
+                        if resumed is None:
+                            return None
+                        prepared_task = resumed
+                        return await _agent.run(
+                            resumed.goal,
+                            _history,
+                            task=resumed,
+                            session=memory_session,
+                        )
                     prepared_task = await prepare_task_for_execution(
                         _input, _agent.engine
                     )
                     if prepared_task is not None and prepared_task.clarification_required:
                         return None
-                    return await _agent.run(_input, _history, task=prepared_task)
+                    return await _agent.run(
+                        _input, _history, task=prepared_task, session=memory_session
+                    )
                 return await _agent.run(_input, _history)
 
             state.status = "Thinking..."
@@ -911,6 +961,12 @@ async def async_chat(agent_type: str = "simple"):
                 continue
 
             if response_msg is None:
+                if trimmed_input in ("/resume", "/continue"):
+                    UI.render_response(
+                        "No saved task was found in this workspace to resume."
+                    )
+                    history.append(ChatMessage(role=Role.USER, content=trimmed_input))
+                    continue
                 # The request lacked information needed for safe planning —
                 # surface the questions instead of executing blindly.
                 questions = " ".join(
@@ -1059,7 +1115,7 @@ async def async_chat(agent_type: str = "simple"):
                     # toward the goal until TaskState reports it complete.
                     UI.render_tool_execution(action.action_type, result)
                     response_msg = await continue_task_after_confirmation(
-                        agent, task, result, history
+                        agent, task, result, history, session=memory_session
                     )
                 else:
                     # No task (e.g. SimpleAgent path) — behave exactly as before:
@@ -1068,6 +1124,22 @@ async def async_chat(agent_type: str = "simple"):
                     break
 
             state.status = "Ready"
+
+            # Fix #6: persist the task snapshot so an interrupted session or a
+            # process restart can resume it (/resume). Only INCOMPLETE tasks
+            # are saved (a finished task has nothing to resume) and the store
+            # prunes old snapshots. Gated: never Ultron's own repository,
+            # never payloads carrying credential patterns.
+            if response_msg.task_state is not None:
+                from pathlib import Path
+
+                from ultron.core.memory.task_store import save_task
+
+                _task = response_msg.task_state
+                if not _task.is_complete():
+                    _ws = _task.code_context.workspace if _task.code_context else None
+                    _root = getattr(_ws, "project_root", None) if _ws is not None else None
+                    save_task(_task, _root or Path.cwd())
 
             import re
             tool_match = re.match(

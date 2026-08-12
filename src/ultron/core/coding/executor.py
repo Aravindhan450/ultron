@@ -78,12 +78,118 @@ class FailureAnalysis(BaseModel):
     summary: str = ""
     evidence: str = ""  # the most relevant line(s) of output
     repair_hint: str = ""
+    # Fix #5 failure localization — populated when the output identifies a
+    # file/line (traceback, compiler) and/or the failing test node.
+    file: str | None = None
+    line: int | None = None
+    test_name: str | None = None
+
+    def location_display(self) -> str:
+        """Compact location: 'file:line (test_name)' or '' when unknown."""
+        parts = []
+        if self.file:
+            parts.append(f"{self.file}:{self.line}" if self.line else self.file)
+        if self.test_name:
+            parts.append(self.test_name)
+        return " ".join(parts).strip()
 
     def to_prompt_line(self, max_len: int = 300) -> str:
         head = f"[{self.category.value}] {self.command or 'command'}"
+        loc = self.location_display()
+        if loc:
+            head = f"{head} @ {loc}"
         if self.summary:
             return f"{head}: {self.summary[: max_len - len(head) - 2]}"
         return head
+
+
+class FailureLocation(BaseModel):
+    """Deterministic file/line/test extraction from failure output (Fix #5)."""
+
+    file: str | None = None
+    line: int | None = None
+    test_name: str | None = None
+
+
+# Deterministic localization patterns — matched in priority order.
+_TRACEBACK_FRAME_RE = re.compile(r'File\s+"([^"]+)",\s*line\s+(\d+)')
+# Modern pytest frame: ``math_util.py:2: in add`` (the implementation frame).
+_PY_IN_FRAME_RE = re.compile(r"([\w./\\-]+\.py):(\d+):\s+in\s+[\w.]+")
+_PYTEST_FAILED_NODE_RE = re.compile(
+    r"FAILED\s+([\w./\\-]+\.py::[\w./\\\[\]]+)"
+)
+_PYTEST_SHORT_NODE_RE = re.compile(
+    r"([\w./\\-]+\.py::[\w./\\\[\]]+)"
+)
+_GO_TEST_FAIL_RE = re.compile(r"---\s+FAIL:\s*([\w./-]+)\s+\(([^)]+)\)")
+_GO_FILE_LINE_RE = re.compile(r"([\w./-]+\.go):(\d+):")
+_PY_FILE_LINE_RE = re.compile(r"([\w./\\-]+\.py):(\d+):")
+_JEST_FAIL_RE = re.compile(r"FAIL\s+([\w./-]+\.(?:test|spec)\.(?:ts|js|tsx|jsx))")
+
+
+def localize_failure(stdout: str = "", stderr: str = "") -> FailureLocation:
+    """
+    Extracts (file, line, test_name) from failure output deterministically.
+
+    Priority: traceback / implementation frame (``file:line``, the repair
+    target) -> pytest FAILED / short node (test name + test file) -> go FAIL
+    -> generic go/py ``file:line`` -> jest FAIL. Returns a
+    :class:`FailureLocation` (fields optional); never raises on malformed
+    input.
+    """
+    haystack = f"{stderr or ''}\n{stdout or ''}"
+    loc = FailureLocation()
+
+    frame = _TRACEBACK_FRAME_RE.search(haystack)
+    if frame:
+        loc.file = frame.group(1)
+        try:
+            loc.line = int(frame.group(2))
+        except ValueError:
+            loc.line = None
+    elif (py_frame := _PY_IN_FRAME_RE.search(haystack)):
+        loc.file = py_frame.group(1)
+        try:
+            loc.line = int(py_frame.group(2))
+        except ValueError:
+            loc.line = None
+
+    node = _PYTEST_FAILED_NODE_RE.search(haystack) or _PYTEST_SHORT_NODE_RE.search(
+        haystack
+    )
+    if node:
+        loc.test_name = node.group(1)
+        if loc.file is None:
+            loc.file = node.group(1).split("::", 1)[0]
+
+    go_fail = _GO_TEST_FAIL_RE.search(haystack)
+    if go_fail:
+        loc.test_name = loc.test_name or go_fail.group(1)
+
+    if loc.file is None:
+        go_line = _GO_FILE_LINE_RE.search(haystack)
+        if go_line:
+            loc.file = go_line.group(1)
+            try:
+                loc.line = int(go_line.group(2))
+            except ValueError:
+                loc.line = None
+
+    if loc.file is None:
+        py_line = _PY_FILE_LINE_RE.search(haystack)
+        if py_line:
+            loc.file = py_line.group(1)
+            try:
+                loc.line = int(py_line.group(2))
+            except ValueError:
+                loc.line = None
+
+    if loc.file is None:
+        jest = _JEST_FAIL_RE.search(haystack)
+        if jest:
+            loc.file = jest.group(1)
+
+    return loc
 
 
 _RE_CATEGORY: list[tuple[FailureCategory, list[str]]] = [
@@ -233,6 +339,7 @@ def classify_failure(
             repair_hint=_REPAIR_HINTS[FailureCategory.TIMEOUT],
         )
     haystack = f"{stderr or ''}\n{stdout or ''}".lower()
+    location = localize_failure(stdout=stdout, stderr=stderr)
     for category, patterns in _RE_CATEGORY:
         for pattern in patterns:
             match = re.search(pattern, haystack)
@@ -245,6 +352,9 @@ def classify_failure(
                     summary=f"matched '{line.strip()[:120]}'",
                     evidence=evidence,
                     repair_hint=_REPAIR_HINTS[category],
+                    file=location.file,
+                    line=location.line,
+                    test_name=location.test_name,
                 )
     return FailureAnalysis(
         category=FailureCategory.UNKNOWN,
@@ -252,6 +362,9 @@ def classify_failure(
         summary=f"exit code {exit_code or '?'} with no classified error pattern",
         evidence=_first_relevant_line(stdout, stderr),
         repair_hint=_REPAIR_HINTS[FailureCategory.UNKNOWN],
+        file=location.file,
+        line=location.line,
+        test_name=location.test_name,
     )
 
 

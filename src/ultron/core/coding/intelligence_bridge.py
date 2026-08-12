@@ -486,6 +486,50 @@ class CodeIntelligenceBridge(BaseModel):
                 break
         return "\n".join(lines) if len(lines) > 1 else ""
 
+    def symbol_facts(self, limit: int = 12) -> list[tuple[str, str]]:
+        """(symbol name, defining file) facts from recorded symbol queries.
+
+        Read-only deterministic export for FIX #6 memory formation: for each
+        recorded symbol-layer query that returned hits, the current
+        definition's file is looked up in the already-built index (never
+        forces a refresh here — the executor's queries keep it fresh).
+        Deduplicated, bounded, and only ever reports what the index
+        actually knows.
+        """
+        ci = self._build()
+        if ci is None:
+            return []
+        facts: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for query in self.queries:
+            name = query.query.strip()
+            if (
+                not name
+                or name in seen
+                or query.layer != "symbol"
+                or query.hits <= 0
+            ):
+                continue
+            seen.add(name)
+            definitions = ci.find_definition(name)
+            if definitions:
+                facts.append((name, definitions[0].location.file))
+                if len(facts) >= limit:
+                    break
+        return facts
+
+    def definition_files(self, name: str) -> list[str]:
+        """Current indexed definition files for *name* (may be empty).
+
+        Used by memory reconciliation: the code index is the authority, so a
+        stored ``symbol:X -> old/path.py`` fact is superseded when the
+        current definition moved.
+        """
+        ci = self._build()
+        if ci is None:
+            return []
+        return [symbol.location.file for symbol in ci.find_definition(name)]
+
     def usage_summary(self) -> str:
         """Compact observability summary for verification evidence."""
         if not self.queries:

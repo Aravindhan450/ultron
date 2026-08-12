@@ -57,6 +57,7 @@ from ultron.core.intelligence.prompt_assembly import (
     polish_response,
 )
 from ultron.core.logging import get_logger
+from ultron.core.memory.session_memory import SessionMemory
 from ultron.core.tools.registry import get_tool, get_tools_schema
 from ultron.core.types import (
     ChatMessage,
@@ -370,7 +371,9 @@ def _task_messages(
     return base
 
 
-def _build_task_context_block(task: TaskState | None) -> str:
+def _build_task_context_block(
+    task: TaskState | None, session: SessionMemory | None = None
+) -> str:
     """
     Explicit continuation context: goal, status, requirements, completed work.
     Injected into the system prompt so the model always knows the overall task
@@ -414,7 +417,84 @@ def _build_task_context_block(task: TaskState | None) -> str:
         if intelligence:
             lines.append("")
             lines.append(intelligence)
+    # Fix #6: bounded, prioritized RELEVANT MEMORY (project facts about this
+    # workspace, session continuity). The ContextManager applies the budget
+    # and excludes stale/superseded records; current task/plan/observation
+    # facts above always outrank memory.
+    memory_block = _build_memory_context_block(task, session)
+    if memory_block:
+        lines.append("")
+        lines.append(memory_block)
     return "\n".join(lines)
+
+
+def _memory_task_terms(task: TaskState) -> list[str]:
+    """Relevance keywords from the task goal + current step (deterministic)."""
+    texts = [str(getattr(task, "goal", "") or "")]
+    step = task.current_plan_step() if callable(getattr(task, "current_plan_step", None)) else None
+    if step is not None:
+        texts.append(str(getattr(step, "description", "") or ""))
+    terms: list[str] = []
+    for text in texts:
+        terms.extend(re.split(r"[^A-Za-z0-9_]+", text))
+    return [term for term in terms if len(term) >= 3][:16]
+
+
+def _build_memory_context_block(
+    task: TaskState | None, session: SessionMemory | None
+) -> str:
+    """
+    Fix #6: the bounded RELEVANT MEMORY section for the current task.
+
+    Project memory (workspace-scoped, valid records only) and session memory
+    are assembled by the ContextManager under its budget + priority rules.
+    Returns '' when neither store has anything relevant — memory never
+    floods the prompt.
+    """
+    if task is None or task.code_context is None:
+        return ""
+    from ultron.core.memory.context_manager import ContextManager
+
+    store = task.code_context.ensure_project_memory()
+    if store is None and (session is None or session.is_empty):
+        return ""
+    records = store.recall(limit=40) if store is not None else []
+    workspace = ""
+    if task.code_context.workspace is not None:
+        workspace = str(
+            getattr(task.code_context.workspace, "project_root", "") or ""
+        )
+    return ContextManager().memory_block(
+        project_records=records,
+        session=session,
+        workspace=workspace,
+        task_terms=_memory_task_terms(task),
+    )
+
+
+def _sync_task_memory(task: TaskState | None) -> None:
+    """
+    Fix #6: deterministic memory formation + reconciliation (idempotent).
+
+    Runs once per agent turn: recorded code-intelligence symbol lookups are
+    promoted to project memory, and stored symbol facts are reconciled
+    against the CURRENT code index (the repository wins over older memory).
+    Formation never writes trivial tool outputs and never bypasses the
+    store's secret guard.
+    """
+    if task is None or task.code_context is None:
+        return
+    if task.code_context.ensure_project_memory() is None:
+        return
+    from ultron.core.memory.formation import (
+        reconcile_project_memory,
+        remember_intelligence_facts,
+    )
+
+    store = task.code_context.ensure_project_memory()
+    bridge = task.code_context.intelligence
+    remember_intelligence_facts(store, bridge)
+    reconcile_project_memory(store, bridge)
 
 
 def _build_plan_context_block(task: TaskState) -> str:
@@ -705,6 +785,7 @@ class ReActAgent(BaseAgent):
         user_input: str,
         history: list[ChatMessage] | None = None,
         task: TaskState | None = None,
+        session: SessionMemory | None = None,
     ) -> ChatMessage:
         """
         Executes the ReAct loop for a single user turn (or a task continuation).
@@ -719,6 +800,11 @@ class ReActAgent(BaseAgent):
         so a successful ``mkdir`` is an observation, never task completion.
         A final-looking answer is only accepted once the task is explicitly
         complete (see ``_verify_task``); otherwise the agent keeps working.
+
+        Fix #6 session integration: ``session`` (optional) is a
+        :class:`SessionMemory` the agent records continuity into (recent
+        request, active workspace, task refs) and reads back from when
+        assembling the bounded memory context block.
         """
         system_prompt = build_system_prompt()
 
@@ -740,16 +826,22 @@ class ReActAgent(BaseAgent):
             # system prompt, then append the user input last (so the task
             # transcript slice below starts exactly at the user's goal).
             messages = list(history) if history else []
+            if session is not None:
+                session.note_request(user_input)
         else:
             # Continuation after a confirmed action: close the interrupted
             # turn with the observation, then resume from the task transcript.
             task = _resume_task(task)
             messages = _task_messages(task, history)
 
+        # Fix #6: deterministic memory formation + reconciliation against the
+        # current code index (idempotent, secret-guarded).
+        _sync_task_memory(task)
+
         # Explicit continuation context: goal, status, requirements, completed
         # work — so the model always knows the overall task is not finished
         # until TaskState says it is.
-        task_block = _build_task_context_block(task)
+        task_block = _build_task_context_block(task, session)
         if task_block:
             system_prompt += "\n\n" + task_block
 
@@ -776,6 +868,16 @@ class ReActAgent(BaseAgent):
         # RUNNING so the model always has a concrete "current step".
         if task is not None:
             _activate_plan_step(task)
+            # Fix #6 session continuity: bind the active workspace + task so a
+            # follow-up request can reuse project context instead of
+            # rediscovering the repository.
+            if session is not None:
+                workspace = task.code_context.workspace if task.code_context else None
+                root = getattr(workspace, "project_root", None) if workspace else None
+                if root:
+                    session.set_workspace(str(root))
+                if task.goal:
+                    session.note_task((task.goal or "")[:60])
 
         for _ in range(self.max_iterations):
             response = (await self.engine.generate(history_to_openai_format(messages))) or ""
@@ -797,6 +899,8 @@ class ReActAgent(BaseAgent):
                     if accepted:
                         return answer
                     continue
+                # Fix #6: capture this final turn's intelligence facts.
+                _sync_task_memory(task)
                 return ChatMessage(
                     role=Role.ASSISTANT,
                     content=polish_response(enforce_reply(user_input, response)),
@@ -905,6 +1009,8 @@ class ReActAgent(BaseAgent):
                 f"Exceeded the maximum of {self.max_iterations} reasoning steps "
                 "with work remaining"
             )
+            # Fix #6: capture the incomplete-turn intelligence facts.
+            _sync_task_memory(task)
             return ChatMessage(
                 role=Role.ASSISTANT,
                 content=(
@@ -993,6 +1099,8 @@ class ReActAgent(BaseAgent):
             return False, None
 
         task.mark_complete()
+        # Fix #6: capture this completing turn's intelligence facts.
+        _sync_task_memory(task)
         return True, ChatMessage(
             role=Role.ASSISTANT,
             content=polish_response(enforce_reply(user_input, proposed_answer)),
@@ -1096,6 +1204,8 @@ class ReActAgent(BaseAgent):
                 )
                 return False, None
             task.mark_complete()
+            # Fix #6: capture this completing turn's intelligence facts.
+            _sync_task_memory(task)
             return True, ChatMessage(
                 role=Role.ASSISTANT,
                 content=polish_response(enforce_reply(user_input, proposed_answer)),
@@ -1194,6 +1304,8 @@ class ReActAgent(BaseAgent):
             )
             return False, None
         task.mark_complete()
+        # Fix #6: capture this completing turn's intelligence facts.
+        _sync_task_memory(task)
         return True, ChatMessage(
             role=Role.ASSISTANT,
             content=polish_response(enforce_reply(user_input, proposed_answer)),
@@ -1262,6 +1374,8 @@ class ReActAgent(BaseAgent):
         if remaining:
             names = ", ".join(f"step {s.id} ({s.description})" for s in remaining)
             detail = f" Remaining plan steps: {names}."
+        # Fix #6: capture the failure turn's intelligence facts.
+        _sync_task_memory(task)
         return True, ChatMessage(
             role=Role.ASSISTANT,
             content=(
