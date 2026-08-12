@@ -35,6 +35,16 @@ class PendingAction(BaseModel):
         "fetch_page",
         "db_query",
         "execute_plan",
+        # Fix #3 coding-edit actions (state-changing, gated like write_file)
+        "create_file",
+        "replace_file",
+        "replace_in_file",
+        "append_to_file",
+        "delete_file",
+        "rename_file",
+        "discover_workspace_summary",
+        "list_directory",
+        "search_files",
     ]
     target: str          # The command string OR the filename/query/URL to act upon
     content: str | None = None  # Content to write if action_type is "write_file" or "overwrite_file"
@@ -476,6 +486,10 @@ class TaskState(BaseModel):
     clarification_required: bool = False  # planner could not proceed safely
     clarification_questions: list[str] = Field(default_factory=list)
     plan_revisions: list[str] = Field(default_factory=list)  # adaptive-plan audit trail
+    # --- Coding workspace / execution context (Fix #3 stage 1) ---
+    # Structured, coding-specific context (workspace, relevant files,
+    # observations, modifications) — separate from the raw transcript.
+    code_context: CodeContext | None = None
     started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -826,3 +840,12 @@ def history_to_openai_format(history: list[ChatMessage]) -> list[dict[str, Any]]
     Map history list of ChatMessage instances to OpenAI compatible dictionary list.
     """
     return [msg.to_openai_format() for msg in history]
+
+
+# Late import: TaskState.code_context references the coding CodeContext, which
+# lives in the coding package. Importing it here (after all model classes are
+# defined) and rebuilding the model resolves the forward reference without a
+# circular import (coding modules never import ultron.core.types at runtime).
+from ultron.core.coding.context import CodeContext
+
+TaskState.model_rebuild()

@@ -255,7 +255,7 @@ def test_response_border_is_brand_orange_truecolor(monkeypatch):
     from ultron.ui import theme
 
     buf = io.StringIO()
-    fake = Console(file=buf, width=100, force_terminal=True)
+    fake = Console(file=buf, width=100, force_terminal=True, color_system="truecolor")
     monkeypatch.setattr(theme, "console", fake)
     theme.UI.render_response("Hello.")
     out = buf.getvalue()
@@ -298,7 +298,7 @@ def test_banner_logo_uses_flame_palette_gradient(monkeypatch):
     from ultron.ui import theme
 
     buf = io.StringIO()
-    fake = Console(file=buf, width=130, force_terminal=True)
+    fake = Console(file=buf, width=130, force_terminal=True, color_system="truecolor")
     monkeypatch.setattr(theme, "console", fake)
     theme.UI.render_banner(model="llama3.2", cwd_short="~/ultron")
 

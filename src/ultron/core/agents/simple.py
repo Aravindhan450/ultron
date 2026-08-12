@@ -54,6 +54,38 @@ def _generic_target_content(tool_name: str, arguments: dict) -> tuple[str, str |
     """
     if tool_name == "read_file":
         return str(arguments.get("file_path", "")), None
+    # Fix #3 coding tools: map arguments to (target, content) for the
+    # security boundary (path for target, written text for content).
+    if tool_name == "list_directory":
+        return str(arguments.get("path", ".")), None
+    if tool_name == "search_files":
+        return str(arguments.get("query", "")), None
+    if tool_name == "discover_workspace_summary":
+        return "", None
+    # Fix #4 code intelligence tools: map the workspace path for the
+    # boundary's path-confinement scan.
+    if tool_name in {
+        "code_search",
+        "find_symbol",
+        "find_definition",
+        "find_references",
+        "semantic_search",
+        "code_index_status",
+        "report_symbol",
+    }:
+        return str(arguments.get("path", ".")), str(arguments.get("query", arguments.get("name", "")))
+    if tool_name in {"get_imports", "get_dependents", "report_file"}:
+        # The actual target is the inspected FILE (relative to the root);
+        # gate that path so an escape via file_path is denied.
+        return str(arguments.get("file_path", "")), str(arguments.get("path", "."))
+    if tool_name in ("create_file", "replace_file", "append_to_file"):
+        return str(arguments.get("file_path", "")), str(arguments.get("content", ""))
+    if tool_name == "replace_in_file":
+        return str(arguments.get("file_path", "")), str(arguments.get("new", ""))
+    if tool_name == "delete_file":
+        return str(arguments.get("file_path", "")), None
+    if tool_name == "rename_file":
+        return str(arguments.get("file_path", "")), str(arguments.get("new_path", ""))
     if tool_name == "web_search":
         return str(arguments.get("query", "")), None
     if tool_name == "fetch_page_text":

@@ -228,7 +228,33 @@ class GuardrailsEngine:
                     block_reason = block_reason or bad_url.message
 
         # --- File targets -----------------------------------------------
-        if action_type in {"read_file", "write_file", "overwrite_file"}:
+        # Fix #3 coding file ops are path-gated exactly like read/write so a
+        # path escape is denied for list/search/edits/delete/rename too.
+        if action_type in {
+            "read_file",
+            "write_file",
+            "overwrite_file",
+            "list_directory",
+            "search_files",
+            "create_file",
+            "replace_file",
+            "replace_in_file",
+            "append_to_file",
+            "delete_file",
+            "rename_file",
+            # Fix #4 code intelligence tools — path-gated like the rest so a
+            # search/index request outside the workspace is denied.
+            "code_search",
+            "find_symbol",
+            "find_definition",
+            "find_references",
+            "get_imports",
+            "get_dependents",
+            "semantic_search",
+            "code_index_status",
+            "report_file",
+            "report_symbol",
+        }:
             bad_path = self.check_path(target)
             if bad_path:
                 findings.append(bad_path)

@@ -111,3 +111,4 @@ env/
 .ultron_resources.db
 .ultron_api_schema.db
 .ultron_connections.db
+.ultron_code_index_*.db

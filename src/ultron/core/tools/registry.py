@@ -1,6 +1,31 @@
 from collections.abc import Callable
 from typing import Any
 
+from ultron.core.coding.edits import (
+    append_to_file,
+    create_file,
+    delete_file,
+    rename_file,
+    replace_file,
+    replace_in_file,
+)
+from ultron.core.coding.intelligence.tools import (
+    code_index_status,
+    code_search,
+    find_definition,
+    find_references,
+    find_symbol,
+    get_dependents,
+    get_imports,
+    report_file,
+    report_symbol,
+    semantic_search,
+)
+from ultron.core.coding.workspace import (
+    discover_workspace_summary,
+    list_directory,
+    search_files,
+)
 from ultron.core.intelligence.debug_context import (
     check_dependency,
     diagnose_failure,
@@ -61,6 +86,27 @@ from ultron.core.tools.resource_monitor import check_resources, resource_forecas
 TOOLS: dict[str, Callable[..., Any]] = {
     "read_file": read_file,
     "write_file": write_file,
+    # --- Fix #3 coding workspace + execution context tools ---
+    "list_directory": list_directory,
+    "search_files": search_files,
+    "discover_workspace_summary": discover_workspace_summary,
+    # --- Fix #4 code intelligence (read-only) ---
+    "code_search": code_search,
+    "find_symbol": find_symbol,
+    "find_definition": find_definition,
+    "find_references": find_references,
+    "get_imports": get_imports,
+    "get_dependents": get_dependents,
+    "semantic_search": semantic_search,
+    "code_index_status": code_index_status,
+    "report_file": report_file,
+    "report_symbol": report_symbol,
+    "create_file": create_file,
+    "replace_file": replace_file,
+    "replace_in_file": replace_in_file,
+    "append_to_file": append_to_file,
+    "delete_file": delete_file,
+    "rename_file": rename_file,
     "run_command": run_command,
     "run_parallel": run_parallel,
     "make_http_request": make_http_request,

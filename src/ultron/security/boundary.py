@@ -115,6 +115,21 @@ class SecurityBoundary:
         # Read-only, low-risk operations.
         if action in {
             "read_file",
+            # Fix #3 coding workspace inspection (read-only)
+            "list_directory",
+            "search_files",
+            "discover_workspace_summary",
+            # Fix #4 code intelligence (read-only)
+            "code_search",
+            "find_symbol",
+            "find_definition",
+            "find_references",
+            "get_imports",
+            "get_dependents",
+            "semantic_search",
+            "code_index_status",
+            "report_file",
+            "report_symbol",
             "web_search",
             "retrieve",
             "check_connectivity",
@@ -168,7 +183,18 @@ class SecurityBoundary:
             return RiskTier.LOW
 
         # File writes: HIGH, escalated to CRITICAL when touching system paths.
-        if action in {"write_file", "overwrite_file"}:
+        # Fix #3 coding edits (create/replace/targeted edit/append/delete/
+        # rename) are state-changing and gated exactly like write_file.
+        if action in {
+            "write_file",
+            "overwrite_file",
+            "create_file",
+            "replace_file",
+            "replace_in_file",
+            "append_to_file",
+            "delete_file",
+            "rename_file",
+        }:
             if self._touches_system_path(target):
                 return RiskTier.CRITICAL
             return RiskTier.HIGH

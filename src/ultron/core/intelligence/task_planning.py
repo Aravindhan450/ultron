@@ -393,4 +393,24 @@ async def prepare_task_for_execution(
             detect_workspace_kind(cwd),
         )
     task.attach_plan(plan)
+    _attach_coding_context(task, cwd)
     return task
+
+
+def _attach_coding_context(task: TaskState, cwd: str | None) -> None:
+    """
+    Attaches a Fix #3 CodeContext (workspace awareness) to a prepared task.
+
+    Read-only workspace discovery — never executes tools, never modifies
+    files. The context lives on the TaskState, so it survives confirmations
+    and agent continuation.
+    """
+    from ultron.core.coding.context import CodeContext
+    from ultron.core.coding.workspace import discover_workspace
+
+    try:
+        workspace = discover_workspace(cwd)
+    except (OSError, ValueError):
+        workspace = None
+    task.code_context = CodeContext(workspace=workspace)
+    task.code_context.attach_task(task)

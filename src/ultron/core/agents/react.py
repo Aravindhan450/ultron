@@ -49,6 +49,9 @@ from ultron.core.agents.simple import (
     handle_http,
     handle_parallel,
 )
+from ultron.core.coding.context import CodeContext
+from ultron.core.coding.edits import EDIT_TOOL_ACTIONS, record_tool_result
+from ultron.core.coding.workspace import discover_workspace
 from ultron.core.intelligence.prompt_assembly import (
     build_response_guidance,
     polish_response,
@@ -238,12 +241,36 @@ def _resume_task(task: TaskState) -> TaskState:
         task.context.append(
             ChatMessage(role=Role.TOOL, name=action_type, content=observation)
         )
+        succeeded = _observation_succeeded(observation)
         task.record_tool_execution(
             tool_name=action_type,
             target=target,
-            success=_observation_succeeded(observation),
+            success=succeeded,
             detail=str(observation),
         )
+        if task.code_context is not None:
+            record_tool_result(
+                task.code_context.tracker,
+                action_type,
+                target,
+                str(observation),
+                step=task.current_step,
+                success=succeeded,
+            )
+            # Record confirmed actions into the executor too, so a failed
+            # confirmed command counts against the repair budget exactly like
+            # an inline one.
+            _confirmed_arguments = (
+                {"command": target} if action_type == "run_command" else {}
+            )
+            task.code_context.executor.record_observation(
+                action_type, _confirmed_arguments, str(observation), succeeded
+            )
+            # Fix #4: a successful edit invalidates the code index — the next
+            # intelligence query must refresh before the agent reasons from
+            # stale source information.
+            if succeeded and action_type in EDIT_TOOL_ACTIONS:
+                task.code_context.intelligence.mark_dirty()
         if task.plan is not None:
             step = next(
                 (
@@ -285,6 +312,13 @@ def _activate_task(
         task.context = list(messages[task_start:])
         task.requires_verification = True
         _seed_task_history(task, messages, task_start)
+    # Coding edits get workspace context so the task knows where it is and
+    # what changed — attached regardless of when the task was created (a task
+    # may already exist from an earlier non-coding confirmation), and it
+    # survives confirmation because it lives on the TaskState itself.
+    if task.code_context is None and action.action_type in EDIT_TOOL_ACTIONS:
+        task.code_context = CodeContext(workspace=discover_workspace())
+        task.code_context.attach_task(task)
     if task.plan is not None:
         step = task.current_plan_step()
         if step is not None and step.status is StepStatus.RUNNING:
@@ -366,6 +400,20 @@ def _build_task_context_block(task: TaskState | None) -> str:
     if plan_block:
         lines.append("")
         lines.append(plan_block)
+    # Fix #3: deterministic CodingExecutor guidance — how to accomplish the
+    # current step (exploration needed, validation commands, repair budget).
+    if task.code_context is not None:
+        guidance = task.code_context.executor.step_guidance(task)
+        if guidance:
+            lines.append("")
+            lines.append(guidance)
+        # Fix #4: code-intelligence guidance — tool-selection strategy for
+        # the step plus a bounded targeted-context block (definitions /
+        # references for candidate symbols), never a repository dump.
+        intelligence = task.code_context.executor.intelligence_guidance(task)
+        if intelligence:
+            lines.append("")
+            lines.append(intelligence)
     return "\n".join(lines)
 
 
@@ -439,6 +487,14 @@ def _work_summary(task: TaskState) -> str:
     return "(no tool executions recorded)"
 
 
+def _verification_evidence_block(task: TaskState) -> str:
+    """CodingExecutor evidence appended to verification prompts ('' when none)."""
+    if task.code_context is None:
+        return ""
+    evidence = task.code_context.executor.verification_evidence(task)
+    return f"\n\nCoding evidence:\n{evidence}" if evidence else ""
+
+
 def _build_verification_prompt(task: TaskState, proposed_answer: str) -> str:
     """
     Asks the model to propose the goal's completion criteria and mark which
@@ -457,6 +513,7 @@ def _build_verification_prompt(task: TaskState, proposed_answer: str) -> str:
         "Respond with ONLY a JSON array, e.g.:\n"
         '[{"description": "application files exist", "satisfied": true}, '
         '{"description": "application can run", "satisfied": false}]'
+        f"{_verification_evidence_block(task)}"
     )
 
 
@@ -536,6 +593,9 @@ def _build_plan_verification_prompt(task: TaskState, proposed_answer: str) -> st
             "  REMAINING work, or null. Never include completed steps.",
         ]
     )
+    evidence = _verification_evidence_block(task)
+    if evidence:
+        lines.append(evidence)
     return "\n".join(lines)
 
 
@@ -750,7 +810,13 @@ class ReActAgent(BaseAgent):
             if not isinstance(arguments, dict):
                 arguments = {}
 
-            outcome = self._route_tool(tool_name, arguments, user_input)
+            # CodingExecutor deterministic gate: a state-changing action that
+            # has already failed identically (or a NEW action once the repair
+            # budget is spent) is blocked BEFORE execution — the block is fed
+            # back as an observation so the model is forced to change approach.
+            outcome = self._coding_gate(task, tool_name, arguments)
+            if outcome is None:
+                outcome = self._route_tool(tool_name, arguments, user_input)
 
             # Confirmation-gated action — hand control back to the CLI with a
             # PendingAction payload AND the live task, so the original goal
@@ -789,6 +855,20 @@ class ReActAgent(BaseAgent):
                     success=succeeded,
                     detail=str(outcome),
                 )
+                if task.code_context is not None:
+                    record_tool_result(
+                        task.code_context.tracker,
+                        tool_name,
+                        target,
+                        str(outcome),
+                        success=succeeded,
+                    )
+                    task.code_context.executor.record_observation(
+                        tool_name, arguments, str(outcome), succeeded
+                    )
+                    # Fix #4: successful edits invalidate the code index.
+                    if succeeded and tool_name in EDIT_TOOL_ACTIONS:
+                        task.code_context.intelligence.mark_dirty()
                 if task.plan is not None and not succeeded:
                     step = task.current_plan_step()
                     if step is not None and step.status is StepStatus.RUNNING:
@@ -1270,6 +1350,20 @@ class ReActAgent(BaseAgent):
                 user_input=user_input,
             )
 
+        # Fix #3 coding file operations: gated exactly like write_file. The
+        # target is the file path and the content is what the boundary scans
+        # (the new text for edits/appends, the destination for rename), so
+        # path escapes and secret writes are denied for these too.
+        if tool_name in {
+            "create_file",
+            "replace_file",
+            "replace_in_file",
+            "append_to_file",
+            "delete_file",
+            "rename_file",
+        }:
+            return self._route_coding_file_op(tool_name, arguments)
+
         if tool_name == "make_http_request":
             # handle_http runs the same boundary gate: deny → blocked; GET is
             # auto-allowed; POST/PUT/DELETE are confirmed unless permissive.
@@ -1308,3 +1402,84 @@ class ReActAgent(BaseAgent):
         except Exception as exc:  # noqa: BLE001 — arbitrary tool surface
             logger.debug(f"Tool '{tool_name}' raised an exception: {exc}")
             return f"Error executing tool '{tool_name}': {exc}"
+
+    def _coding_gate(
+        self,
+        task: TaskState | None,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> str | None:
+        """
+        CodingExecutor deterministic safety gate, applied BEFORE routing.
+
+        Returns a blocking observation string when the action must NOT
+        execute, or None to proceed normally:
+
+        - a state-changing action that has already failed identically more
+          than the budget allows is blocked (no blind repetition);
+        - any NEW state-changing action is blocked once the repair budget is
+          exhausted (no endless repair attempts).
+
+        The returned message is fed back as an observation, so the model sees
+        it, learns the constraint, and must change its approach — the gate
+        never executes the tool and never bypasses the security boundary.
+        """
+        if task is None or task.code_context is None:
+            return None
+        executor = task.code_context.executor
+        message = executor.gate_action(tool_name, arguments)
+        if message is not None:
+            return message
+        return executor.gate_new_action_with_exhausted_budget(tool_name)
+
+    def _route_coding_file_op(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> str | ChatMessage:
+        """
+        Gates a Fix #3 coding file operation through the security boundary.
+
+        Maps the tool's arguments to the (target, content) pair the boundary
+        expects, then applies the same verdict policy as write_file:
+
+        - ``deny`` (path escape, secret content) → hard block, never offered
+        - ``allow`` (permissive mode) → execute directly
+        - ``confirm`` → PendingAction for the CLI to ask the user first
+        """
+        file_path = str(arguments.get("file_path", arguments.get("path", ""))).strip()
+        target = file_path
+        content: str | None = None
+
+        if tool_name == "replace_in_file":
+            # Scan the replacement text the same way write_file content is.
+            content = str(arguments.get("new", ""))
+        elif tool_name in ("append_to_file", "create_file", "replace_file"):
+            content = str(arguments.get("content", ""))
+        elif tool_name == "rename_file":
+            # Scan the destination path too (targets a file location).
+            content = str(arguments.get("new_path", ""))
+
+        if not target:
+            return f"Error: {tool_name} requires a non-empty file path."
+
+        verdict = check_action(tool_name, target, content)
+        if is_denied(verdict):
+            return blocked_message(verdict)
+        if is_allow(verdict):
+            return execute_tool(tool_name, **arguments)
+
+        # Encode the tool arguments in the pending action so the CLI can
+        # reconstruct the exact call after approval. replace_in_file needs
+        # both old and new text, so they travel as a JSON payload.
+        if tool_name == "replace_in_file":
+            payload = json.dumps(
+                {"old": str(arguments.get("old", "")), "new": str(arguments.get("new", ""))}
+            )
+        else:
+            payload = content or ""
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=f"File operation requested: {tool_name} on '{target}'",
+            pending_action=PendingAction(
+                action_type=tool_name, target=target, content=payload
+            ),
+        )

@@ -589,6 +589,50 @@ async def execute_pending_action(action: PendingAction) -> str:
             else "Error: Tool 'write_file' not found."
         )
 
+    # --- Fix #3 coding file operations (gated + confirmed like write_file) ---
+    elif action.action_type in ("create_file", "replace_file"):
+        tool = get_tool(action.action_type)
+        result = (
+            tool(action.target, action.content or "")
+            if tool
+            else f"Error: Tool '{action.action_type}' not found."
+        )
+
+    elif action.action_type == "replace_in_file":
+        import json as _json
+
+        payload = _json.loads(action.content or "{}")
+        tool = get_tool("replace_in_file")
+        result = (
+            tool(action.target, str(payload.get("old", "")), str(payload.get("new", "")))
+            if tool
+            else "Error: Tool 'replace_in_file' not found."
+        )
+
+    elif action.action_type == "append_to_file":
+        tool = get_tool("append_to_file")
+        result = (
+            tool(action.target, action.content or "")
+            if tool
+            else "Error: Tool 'append_to_file' not found."
+        )
+
+    elif action.action_type == "delete_file":
+        tool = get_tool("delete_file")
+        result = (
+            tool(action.target)
+            if tool
+            else "Error: Tool 'delete_file' not found."
+        )
+
+    elif action.action_type == "rename_file":
+        tool = get_tool("rename_file")
+        result = (
+            tool(action.target, action.content or "")
+            if tool
+            else "Error: Tool 'rename_file' not found."
+        )
+
     elif action.action_type == "web_search":
         search_func = get_tool("search_web")
         result = (
@@ -980,6 +1024,17 @@ async def async_chat(agent_type: str = "simple"):
                         # JSON into the chip line would wreck the layout.
                         target="",
                         preview=(action.content or "")[:500],
+                    )
+                elif action.action_type in ("create_file", "replace_file", "replace_in_file", "append_to_file", "delete_file", "rename_file"):
+                    # Fix #3 coding file operations — confirmed like write_file.
+                    preview = (action.content or "")[:120]
+                    if len(action.content or "") > 120:
+                        preview += "…"
+                    UI.render_action_card(
+                        title="File Operation Confirmation Required",
+                        action=action.action_type.replace("_", " "),
+                        target=action.target,
+                        preview=preview if action.action_type in ("create_file", "replace_file", "replace_in_file", "append_to_file") else "",
                     )
                 else:
                     UI.render_action_card(
