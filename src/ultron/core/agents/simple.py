@@ -423,17 +423,14 @@ def handle_routed_intent(intent) -> ChatMessage | None:
     }:
         # Code-intelligence tools search the workspace; pass the project root
         # explicitly so they are never anchored to an arbitrary process CWD.
-        # The capability -> tool mapping comes from the canonical definitions
-        # table (STEP 2A) — never a hardcoded routing map.
+        # The capability -> tool mapping goes through the ONE capability-
+        # selection path (STEP 2C): intent -> capability -> canonical registry
+        # -> preferred tool.  Never a hardcoded routing map.
+        from ultron.core.capabilities import select_capability
         from ultron.core.nlp.workspace import resolve_workspace
-        from ultron.core.tools.definitions import (
-            ToolCapability as _Capability,
-        )
-        from ultron.core.tools.definitions import (
-            preferred_tool_for as _preferred_tool,
-        )
         ws_root = resolve_workspace().project_root
-        tool = _preferred_tool(_Capability(cat.value))
+        selection = select_capability(cat)
+        tool = selection.preferred_tool
         if tool is None:
             return None  # capability with no registered tool — fall through
         kw = {"name": args.get("name", "")} if "name" in args else {"query": args.get("query", "")}

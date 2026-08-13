@@ -64,7 +64,6 @@ from ultron.core.tools.definitions import (
 from ultron.core.tools.definitions import (
     code_intel_tool_names,
     generic_code_tool_names,
-    preferred_tool_for,
     web_tool_names,
 )
 from ultron.core.tools.registry import get_tool, get_tools_schema
@@ -102,15 +101,14 @@ _CODE_INTEL_TOOLS = code_intel_tool_names()
 _TURN_CORRECTABLE_TOOLS = frozenset(generic_code_tool_names() | web_tool_names())
 
 # Specific symbol capabilities: these answer "where is X used/defined" with
-# VERIFIED index evidence — never a raw lexical dump.  DERIVED from the
-# canonical capability -> tool preference.
-_SPECIFIC_SYMBOL_TOOLS = frozenset(
-    t
-    for t in (
-        preferred_tool_for(_ToolCapability.DEFINITION_LOOKUP),
-        preferred_tool_for(_ToolCapability.REFERENCE_LOOKUP),
-    )
-    if t
+# VERIFIED index evidence — never a raw lexical dump.  A capability-level set
+# (not tool names): the tool is discovered from the canonical registry via
+# the selection result (STEP 2C).
+_SPECIFIC_SYMBOL_CAPABILITIES = frozenset(
+    {
+        _ToolCapability.DEFINITION_LOOKUP,
+        _ToolCapability.REFERENCE_LOOKUP,
+    }
 )
 
 
@@ -150,20 +148,26 @@ def route_llm_tool_call(
     action, and never a security downgrade (the corrected call still flows
     through the boundary).
     """
+    from ultron.core.capabilities import select_capability
     from ultron.core.nlp.intent import route_request
 
     # (1) Turn-level correction: the user's actual request classifies to a
     # specific symbol capability, but the model reached for a generic code
-    # tool. The runtime wins — execute the specific tool with the correctly
-    # extracted symbol.
+    # tool. The runtime wins — the capability selection (ONE path, STEP 2C)
+    # decides the capability, and the canonical registry supplies the tool,
+    # with the correctly extracted symbol.
     if user_input and user_input.strip():
         turn_intent = route_request(user_input.strip())
-        if (
-            turn_intent is not None
-            and turn_intent.tool in _SPECIFIC_SYMBOL_TOOLS
-            and tool_name in _TURN_CORRECTABLE_TOOLS
-        ):
-            return turn_intent.tool, dict(turn_intent.arguments or {})
+        if turn_intent is not None:
+            selection = select_capability(turn_intent.intent_type)
+            if (
+                selection.is_resolved()
+                and selection.primary in _SPECIFIC_SYMBOL_CAPABILITIES
+                and tool_name in _TURN_CORRECTABLE_TOOLS
+            ):
+                corrected_tool = selection.preferred_tool
+                if corrected_tool is not None:
+                    return corrected_tool, dict(turn_intent.arguments or {})
 
     query = str(arguments.get("query") or arguments.get("name") or "").strip()
     if not query:

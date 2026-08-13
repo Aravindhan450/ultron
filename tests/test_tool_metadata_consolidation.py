@@ -104,7 +104,7 @@ def test_old_duplicate_structures_are_removed():
 def test_react_redirect_sets_are_derived_from_canonical():
     from ultron.core.agents.react import (
         _CODE_INTEL_TOOLS,
-        _SPECIFIC_SYMBOL_TOOLS,
+        _SPECIFIC_SYMBOL_CAPABILITIES,
         _TURN_CORRECTABLE_TOOLS,
     )
 
@@ -112,7 +112,12 @@ def test_react_redirect_sets_are_derived_from_canonical():
     assert _TURN_CORRECTABLE_TOOLS == frozenset(
         generic_code_tool_names() | web_tool_names()
     )
-    specific = {
+    # STEP 2C: the redirect set is capability-level (not tool names); the
+    # corrected tools are discovered from the canonical registry at runtime.
+    assert _SPECIFIC_SYMBOL_CAPABILITIES == frozenset(
+        {ToolCapability.DEFINITION_LOOKUP, ToolCapability.REFERENCE_LOOKUP}
+    )
+    specific_tools = {
         t
         for t in (
             preferred_tool_for(ToolCapability.DEFINITION_LOOKUP),
@@ -120,7 +125,8 @@ def test_react_redirect_sets_are_derived_from_canonical():
         )
         if t
     }
-    assert _SPECIFIC_SYMBOL_TOOLS == specific
+    assert len(specific_tools) == 2  # both symbol capabilities are tool-backed
+    assert _CODE_INTEL_TOOLS >= specific_tools
     # The redirect universe stays read-only: code-intel tools are all
     # declared read-only in the canonical table.
     assert code_intel_tool_names() <= {n for n, d in TOOL_DEFINITIONS.items() if d.read_only}
