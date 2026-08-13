@@ -53,49 +53,34 @@ def _generic_target_content(tool_name: str, arguments: dict) -> tuple[str, str |
     """
     Maps a tool call's arguments to the (target, content) pair the security
     boundary expects for classification and guardrail scanning.
+
+    Argument roles come from the canonical tool definitions table
+    (``ultron.core.tools.definitions``) — the single source of truth — so a
+    tool's target/content arguments are never re-declared here.  Only
+    composite encodings (batches, triple concatenations, url-or-request)
+    and non-registered internal actions keep explicit policy branches.
     """
-    if tool_name == "read_file":
-        return str(arguments.get("file_path", "")), None
-    # Fix #3 coding tools: map arguments to (target, content) for the
-    # security boundary (path for target, written text for content).
-    if tool_name == "list_directory":
-        return str(arguments.get("path", ".")), None
-    if tool_name == "search_files":
-        return str(arguments.get("query", "")), None
-    if tool_name == "discover_workspace_summary":
-        return "", None
-    # Fix #4 code intelligence tools: map the workspace path for the
-    # boundary's path-confinement scan.
-    if tool_name in {
-        "code_search",
-        "find_symbol",
-        "find_definition",
-        "find_references",
-        "semantic_search",
-        "code_index_status",
-        "report_symbol",
-    }:
-        return str(arguments.get("path", ".")), str(arguments.get("query", arguments.get("name", "")))
-    if tool_name in {"get_imports", "get_dependents", "report_file"}:
-        # The actual target is the inspected FILE (relative to the root);
-        # gate that path so an escape via file_path is denied.
-        return str(arguments.get("file_path", "")), str(arguments.get("path", "."))
-    if tool_name in ("create_file", "replace_file", "append_to_file"):
-        return str(arguments.get("file_path", "")), str(arguments.get("content", ""))
-    if tool_name == "replace_in_file":
-        return str(arguments.get("file_path", "")), str(arguments.get("new", ""))
-    if tool_name == "delete_file":
-        return str(arguments.get("file_path", "")), None
-    if tool_name == "rename_file":
-        return str(arguments.get("file_path", "")), str(arguments.get("new_path", ""))
-    if tool_name == "web_search":
-        return str(arguments.get("query", "")), None
-    if tool_name == "fetch_page_text":
-        return str(arguments.get("url", "")), None
-    if tool_name == "search_memories":
-        return str(arguments.get("keyword", "")), None
-    if tool_name == "add_memory":
-        return "", str(arguments.get("fact", ""))
+    from ultron.core.tools.definitions import get_tool_definition
+
+    definition = get_tool_definition(tool_name)
+    if definition is not None and (definition.target_arg or definition.content_arg):
+        target = (
+            str(arguments.get(definition.target_arg, definition.target_default))
+            if definition.target_arg
+            else ""
+        )
+        content = (
+            str(arguments.get(definition.content_arg, ""))
+            if definition.content_arg
+            else None
+        )
+        return target, content
+
+    # Composite encodings + non-registered internal actions (policy).
+    if tool_name == "run_parallel":
+        # The batch is encoded newline-joined so the boundary can classify
+        # and scan each command in the batch individually.
+        return "\n".join(str(c) for c in arguments.get("commands", [])), None
     if tool_name == "add_triple":
         return "", " ".join(
             str(arguments.get(key, "")) for key in ("subject", "predicate", "object")
@@ -106,59 +91,12 @@ def _generic_target_content(tool_name: str, arguments: dict) -> tuple[str, str |
             "",
         )
         return target, None
-    if tool_name == "search_triples":
-        return str(arguments.get("keyword", "")), None
-    if tool_name == "query_chain":
-        return str(arguments.get("anchor", "")), None
-    if tool_name == "run_parallel":
-        # The batch is encoded newline-joined so the boundary can classify
-        # and scan each command in the batch individually.
-        return "\n".join(str(c) for c in arguments.get("commands", [])), None
     if tool_name == "retrieve":
         return str(arguments.get("url", "") or arguments.get("request", "")), None
-    if tool_name == "check_connectivity":
-        return str(arguments.get("url", "")), None
-    if tool_name == "learn_api_schema":
-        return str(arguments.get("base_url", "")), None
-    if tool_name == "get_api_knowledge":
-        return str(arguments.get("base_url", "")), None
-    if tool_name == "forget_api":
-        return str(arguments.get("base_url", "")), None
-    if tool_name == "api_usage_hint":
-        return str(arguments.get("url", "")), str(arguments.get("body"))
-    if tool_name == "resource_forecast":
-        return str(arguments.get("command", "")), None
-    if tool_name == "check_resources":
-        return "", None
-    if tool_name == "memory_connections":
-        return str(arguments.get("topic", "")), None
-    if tool_name == "related_facts":
-        return str(arguments.get("fact", "")), None
-    if tool_name == "discover_connections":
-        return "", None
     if tool_name == "explain_relation":
         return "", f"{arguments.get('a', '')} {arguments.get('b', '')}"
-    if tool_name in {"enforce_schema", "schema_validate"}:
-        return str(arguments.get("format", "")), str(arguments.get("text", ""))
-    if tool_name == "list_schemas":
-        return "", None
-    if tool_name in {"preflight_plan", "analyze_dependencies"}:
-        return "", str(arguments.get("steps_json", ""))
-    if tool_name == "list_plan_actions":
-        return "", None
-    if tool_name == "get_debug_context":
-        return "", None
-    if tool_name == "diagnose_failure":
-        return str(arguments.get("command", "")), str(arguments.get("text", ""))
-    if tool_name == "check_dependency":
-        return str(arguments.get("name", "")), None
-    if tool_name == "run_tool_batch":
-        # The batch payload is the content: the guardrails scan it for
-        # secrets/URLs while the per-call gating inside run_tool_batch
-        # classifies each member individually.
-        return "", str(arguments.get("calls_json", ""))
-    if tool_name == "synthesize_analysis":
-        return "", str(arguments.get("results_json", ""))
+    if tool_name == "query_chain":
+        return str(arguments.get("anchor", "")), None
     return "", None
 
 
@@ -480,19 +418,24 @@ def handle_routed_intent(intent) -> ChatMessage | None:
 
     if cat.value in {
         "definition_lookup", "reference_lookup", "symbol_search",
-        "code_search", "semantic_search",
+        "symbol_inspection", "code_search", "semantic_search",
+        "repository_investigation",
     }:
         # Code-intelligence tools search the workspace; pass the project root
         # explicitly so they are never anchored to an arbitrary process CWD.
+        # The capability -> tool mapping comes from the canonical definitions
+        # table (STEP 2A) — never a hardcoded routing map.
         from ultron.core.nlp.workspace import resolve_workspace
+        from ultron.core.tools.definitions import (
+            ToolCapability as _Capability,
+        )
+        from ultron.core.tools.definitions import (
+            preferred_tool_for as _preferred_tool,
+        )
         ws_root = resolve_workspace().project_root
-        tool = {
-            "definition_lookup": "find_definition",
-            "reference_lookup": "find_references",
-            "symbol_search": "find_symbol",
-            "code_search": "code_search",
-            "semantic_search": "semantic_search",
-        }[cat.value]
+        tool = _preferred_tool(_Capability(cat.value))
+        if tool is None:
+            return None  # capability with no registered tool — fall through
         kw = {"name": args.get("name", "")} if "name" in args else {"query": args.get("query", "")}
         msg = _gated_readonly(tool, path=ws_root, **kw)
         record_action(cat.value, tool, extracted_arguments=args,

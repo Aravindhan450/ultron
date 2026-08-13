@@ -16,16 +16,14 @@ Modules:
 - :mod:`intent` — ``IntentCategory`` + ``UserIntent`` + deterministic
   ``route_request()`` classifier
 - :mod:`project` — natural-language → project-specific command discovery
-- :mod:`capabilities` — tool capability metadata + schema-aware selection
 - :mod:`interpret` — deterministic result interpretation
 - :mod:`observe` — structured action records (observability)
+
+Tool capability metadata lives in :mod:`ultron.core.tools.definitions` —
+the single authoritative source of truth (STEP 2A); this package only
+*consumes* it through ``route_request``/``handle_routed_intent``.
 """
 
-from ultron.core.nlp.capabilities import (
-    TOOL_CAPABILITIES,
-    ToolCapability,
-    select_tool,
-)
 from ultron.core.nlp.intent import IntentCategory, UserIntent, route_request
 from ultron.core.nlp.interpret import interpret_command_result
 from ultron.core.nlp.normalize import (
@@ -47,11 +45,9 @@ from ultron.core.nlp.workspace import (
 )
 
 __all__ = [
-    "TOOL_CAPABILITIES",
     "ActionRecord",
     "IntentCategory",
     "ResolvedTestCommand",
-    "ToolCapability",
     "UserIntent",
     "WorkspaceContext",
     "detect_explicit_test_command",
@@ -66,5 +62,4 @@ __all__ = [
     "resolve_test_command",
     "resolve_workspace",
     "route_request",
-    "select_tool",
 ]

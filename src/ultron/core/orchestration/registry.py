@@ -42,6 +42,7 @@ from ultron.core.orchestration.permissions import (
     PermissionCheck,
     classify_tool,
 )
+from ultron.core.tools.definitions import TOOL_DEFINITIONS, ToolDomain
 from ultron.security import BoundaryResult, Decision, RiskTier, SecurityBoundary
 
 logger = get_logger("ultron.orchestration.registry")
@@ -306,33 +307,26 @@ class AgentRegistry:
 # ---------------------------------------------------------------------------
 
 # Shared read/search/code-intelligence whitelist used by the read-only roles.
+# DERIVED from the canonical definitions table (STEP 2A) — the read-only
+# filesystem + code-intelligence tools, minus ``code_investigation``
+# (deliberate policy: repository investigation stays with the LLM-driven
+# agents, not the read-only specialist roles).
 _READ_SEARCH_TOOLS = [
-    "read_file",
-    "list_directory",
-    "search_files",
-    "discover_workspace_summary",
-    "code_search",
-    "find_symbol",
-    "find_definition",
-    "find_references",
-    "get_imports",
-    "get_dependents",
-    "semantic_search",
-    "code_index_status",
-    "report_file",
-    "report_symbol",
+    name
+    for name, definition in TOOL_DEFINITIONS.items()
+    if definition.read_only
+    and definition.domain
+    in (ToolDomain.FILESYSTEM, ToolDomain.CODE_INTELLIGENCE)
+    and name != "code_investigation"
 ]
 
+# State-changing file tools the coder may use (policy), derived from the
+# canonical filesystem-write domain + the overwrite_file pending-action type.
 _WRITE_TOOLS = [
-    "write_file",
-    "overwrite_file",
-    "create_file",
-    "replace_file",
-    "replace_in_file",
-    "append_to_file",
-    "delete_file",
-    "rename_file",
-]
+    name
+    for name, definition in TOOL_DEFINITIONS.items()
+    if not definition.read_only and definition.domain is ToolDomain.FILESYSTEM
+] + ["overwrite_file"]
 
 
 def _baseline_specs() -> list[AgentSpec]:

@@ -50,27 +50,46 @@ _MAX_RESULT_CHARS = 240
 # get_tools_schema), detectors/planner emit action names. Every name is
 # canonicalized to the *action* name for gating + wave classification + labels,
 # and only resolved to the registry key at execution time.
-TOOL_TO_ACTION = {
-    "search_web": "web_search",
-}
-ACTION_TO_TOOL = {v: k for k, v in TOOL_TO_ACTION.items()}
+#
+# Aliases are owned by the canonical tool definitions table (STEP 2A); these
+# helpers derive from it lazily (parallel_tools is imported by definitions,
+# so a module-level import would be circular).
 
 
 def _canonical_action_name(name: str) -> str:
-    """Maps any spelling (action or registry tool name) to the boundary action name."""
-    return TOOL_TO_ACTION.get(name, name)
+    """Maps any spelling (action or registry tool name) to the boundary action name.
+
+    A tool with canonical aliases maps to its first alias (``search_web`` ->
+    ``web_search``); an already-alias spelling maps to the same alias; tools
+    without aliases are unchanged.
+    """
+    from ultron.core.tools.definitions import TOOL_DEFINITIONS
+
+    for definition in TOOL_DEFINITIONS.values():
+        if name == definition.name or name in definition.aliases:
+            if definition.aliases:
+                return definition.aliases[0]
+            return definition.name
+    return name
 
 
 def _registry_tool_name(action_name: str) -> str:
-    """Maps a canonical action name to the registry tool name (identity by default)."""
-    return ACTION_TO_TOOL.get(action_name, action_name)
+    """Maps any spelling to the registry tool name (identity by default)."""
+    from ultron.core.tools.definitions import canonical_action_name
+
+    return canonical_action_name(action_name)
 
 
-# Tools that read state but never write it. Only these may run concurrently:
-# a state-writing tool (add_memory, add_triple, forget_api, …) is auto-
-# allowed by the boundary (LOW) but must NOT run in parallel with other
-# writers — concurrent SQLite writers collide with "database is locked".
-# Such members still execute, but sequentially after the read wave.
+# POLICY (concurrency scheduling), not tool metadata: tools eligible for the
+# parallel read wave. Read-only status itself lives in the canonical tool
+# metadata (tools/definitions.py); this set is deliberately curated —
+# code-intelligence / filesystem-list tools stay sequential to keep
+# exploration ordering deterministic, and run_query is treated as a read for
+# batching even though canonical flags it write-capable. A state-writing tool
+# (add_memory, add_triple, forget_api, …) is auto-allowed by the boundary
+# (LOW) but must NOT run in parallel with other writers — concurrent SQLite
+# writers collide with "database is locked". Such members still execute, but
+# sequentially after the read wave.
 BATCH_READONLY_TOOLS = frozenset(
     {
         "read_file",

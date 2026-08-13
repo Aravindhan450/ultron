@@ -51,22 +51,47 @@ def code_search(
     file_pattern: str | None = None,
     case_sensitive: bool = False,
 ) -> str:
-    """Lexical/regex search respecting .gitignore and ignored directories."""
+    """Lexical/regex search respecting .gitignore and ignored directories.
+
+    Multi-word queries ("coding executor") that miss lexically are retried
+    against their normalized identifier spellings ("CodingExecutor"), so a
+    natural-language symbol phrase still finds the source.
+    """
     ci = _intelligence(path)
     if ci is None:
         return "Error: access denied, that directory is outside the allowed project folder."
     with ci:
-        return ci.search(
+        out = ci.search(
             query,
             max_results=max_results,
             regex=regex,
             file_pattern=file_pattern,
             case_sensitive=case_sensitive,
         )
+        if not regex and not case_sensitive and out.startswith("No matches"):
+            from ultron.core.coding.intelligence.resolve import normalize_symbol_phrase
+
+            for candidate in normalize_symbol_phrase(query):
+                if candidate == query or not candidate.strip():
+                    continue
+                normalized = ci.search(
+                    candidate,
+                    max_results=max_results,
+                    regex=False,
+                    file_pattern=file_pattern,
+                    case_sensitive=False,
+                )
+                if not normalized.startswith(("No matches", "Error:")):
+                    return f"Matches for '{candidate}' (normalized from '{query}'):\n{normalized}"
+        return out
 
 
 def find_symbol(name: str, path: str = ".") -> str:
-    """Every symbol (any kind) named *name* across the indexed workspace."""
+    """Every symbol (any kind) named *name* across the indexed workspace.
+
+    Resolution is case-tolerant and normalization-aware ("coding executor"
+    resolves to ``CodingExecutor``); the canonical identifier is reported.
+    """
     if not (name or "").strip():
         return "Error: find_symbol requires a non-empty 'name'."
     ci = _intelligence(path)
@@ -74,17 +99,22 @@ def find_symbol(name: str, path: str = ".") -> str:
         return "Error: access denied, that directory is outside the allowed project folder."
     with ci:
         ci.refresh()
-        symbols = ci.find_symbol(name.strip())
-        if not symbols:
-            return f"No symbol named '{name.strip()}' found in the index."
-        lines = [f"Symbols named '{name.strip()}':"]
-        for symbol in symbols[:20]:
-            lines.append(f"  - {symbol.to_prompt_line()}")
-        return "\n".join(lines)
+        from ultron.core.coding.intelligence.resolve import (
+            format_symbol_result,
+            resolve_symbol,
+        )
+
+        return format_symbol_result(resolve_symbol(ci, name.strip()))
 
 
 def find_definition(name: str, path: str = ".") -> str:
-    """The defining location(s) of *name* (class/function/... kinds)."""
+    """The defining location(s) of *name* (class/function/... kinds).
+
+    Evidence-grounded: an exact / case-insensitive / normalized index hit, or
+    a verified source definition line, is reported as a found definition;
+    otherwise the response says explicitly that no verified definition was
+    found (never a filename-convention guess).
+    """
     if not (name or "").strip():
         return "Error: find_definition requires a non-empty 'name'."
     ci = _intelligence(path)
@@ -92,17 +122,20 @@ def find_definition(name: str, path: str = ".") -> str:
         return "Error: access denied, that directory is outside the allowed project folder."
     with ci:
         ci.refresh()
-        definitions = ci.find_definition(name.strip())
-        if not definitions:
-            return f"No definition found for '{name.strip()}' in the index."
-        lines = [f"Definitions of '{name.strip()}':"]
-        for symbol in definitions[:10]:
-            lines.append(f"  - {symbol.to_prompt_line()}")
-        return "\n".join(lines)
+        from ultron.core.coding.intelligence.resolve import (
+            format_definition_result,
+            resolve_definition,
+        )
+
+        return format_definition_result(resolve_definition(ci, name.strip()))
 
 
 def find_references(name: str, path: str = ".") -> str:
-    """Usage sites of *name* outside its definition (bounded)."""
+    """Usage sites of *name* outside its definition (bounded).
+
+    Case-tolerant and normalization-aware: ``taskstate`` finds references to
+    ``TaskState`` rather than reporting zero results.
+    """
     if not (name or "").strip():
         return "Error: find_references requires a non-empty 'name'."
     ci = _intelligence(path)
@@ -110,16 +143,12 @@ def find_references(name: str, path: str = ".") -> str:
         return "Error: access denied, that directory is outside the allowed project folder."
     with ci:
         ci.refresh()
-        references = ci.find_references(name.strip())
-        if not references:
-            return f"No references found for '{name.strip()}'."
-        lines = [
-            f"References to '{name.strip()}' ({len(references)} found, showing up to 20):"
-        ]
-        for ref in references[:20]:
-            lines.append(f"  - {ref.to_prompt_line()}")
-        return "\n".join(lines)
+        from ultron.core.coding.intelligence.resolve import (
+            format_reference_result,
+            resolve_references,
+        )
 
+        return format_reference_result(resolve_references(ci, name.strip()))
 
 def get_imports(file_path: str, path: str = ".") -> str:
     """EXACT import edges of *file_path* (relative to *path*)."""
@@ -177,6 +206,31 @@ def semantic_search(query: str, path: str = ".", top_k: int = 5) -> str:
         return "\n".join(lines)
 
 
+def code_investigation(query: str, path: str = ".") -> str:
+    """Synthesized repository investigation (\"how does X work\" /
+    \"where is X implemented\").
+
+    Resolves a verified definition when one exists (exact -> case-insensitive
+    -> normalized -> lexical), then reports the primary implementation,
+    supporting components (imports/dependents), and relevant tests.  For
+    conceptual subjects (\"command execution\") it falls back to ranked
+    semantic evidence (src-first).  Never guesses a file path.
+    """
+    if not (query or "").strip():
+        return "Error: code_investigation requires a non-empty 'query'."
+    ci = _intelligence(path)
+    if ci is None:
+        return "Error: access denied, that directory is outside the allowed project folder."
+    with ci:
+        ci.refresh()
+        from ultron.core.coding.intelligence.resolve import (
+            format_investigation_result,
+            resolve_investigation,
+        )
+
+        return format_investigation_result(resolve_investigation(ci, query.strip()))
+
+
 def code_index_status(path: str = ".") -> str:
     """Index row counts for *path* (rescans only when the index is empty)."""
     ci = _intelligence(path)
@@ -204,7 +258,11 @@ def report_file(file_path: str, path: str = ".") -> str:
 
 
 def report_symbol(name: str, path: str = ".") -> str:
-    """Combined definition + references report for one symbol."""
+    """Combined definition + references report for one symbol.
+
+    Resolution-aware (case-tolerant + normalization), evidence-grounded:
+    never guesses a definition from a filename convention.
+    """
     if not (name or "").strip():
         return "Error: report_symbol requires a non-empty 'name'."
     ci = _intelligence(path)
@@ -212,4 +270,13 @@ def report_symbol(name: str, path: str = ".") -> str:
         return "Error: access denied, that directory is outside the allowed project folder."
     with ci:
         ci.refresh()
-        return ci.report_symbol(name.strip())
+        from ultron.core.coding.intelligence.resolve import (
+            format_definition_result,
+            format_reference_result,
+            resolve_definition,
+            resolve_references,
+        )
+
+        definition_block = format_definition_result(resolve_definition(ci, name.strip()))
+        reference_block = format_reference_result(resolve_references(ci, name.strip()))
+        return f"{definition_block}\n\n{reference_block}"

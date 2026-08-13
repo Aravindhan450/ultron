@@ -298,8 +298,9 @@ class CodeIntelligenceBridge(BaseModel):
 
         Supported operations mirror the registered tools:
         ``find_definition``, ``find_symbol``, ``find_references``,
-        ``semantic_search``, ``code_search``, ``get_imports``,
-        ``get_dependents``, ``report_symbol``, ``report_file``.
+        ``semantic_search``, ``code_search``, ``code_investigation``,
+        ``get_imports``, ``get_dependents``, ``report_symbol``,
+        ``report_file``.
         """
         ci = self._ensure_fresh()
         if ci is None:
@@ -352,6 +353,15 @@ class CodeIntelligenceBridge(BaseModel):
         elif operation == "report_symbol":
             out = ci.report_symbol(name)
             hits = _count_result_lines(out, "References")
+        elif operation == "code_investigation":
+            from ultron.core.coding.intelligence.resolve import (
+                format_investigation_result,
+                resolve_investigation,
+            )
+
+            out = format_investigation_result(resolve_investigation(ci, name))
+            layer = "investigation"
+            hits = _count_result_lines(out, "Primary implementation")
         elif operation == "report_file":
             out = ci.report_file(str(kwargs.get("file_path", "")).lstrip("./"))
             layer = "file"
@@ -367,35 +377,32 @@ class CodeIntelligenceBridge(BaseModel):
     def _format_definitions(self, ci: CodeIntelligence, name: str) -> str:
         if not name:
             return "Error: a symbol 'name' is required."
-        definitions = ci.find_definition(name)
-        if not definitions:
-            return f"No definition found for '{name}' in the index."
-        lines = [f"Definitions of '{name}':"]
-        for symbol in definitions[:10]:
-            lines.append(f"  - {symbol.to_prompt_line()}")
-        return "\n".join(lines)
+        from ultron.core.coding.intelligence.resolve import (
+            format_definition_result,
+            resolve_definition,
+        )
+
+        return format_definition_result(resolve_definition(ci, name))
 
     def _format_symbols(self, ci: CodeIntelligence, name: str) -> str:
         if not name:
             return "Error: a symbol 'name' is required."
-        symbols = ci.find_symbol(name)
-        if not symbols:
-            return f"No symbol named '{name}' found in the index."
-        lines = [f"Symbols named '{name}':"]
-        for symbol in symbols[:20]:
-            lines.append(f"  - {symbol.to_prompt_line()}")
-        return "\n".join(lines)
+        from ultron.core.coding.intelligence.resolve import (
+            format_symbol_result,
+            resolve_symbol,
+        )
+
+        return format_symbol_result(resolve_symbol(ci, name))
 
     def _format_references(self, ci: CodeIntelligence, name: str) -> str:
         if not name:
             return "Error: a symbol 'name' is required."
-        references = ci.find_references(name)
-        if not references:
-            return f"No references found for '{name}'."
-        lines = [f"References to '{name}' ({len(references)} found, showing up to 20):"]
-        for ref in references[:20]:
-            lines.append(f"  - {ref.to_prompt_line()}")
-        return "\n".join(lines)
+        from ultron.core.coding.intelligence.resolve import (
+            format_reference_result,
+            resolve_references,
+        )
+
+        return format_reference_result(resolve_references(ci, name))
 
     # ------------------------------------------------------------------
     # Tool selection ladder + targeted retrieval

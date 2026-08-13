@@ -39,45 +39,11 @@ class PermissionLevel(str, Enum):
     DENY = "deny"                  # hard block — never run, never ask
 
 
-# Friendly action labels for the confirmation cards (mirrors main.py's titles).
-_ACTION_LABELS = {
-    "run_command": "Execute terminal command",
-    "read_file": "Read file",
-    "write_file": "Create new file",
+# Friendly action labels for the confirmation cards.  Registered tools get
+# their labels from the canonical definitions table (single source of truth);
+# only the non-registered PendingAction type is mapped here as UI policy.
+_PENDING_ONLY_LABELS = {
     "overwrite_file": "Overwrite existing file",
-    "list_directory": "List directory",
-    "search_files": "Search files",
-    "discover_workspace_summary": "Inspect workspace",
-    "code_search": "Search code",
-    "find_symbol": "Find symbol",
-    "find_definition": "Find definition",
-    "find_references": "Find references",
-    "get_imports": "Get imports",
-    "get_dependents": "Get dependents",
-    "semantic_search": "Semantic code search",
-    "code_index_status": "Code index status",
-    "report_file": "Report file symbols",
-    "report_symbol": "Report symbol",
-    "create_file": "Create new file",
-    "replace_file": "Replace file",
-    "replace_in_file": "Edit file (targeted replace)",
-    "append_to_file": "Append to file",
-    "delete_file": "Delete file",
-    "rename_file": "Rename/move file",
-    "web_search": "Search the web",
-    "fetch_page": "Fetch web page",
-    "fetch_page_text": "Fetch web page",
-    "db_query": "Execute database query",
-    "make_http_request": "Make HTTP request",
-    "add_memory": "Save memory",
-    "get_all_memories": "Read memories",
-    "search_memories": "Search memories",
-}
-
-# PendingAction action types that differ from the boundary's vocabulary.
-_ACTION_ALIASES = {
-    "fetch_page": "fetch_page_text",
-    "db_query": "run_query",
 }
 
 
@@ -116,8 +82,19 @@ class PermissionRequest:
 
     @property
     def action_label(self) -> str:
-        """Friendly human label for the confirmation card."""
-        return _ACTION_LABELS.get(self.action_type, self.action_type)
+        """Friendly human label for the confirmation card.
+
+        Labels for registered tools (and their aliases) come from the
+        canonical definitions table; a tiny policy map covers the one
+        non-registered PendingAction type.
+        """
+        from ultron.core.tools.definitions import action_label_for
+
+        return (
+            action_label_for(self.action_type)
+            or _PENDING_ONLY_LABELS.get(self.action_type)
+            or self.action_type
+        )
 
     @property
     def prompt_title(self) -> str:
@@ -163,8 +140,14 @@ class PermissionClassifier:
         """
         Classifies a ``PendingAction`` from the agent layer (the object the
         CLI receives when an agent requests interactive confirmation).
+
+        Alias spellings (``fetch_page``, ``db_query``, ``web_search``) are
+        resolved to their registered tool through the canonical definitions
+        table — the single source of truth for action aliases.
         """
-        action = _ACTION_ALIASES.get(pending.action_type, pending.action_type)
+        from ultron.core.tools.definitions import canonical_action_name
+
+        action = canonical_action_name(pending.action_type)
         target = pending.target or ""
 
         # main.py encodes HTTP requests as ``run_command`` with an

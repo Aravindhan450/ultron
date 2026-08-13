@@ -209,7 +209,9 @@ def test_reference_lookup_variants():
         assert it.tool == "find_references", phrase
 
 
-def test_where_implemented_routes_to_code_search():
+def test_where_implemented_routes_to_investigation():
+    # "where X implemented/handled" is a repository investigation (definition
+    # + synthesis), NOT a raw lexical search dump.
     for phrase in (
         "Where is authentication implemented?",
         "Find where command execution is implemented",
@@ -217,8 +219,8 @@ def test_where_implemented_routes_to_code_search():
     ):
         it = route_request(phrase)
         assert it is not None, phrase
-        assert it.intent_type is IntentCategory.CODE_SEARCH, phrase
-        assert it.tool == "code_search", phrase
+        assert it.intent_type is IntentCategory.REPOSITORY_INVESTIGATION, phrase
+        assert it.tool == "code_investigation", phrase
 
 
 def test_lexical_search_routes_to_code_search():
@@ -231,7 +233,6 @@ def test_lexical_search_routes_to_code_search():
 def test_semantic_search_phrases():
     for phrase in (
         "Find the code responsible for user login",
-        "Find where authentication is implemented",
         "Search semantically for task planning",
     ):
         it = route_request(phrase)
@@ -249,6 +250,21 @@ def test_architecture_question_never_shell():
     ):
         it = route_request(phrase)
         assert it is None or it.tool != "run_command", phrase
+
+
+def test_repository_questions_route_to_investigation_not_web():
+    """'how does X work' / 'how is X implemented' are repository questions —
+    they must route to code investigation, never to web search."""
+    for phrase in (
+        "How does the Supervisor delegate work?",
+        "How does TaskState interact with the workflow engine?",
+        "How is command execution implemented?",
+        "How does CodingExecutor work?",
+    ):
+        it = route_request(phrase)
+        assert it is not None, phrase
+        assert it.intent_type is IntentCategory.REPOSITORY_INVESTIGATION, phrase
+        assert it.tool == "code_investigation", phrase
 
 
 # ---------------------------------------------------------------------------

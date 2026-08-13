@@ -121,14 +121,18 @@ class CodeIntelligence:
     # L3 — symbol intelligence
     # ------------------------------------------------------------------
 
-    def find_symbol(self, name: str) -> list[Symbol]:
-        return self.index.find_symbol(name)
+    def find_symbol(self, name: str, *, case_insensitive: bool = False) -> list[Symbol]:
+        return self.index.find_symbol(name, case_insensitive=case_insensitive)
 
-    def find_definition(self, name: str) -> list[Symbol]:
-        return self.index.find_definition(name)
+    def find_definition(
+        self, name: str, *, case_insensitive: bool = False
+    ) -> list[Symbol]:
+        return self.index.find_definition(name, case_insensitive=case_insensitive)
 
-    def find_references(self, name: str) -> list[SymbolReference]:
-        return self.index.find_references(name)
+    def find_references(
+        self, name: str, *, case_insensitive: bool = False
+    ) -> list[SymbolReference]:
+        return self.index.find_references(name, case_insensitive=case_insensitive)
 
     def get_imports(self, rel_path: str) -> list[ImportEdge]:
         return self.index.get_imports(rel_path)

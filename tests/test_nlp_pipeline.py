@@ -225,11 +225,11 @@ def test_usage_and_caller_intents():
     assert route_request("What calls authenticate()?").tool == "find_references"
 
 
-def test_where_implemented_routes_to_code_search():
+def test_where_implemented_routes_to_investigation():
     it = route_request("Where is authentication implemented?")
     assert it is not None
-    assert it.intent_type is IntentCategory.CODE_SEARCH
-    assert it.tool == "code_search"
+    assert it.intent_type is IntentCategory.REPOSITORY_INVESTIGATION
+    assert it.tool == "code_investigation"
 
 
 def test_semantic_intent():

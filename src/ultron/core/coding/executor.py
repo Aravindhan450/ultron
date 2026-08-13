@@ -541,22 +541,6 @@ class RepairBudget(BaseModel):
 # Exploration state
 # ---------------------------------------------------------------------------
 
-
-# Fix #4 code-intelligence tools — recorded as searches for observability.
-_INTELLIGENCE_TOOLS = frozenset(
-    {
-        "code_search",
-        "find_symbol",
-        "find_definition",
-        "find_references",
-        "get_imports",
-        "get_dependents",
-        "semantic_search",
-        "code_index_status",
-    }
-)
-
-
 class ExplorationState(BaseModel):
     """Tracks what the executor has inspected so far."""
 
@@ -576,7 +560,7 @@ class ExplorationState(BaseModel):
                 self.searches.append(query)
         elif tool_name == "list_directory":
             self.tree_listings += 1
-        elif tool_name in _INTELLIGENCE_TOOLS:
+        elif tool_name in _code_intel_tools():
             query = str(
                 arguments.get("query")
                 or arguments.get("name")
@@ -618,7 +602,10 @@ _EXPLORATION_KEYWORDS = (
     "look",
 )
 
-# Tools that change state — the only ones subject to identical-action gating.
+# POLICY (not metadata): the subset of state-changing tools subject to
+# identical-action gating. Deliberately smaller than the canonical non-read-only
+# set (e.g. add_memory/run_parallel are excluded because repeat execution is
+# benign). Read-only status itself lives in the canonical tool metadata.
 _STATE_CHANGING_TOOLS = frozenset(
     {
         "run_command",
@@ -632,9 +619,6 @@ _STATE_CHANGING_TOOLS = frozenset(
     }
 )
 
-_INSPECTION_TOOLS = frozenset(
-    {"read_file", "search_files", "list_directory"}
-) | _INTELLIGENCE_TOOLS
 
 
 def _step_needs_exploration(step: Any) -> bool:
@@ -744,7 +728,7 @@ class CodingExecutor(BaseModel):
     ) -> None:
         """Records a tool observation: exploration for inspection tools, and
         classified failures for state-changing tools."""
-        if tool_name in _INSPECTION_TOOLS and succeeded:
+        if tool_name in _inspection_tools() and succeeded:
             self.exploration.record(tool_name, arguments)
         if not succeeded and tool_name in _STATE_CHANGING_TOOLS:
             self.budget.record_failure(tool_name, arguments)
@@ -1024,3 +1008,27 @@ class CodingExecutor(BaseModel):
                 if usage and "no code-intelligence queries" not in usage:
                     lines.append("Code intelligence: " + usage)
         return "\n".join(lines) if lines else ""
+
+
+# ---------------------------------------------------------------------------
+# Canonical-metadata bridges (runtime-lazy to avoid an import cycle)
+# ---------------------------------------------------------------------------
+
+
+def _code_intel_tools() -> frozenset[str]:
+    """Code-intelligence tool names from the canonical metadata.
+
+    Imported lazily at call time because ``tools.definitions`` transitively
+    reaches this module (via ``intelligence -> types -> coding.context``), so
+    the import cannot run while this module is still being initialized.
+    """
+
+    from ultron.core.tools.definitions import code_intel_tool_names
+
+    return code_intel_tool_names()
+
+
+def _inspection_tools() -> frozenset[str]:
+    """Inspection tools (file/dir reads + code intelligence), canonical-derived."""
+
+    return frozenset({"read_file", "search_files", "list_directory"}) | _code_intel_tools()

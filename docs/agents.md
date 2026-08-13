@@ -385,6 +385,77 @@ on the LLM.  Security still evaluates the **final** normalized arguments, and
 `python -m pytest` / `.venv/bin/python -m pytest` are treated read-only like
 bare `pytest`.
 
+### Code-intelligence query resolution
+
+Repository questions go through a deterministic resolution layer
+(`coding/intelligence/resolve.py`) so that natural-language, mis-cased, and
+multi-word symbol queries resolve to verified evidence instead of
+speculation:
+
+- **Symbol normalization** — `normalize_symbol_phrase()` generates candidate
+  spellings from one input: `taskstate`, `task state`, `Task State`,
+  `task-state`, `task_state` → candidates include `taskstate`, `Taskstate`,
+  `task_state`, `task-state`, `TaskState`, … so users never need to know
+  Python identifier casing.
+- **Resolution cascade** — every lookup walks the hierarchy
+  `exact indexed symbol → case-insensitive symbol → identifier normalization
+  → lexical source search → references (INFERRED) → semantic (INFERRED)`.
+  Exact symbol questions never jump straight to semantic search.
+- **Case-insensitive index** — `index.find_definition()` /
+  `find_symbol()` / `find_references()` accept a `case_insensitive=True`
+  kwarg (SQL `LOWER()` match) wired through the `CodeIntelligence` facade.
+- **Evidence-grounded answers** — results carry an explicit `status` of
+  `VERIFIED` (indexed definition / verified reference) or `INFERRED` (lexical
+  or semantic match).  Only verified locations are presented as definitive;
+  lexical/semantic hits are labeled as such.  The agent never reports
+  `"src/foo/supervisor.py is likely the definition"` from a filename
+  convention.
+- **Multi-word symbols** — `coding executor` / `CodingExecutor` /
+  `codingexecutor` / `coding_executor` all resolve to `CodingExecutor`;
+  intent classifiers are article-tolerant (`find where **the** supervisor is
+  defined`) and distinguish definition vs. reference vs. semantic vs. lexical
+  operations (`where is X defined` ≠ `where is X used` ≠ `who calls X`).
+- **`SYMBOL_INSPECTION`** — "what does X do" routes to `report_symbol()`,
+  which reads the verified definition source rather than answering from
+  model memory.
+
+Unknown symbols return an explicit no-verified-definition message — never a
+speculative file path.
+
+### Repository-question routing + code-search synthesis
+
+- **Reference extraction is symbol-only** — "Where is TaskState used?",
+  "find references to taskstate", "who uses X", "what references X",
+  "where is X referenced/called" all extract ONLY the symbol (`TaskState`),
+  never the grammatical wrapper (`is TaskState`).  The `is/are` after
+  `where` is a required group, so the symbol phrase cannot swallow it.
+- **Repository questions never web-search** — "how does X work/delegate/
+  execute/interact", "how is X implemented", "explain how X works", and
+  "why does X reject/fail" route to `code_investigation` (a new registered
+  tool, read-only LOW) before the LLM fallback can misclassify them as
+  `web_search`.  Explicit external queries ("search the web for X", "what
+  is the latest Python release") are untouched.
+- **Synthesis instead of dumps** — "where is X implemented/handled" and
+  "how does X work" produce a ranked investigation: a verified definition
+  is the primary implementation, with supporting components (imports /
+  dependents of the defining file) and relevant tests; conceptual subjects
+  ("command execution") fall back to lexical + semantic evidence ranked
+  `src/` > `tests/` > `docs/` > scripts.  A nonexistent component returns
+  "No repository evidence found" — never a filename-convention guess.
+- **The same gate applies to the ReAct loop** — `route_llm_tool_call()`
+  (`agents/react.py`) corrects misrouted LLM tool calls before execution:
+  `search_web` on a repository question → `code_investigation`;
+  question-shaped arguments on generic code tools → the specific
+  capability (`find_definition`/`find_references`) with the extracted
+  symbol; and — on the first tool call of a turn only — the *turn's*
+  original request decides when the model stripped the argument to a bare
+  symbol (`code_search(query='taskstate')` on "where is taskstate used?"
+  → `find_references`).  Redirects are restricted to read-only code-intel
+  tools and still flow through the security boundary.  `CodeIntelligenceBridge`
+  delegates to the same `resolve.py` path as the registered tools, so both
+  agents produce identical evidence-grounded answers.  `search_web` now
+  gates identically to `web_search` (LOW/allow).
+
 ## Adding a New Agent
 
 1. Create a class that inherits from `BaseAgent` (see `ReActAgent` for a

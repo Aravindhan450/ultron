@@ -51,7 +51,9 @@ class IntentCategory(str, Enum):
     SYMBOL_SEARCH = "symbol_search"
     DEFINITION_LOOKUP = "definition_lookup"
     REFERENCE_LOOKUP = "reference_lookup"
+    SYMBOL_INSPECTION = "symbol_inspection"
     SEMANTIC_SEARCH = "semantic_search"
+    REPOSITORY_INVESTIGATION = "repository_investigation"
     TERMINAL_EXECUTION = "terminal_execution"
     TEST_EXECUTION = "test_execution"
     APPLICATION_START = "application_start"
@@ -270,15 +272,32 @@ def detect_file_search(text: str) -> UserIntent | None:
     )
 
 
+# A symbol phrase: one or more identifier-ish words, tolerant of the
+# optional article ("the supervisor") and multi-word names ("coding
+# executor", "task state", "orchestration validator").  Parentheses are
+# allowed for call-like references ("authenticate()"); the first class
+# includes them so a trailing "()" stays part of the symbol.
+_SYMBOL_PHRASE = r"[\w.()]+(?:\s+[\w.()]+)*?"
+# Optional leading article consumed BEFORE the symbol capture.
+_ARTICLE = r"(?:the\s+|a\s+|an\s+)?"
+
+
 def detect_definition_lookup(text: str) -> UserIntent | None:
-    """\"where is TaskState defined\" / \"find where TaskState is defined\" /
-    \"definition of authenticate\"."""
+    """\"where is TaskState defined\" / \"find where the supervisor is
+    defined\" / \"where is coding executor declared\" / \"definition of
+    authenticate\".
+
+    Article-tolerant and multi-word so these never fall through to the LLM
+    (which previously guessed file paths from naming conventions).
+    """
     m = re.search(
-        r"\bwhere\s+(?:is|are)\s+([\w.]+)\s+(?:defined|declared)\b"
-        r"|\b(?:find|show)\s+where\s+([\w.]+)\s+(?:is\s+|are\s+)?"
-        r"(?:defined|declared)\b"
-        r"|\bwhere\s+([\w.]+)\s+(?:is|are)\s+(?:defined|declared)\b"
-        r"|\b(?:the\s+)?definition\s+of\s+([\w.]+)\b",
+        r"\bwhere\s+(?:is|are)\s+(?:the\s+|a\s+|an\s+)?(" + _SYMBOL_PHRASE + r")\s+"
+        r"(?:is\s+|are\s+)?(?:defined|declared)\b"
+        r"|\b(?:find|show)\s+where\s+(?:the\s+|a\s+|an\s+)?(" + _SYMBOL_PHRASE + r")\s+"
+        r"(?:is\s+|are\s+)?(?:defined|declared)\b"
+        r"|\bwhere\s+(?:the\s+|a\s+|an\s+)?(" + _SYMBOL_PHRASE + r")\s+"
+        r"(?:is|are)\s+(?:defined|declared)\b"
+        r"|\b(?:the\s+)?definition\s+of\s+(" + _SYMBOL_PHRASE + r")\b",
         text,
         re.IGNORECASE,
     )
@@ -298,14 +317,21 @@ def detect_definition_lookup(text: str) -> UserIntent | None:
 
 def detect_reference_lookup(text: str) -> UserIntent | None:
     """\"references to TaskState\" / \"usages of X\" / \"what calls X\" /
-    \"find where X is used\"."""
+    \"who uses X\" / \"where is X used\" / \"find where X is used\" /
+    \"where is X referenced/called\".
+
+    The extracted entity is ONLY the symbol — the grammatical wrapper
+    (\"where **is** X used\") never leaks into the capture.  The \"is/are\"
+    after \"where\" is a required/greedy group so the symbol phrase cannot
+    swallow it (the historical \"is TaskState\" bug).
+    """
     m = re.search(
-        r"\b(?:find\s+)?references?\s+to\s+([\w.()]+)\b"
-        r"|\b(?:all\s+)?usages?\s+of\s+([\w.()]+)\b"
-        r"|\bwhere\s+(?:is\s+)?([\w.()]+)\s+(?:is\s+)?used\b"
-        r"|\bfind\s+where\s+([\w.()]+)\s+(?:is\s+)?used\b"
-        r"|\b(?:what|who)\s+calls\s+([\w.()]+)\b"
-        r"|\bcallers?\s+of\s+([\w.()]+)\b",
+        r"\b(?:find\s+)?(?:all\s+)?references?\s+to\s+" + _ARTICLE + "(" + _SYMBOL_PHRASE + r")\b"
+        r"|\b(?:find\s+)?(?:all\s+)?usages?\s+of\s+" + _ARTICLE + "(" + _SYMBOL_PHRASE + r")\b"
+        r"|\bwhere\s+(?:is|are)\s+" + _ARTICLE + "(" + _SYMBOL_PHRASE + r")\s+(?:is|are)?\s*(?:used|referenced|called)\b"
+        r"|\bfind\s+where\s+" + _ARTICLE + "(" + _SYMBOL_PHRASE + r")\s+(?:is|are)?\s*(?:used|referenced|called)\b"
+        r"|\b(?:what|who)\s+(?:calls|uses|references?)\s+" + _ARTICLE + "(" + _SYMBOL_PHRASE + r")\b"
+        r"|\bcallers?\s+of\s+" + _ARTICLE + "(" + _SYMBOL_PHRASE + r")\b",
         text,
         re.IGNORECASE,
     )
@@ -319,6 +345,26 @@ def detect_reference_lookup(text: str) -> UserIntent | None:
         objective=f"Find references to '{name}'",
         entities={"name": name},
         tool="find_references",
+        arguments={"name": name},
+    )
+
+
+def detect_symbol_inspection(text: str) -> UserIntent | None:
+    """\"what does CodingExecutor do?\" — locate the symbol (definition +
+    references) rather than answering from model memory."""
+    m = re.search(
+        r"\bwhat\s+does\s+" + _ARTICLE + "(" + _SYMBOL_PHRASE + r")\s+do\??\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    name = m.group(1).strip()
+    return UserIntent(
+        intent_type=IntentCategory.SYMBOL_INSPECTION,
+        objective=f"Inspect symbol '{name}'",
+        entities={"name": name},
+        tool="report_symbol",
         arguments={"name": name},
     )
 
@@ -343,9 +389,13 @@ def detect_symbol_lookup(text: str) -> UserIntent | None:
 
 
 def detect_code_search(text: str) -> UserIntent | None:
-    """\"search the code for X\" / \"search the codebase for X\" /
-    \"where is authentication implemented\" / \"find where command execution
-    is implemented\"."""
+    """\"search the code for X\" / \"search the codebase for X\" — raw
+    lexical search.
+
+    \"where X is implemented/handled\" is NOT raw search: it is a
+    repository investigation (definition + synthesis) and is routed by
+    :func:`detect_repository_investigation`'s sibling branch below.
+    """
     m = re.search(
         r"\b(?:search|grep)\s+(?:the\s+)?(?:code|codebase|repository)\s+"
         r"(?:for\s+)?(.+?)\s*[.!?]?\s*$",
@@ -363,23 +413,27 @@ def detect_code_search(text: str) -> UserIntent | None:
                 arguments={"query": query},
             )
 
-    # "where (is) X implemented" / "find where X is implemented" — semantic-
-    # looking lookup, mapped to a lexical code search for the subject (which
-    # may be multi-word: "command execution") so it never reaches the shell.
+    # "where (is) X implemented" / "find where X is implemented" /
+    # "where is X handled" — semantic-looking lookup with a multi-word
+    # subject ("command execution"), routed to the investigation tool so
+    # the answer synthesizes a primary implementation instead of dumping
+    # raw lexical matches.  Leading articles are stripped ("where is the
+    # OrchestrationValidator implemented" -> "OrchestrationValidator").
     where = re.search(
         r"\b(?:find\s+|show\s+me\s+)?where\s+(?:is\s+|are\s+)?"
-        r"(.+?)\s+(?:is\s+|are\s+)?(?:implemented|handled)\b",
+        r"(?:the\s+|a\s+|an\s+)?(.+?)\s+(?:is\s+|are\s+)?(?:implemented|handled)\b",
         text,
         re.IGNORECASE,
     )
     if where:
         subject = where.group(1).strip()
+        subject = re.sub(r"^(?:the|a|an)\s+", "", subject, flags=re.IGNORECASE)
         if subject:
             return UserIntent(
-                intent_type=IntentCategory.CODE_SEARCH,
+                intent_type=IntentCategory.REPOSITORY_INVESTIGATION,
                 objective=f"Find where '{subject}' is implemented",
                 entities={"query": subject},
-                tool="code_search",
+                tool="code_investigation",
                 arguments={"query": subject},
             )
     return None
@@ -387,12 +441,14 @@ def detect_code_search(text: str) -> UserIntent | None:
 
 def detect_semantic_search(text: str) -> UserIntent | None:
     """\"search semantically for X\" / \"find code responsible for X\" /
-    \"find code that does X\"."""
+    \"find code that does X\" / \"where does the supervisor delegate\"."""
     m = re.search(
         r"\bsemantic(?:ally)?\s+(?:search|find)\s+(?:for\s+)?(.+?)\s*[.!?]?\s*$"
         r"|\b(?:search|find)\s+semantic(?:ally)?\s+(?:for\s+)?(.+?)\s*[.!?]?\s*$"
         r"|\bfind\s+(?:the\s+)?code\s+(?:that\s+)?(?:is\s+)?(?:responsible\s+for\s+)?"
-        r"(.+?)\s*[.!?]?\s*$",
+        r"(.+?)\s*[.!?]?\s*$"
+        r"|\bwhere\s+does\s+(?:the\s+)?(.+?)\s+"
+        r"(?:work|delegate|happen|live|execute)\b\s*[.!?]?\s*$",
         text,
         re.IGNORECASE,
     )
@@ -402,12 +458,51 @@ def detect_semantic_search(text: str) -> UserIntent | None:
     if not query:
         return None
     query = query.strip()
+    query = re.sub(r"^(?:the|a|an)\s+", "", query, flags=re.IGNORECASE)
     return UserIntent(
         intent_type=IntentCategory.SEMANTIC_SEARCH,
         objective=f"Semantic search for '{query}'",
         entities={"query": query},
         tool="semantic_search",
         arguments={"query": query},
+    )
+
+
+def detect_repository_investigation(text: str) -> UserIntent | None:
+    """\"how does X work\" / \"how does the Supervisor delegate\" /
+    \"how is command execution implemented\" / \"explain how X works\" /
+    \"how does X interact with Y\" / \"why does the workflow validator reject\".
+
+    These are repository/code-understanding questions: they must route to
+    code intelligence (definition + relationships + synthesis) — never to
+    web search.  The subject is passed to ``code_investigation`` which
+    resolves a verified definition when one exists and otherwise falls back
+    to ranked semantic evidence.
+    """
+    m = re.search(
+        r"\bhow\s+does\s+(?:the\s+)?(.+?)\s+(?:work|delegate|execute|operate|behave)\b"
+        r"|\bhow\s+does\s+(?:the\s+)?(.+?)\s+interact\s+with\s+[^?]+\??\s*$"
+        r"|\bhow\s+(?:is|are)\s+(?:the\s+)?(.+?)\s+(?:implemented|structured)\b"
+        r"|\bexplain\s+how\s+(?:the\s+)?(.+?)\s+(?:works|is\s+implemented|is\s+structured)\b"
+        r"|\bwhy\s+does\s+(?:the\s+)?(.+?)\s+(?:reject|fail|error)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    subject = next((g for g in m.groups() if g), None)
+    if not subject:
+        return None
+    subject = subject.strip()
+    subject = re.sub(r"^(?:the|a|an)\s+", "", subject, flags=re.IGNORECASE)
+    if not subject:
+        return None
+    return UserIntent(
+        intent_type=IntentCategory.REPOSITORY_INVESTIGATION,
+        objective=f"Investigate how '{subject}' works in this repository",
+        entities={"query": subject},
+        tool="code_investigation",
+        arguments={"query": subject},
     )
 
 
@@ -516,8 +611,10 @@ def route_request(text: str, cwd: str | None = None) -> UserIntent | None:
         detect_definition_lookup,
         detect_reference_lookup,
         detect_symbol_lookup,
+        detect_symbol_inspection,
         detect_code_search,
         detect_semantic_search,
+        detect_repository_investigation,
     )
     for detector in detectors:
         intent = detector(raw)

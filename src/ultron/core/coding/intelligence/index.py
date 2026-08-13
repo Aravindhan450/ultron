@@ -407,30 +407,40 @@ class RepositoryIndex:
     # Queries
     # ------------------------------------------------------------------
 
-    def find_definition(self, name: str) -> list[Symbol]:
-        """The defining symbol(s) for *name* (class/function/... kinds)."""
+    def find_definition(
+        self, name: str, *, case_insensitive: bool = False
+    ) -> list[Symbol]:
+        """The defining symbol(s) for *name* (class/function/... kinds).
+
+        With ``case_insensitive=True`` the match is case-tolerant
+        (``taskstate`` finds ``TaskState``); the canonical identifier is
+        returned in the symbols themselves.
+        """
+        name_clause = "LOWER(s.name) = LOWER(?)" if case_insensitive else "s.name = ?"
+        kind_placeholders = ",".join("?" for _ in _DEFINITION_KINDS)
         rows = self._conn.execute(
             "SELECT s.name, s.kind, s.language, s.file_id, s.line, s.column, "
             " s.end_line, s.end_column, s.scope, s.parent, s.signature, "
             " s.doc, s.bases, s.inferred, f.path "
             "FROM symbols s JOIN files f ON f.id = s.file_id "
-            "WHERE s.name = ? AND s.kind IN ({}) "
+            f"WHERE {name_clause} AND s.kind IN ({kind_placeholders}) "
             "ORDER BY CASE s.kind WHEN 'class' THEN 0 WHEN 'interface' THEN 1 "
-            "WHEN 'function' THEN 2 WHEN 'method' THEN 3 ELSE 4 END, s.line".format(
-                ",".join("?" for _ in _DEFINITION_KINDS)
-            ),
+            "WHEN 'function' THEN 2 WHEN 'method' THEN 3 ELSE 4 END, s.line",
             (name, *tuple(k.value for k in _DEFINITION_KINDS)),
         ).fetchall()
         return [_row_to_symbol(r) for r in rows]
 
-    def find_symbol(self, name: str) -> list[Symbol]:
+    def find_symbol(
+        self, name: str, *, case_insensitive: bool = False
+    ) -> list[Symbol]:
         """Every symbol (any kind) named *name* across the index."""
+        name_clause = "LOWER(s.name) = LOWER(?)" if case_insensitive else "s.name = ?"
         rows = self._conn.execute(
             "SELECT s.name, s.kind, s.language, s.file_id, s.line, s.column, "
             " s.end_line, s.end_column, s.scope, s.parent, s.signature, "
             " s.doc, s.bases, s.inferred, f.path "
             "FROM symbols s JOIN files f ON f.id = s.file_id "
-            "WHERE s.name = ? ORDER BY s.line",
+            f"WHERE {name_clause} ORDER BY s.line",
             (name,),
         ).fetchall()
         return [_row_to_symbol(r) for r in rows]
@@ -452,12 +462,15 @@ class RepositoryIndex:
         ).fetchall()
         return [_row_to_symbol(r) for r in rows]
 
-    def find_references(self, name: str) -> list[SymbolReference]:
+    def find_references(
+        self, name: str, *, case_insensitive: bool = False
+    ) -> list[SymbolReference]:
         """Usage sites of *name* outside its definition (bounded, ordered)."""
+        name_clause = "LOWER(r.name) = LOWER(?)" if case_insensitive else "r.name = ?"
         rows = self._conn.execute(
             "SELECT r.name, r.file_id, r.line, r.column, r.context, f.path "
             "FROM symbol_refs r JOIN files f ON f.id = r.file_id "
-            "WHERE r.name = ? ORDER BY f.path, r.line LIMIT 300",
+            f"WHERE {name_clause} ORDER BY f.path, r.line LIMIT 300",
             (name,),
         ).fetchall()
         return [

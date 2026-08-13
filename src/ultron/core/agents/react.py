@@ -58,6 +58,15 @@ from ultron.core.intelligence.prompt_assembly import (
 )
 from ultron.core.logging import get_logger
 from ultron.core.memory.session_memory import SessionMemory
+from ultron.core.tools.definitions import (
+    ToolCapability as _ToolCapability,
+)
+from ultron.core.tools.definitions import (
+    code_intel_tool_names,
+    generic_code_tool_names,
+    preferred_tool_for,
+    web_tool_names,
+)
 from ultron.core.tools.registry import get_tool, get_tools_schema
 from ultron.core.types import (
     ChatMessage,
@@ -75,6 +84,108 @@ logger = get_logger("ultron.agents.react")
 # Cap on reasoning steps per turn — prevents runaway loops if the model keeps
 # emitting tool calls without ever reaching a final answer.
 DEFAULT_MAX_ITERATIONS = 10
+
+# Code-intelligence tools the ReAct routing correction may redirect to.
+# Redirects never target state-modifying tools: the runtime only moves an
+# LLM tool call toward the dedicated read-only capability.  DERIVED from the
+# canonical definitions table (STEP 2A) — never an independent list.
+_CODE_INTEL_TOOLS = code_intel_tool_names()
+
+# Tools the turn-level correction may replace when the turn's original request
+# classifies to a specific symbol capability (see route_llm_tool_call): generic
+# code tools AND web search — a repo-question turn must never produce a web
+# call, even when the model stripped the argument down to a bare symbol that
+# does not itself classify (search_web(query='taskstate') on a "where is
+# taskstate used?" turn -> find_references). Genuine web turns never classify
+# to a specific symbol tool, so they are never touched.  DERIVED from canonical
+# capability metadata.
+_TURN_CORRECTABLE_TOOLS = frozenset(generic_code_tool_names() | web_tool_names())
+
+# Specific symbol capabilities: these answer "where is X used/defined" with
+# VERIFIED index evidence — never a raw lexical dump.  DERIVED from the
+# canonical capability -> tool preference.
+_SPECIFIC_SYMBOL_TOOLS = frozenset(
+    t
+    for t in (
+        preferred_tool_for(_ToolCapability.DEFINITION_LOOKUP),
+        preferred_tool_for(_ToolCapability.REFERENCE_LOOKUP),
+    )
+    if t
+)
+
+
+def route_llm_tool_call(
+    tool_name: str, arguments: dict, user_input: str | None = None
+) -> tuple[str, dict] | None:
+    """
+    Deterministic correction for the ReAct loop's tool calls.
+
+    The LLM decides WHAT the user wants; the runtime decides WHICH tool and
+    with WHAT arguments. This layer redirects a tool call the model misrouted:
+
+    - ``search_web`` on a repository question ("How does the Supervisor
+      delegate work?") -> ``code_investigation`` — repository questions never
+      hit the web in the LLM-driven loop, exactly as in the deterministic
+      SimpleAgent path;
+    - a question-shaped argument on a code-intelligence tool
+      (``code_search(query="Where is TaskState defined?")``) -> the specific
+      tool ``route_request`` picks (``find_definition``, ...) with the
+      correctly extracted symbol;
+    - a generic code tool (``code_search``/``semantic_search``) whose bare
+      argument is a symbol, while the TURN's original request classifies to a
+      specific symbol capability (``user_input="Where is taskstate used?"``
+      -> ``find_references(name="taskstate")``) — the model may emit a bare
+      symbol that does not itself classify, but the user's question does, and
+      the runtime decides the tool.
+
+    ``user_input`` is the turn's original user message (optional): when it
+    classifies to a specific symbol tool, a generic first tool call is
+    corrected regardless of what the model extracted. Callers pass it only
+    for the first tool call of a turn, so mid-loop generic searches (legit
+    exploration) are never overridden.
+
+    Returns ``(corrected_tool, corrected_arguments)`` to execute instead, or
+    ``None`` to run the call as-is.  Redirects are restricted to read-only
+    code-intelligence tools — never ``run_command`` or any state-modifying
+    action, and never a security downgrade (the corrected call still flows
+    through the boundary).
+    """
+    from ultron.core.nlp.intent import route_request
+
+    # (1) Turn-level correction: the user's actual request classifies to a
+    # specific symbol capability, but the model reached for a generic code
+    # tool. The runtime wins — execute the specific tool with the correctly
+    # extracted symbol.
+    if user_input and user_input.strip():
+        turn_intent = route_request(user_input.strip())
+        if (
+            turn_intent is not None
+            and turn_intent.tool in _SPECIFIC_SYMBOL_TOOLS
+            and tool_name in _TURN_CORRECTABLE_TOOLS
+        ):
+            return turn_intent.tool, dict(turn_intent.arguments or {})
+
+    query = str(arguments.get("query") or arguments.get("name") or "").strip()
+    if not query:
+        return None
+
+    intent = route_request(query)
+    if intent is None or not intent.tool:
+        return None
+    if intent.tool not in _CODE_INTEL_TOOLS:
+        return None
+
+    if tool_name in web_tool_names():
+        # A repository question must never be executed as a web search.
+        if intent.tool != tool_name:
+            return intent.tool, dict(intent.arguments or {})
+        return None
+
+    if tool_name in _CODE_INTEL_TOOLS and intent.tool != tool_name:
+        # The argument is a natural-language question; route it to the
+        # specific capability (and the correctly extracted symbol/query).
+        return intent.tool, dict(intent.arguments or {})
+    return None
 
 
 def build_system_prompt() -> str:
@@ -879,6 +990,7 @@ class ReActAgent(BaseAgent):
                 if task.goal:
                     session.note_task((task.goal or "")[:60])
 
+        first_tool_call = True
         for _ in range(self.max_iterations):
             response = (await self.engine.generate(history_to_openai_format(messages))) or ""
             tool_call = extract_tool_call(response)
@@ -920,6 +1032,20 @@ class ReActAgent(BaseAgent):
             # back as an observation so the model is forced to change approach.
             outcome = self._coding_gate(task, tool_name, arguments)
             if outcome is None:
+                # Deterministic routing correction: the LLM decides what the
+                # user wants, the runtime decides which tool and arguments.
+                # Redirect a misrouted call (repo question -> web search, or
+                # a question-shaped argument on a generic code tool) toward
+                # the dedicated read-only capability. The turn's original
+                # request is consulted only on the FIRST tool call, so
+                # mid-loop generic searches (legit exploration) are never
+                # overridden.
+                corrected = route_llm_tool_call(
+                    tool_name, arguments, user_input=user_input if first_tool_call else None
+                )
+                if corrected is not None:
+                    tool_name, arguments = corrected
+                first_tool_call = False
                 outcome = self._route_tool(tool_name, arguments, user_input)
 
             # Confirmation-gated action — hand control back to the CLI with a

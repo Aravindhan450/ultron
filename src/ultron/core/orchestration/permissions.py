@@ -37,6 +37,7 @@ from enum import Enum
 
 from pydantic import BaseModel, ConfigDict
 
+from ultron.core.tools.definitions import TOOL_DEFINITIONS, ToolDomain
 from ultron.security import Decision, SecurityBoundary, get_boundary
 
 # ---------------------------------------------------------------------------
@@ -55,61 +56,18 @@ class PermissionCategory(str, Enum):
     OTHER = "other"  # whitelisted but unclassified -> security evaluation
 
 
-# Read-only registry tools (filesystem, code intelligence, memory lookups).
-_READ_TOOLS = frozenset(
-    {
-        "read_file",
-        "list_directory",
-        "search_files",
-        "discover_workspace_summary",
-        "code_search",
-        "find_symbol",
-        "find_definition",
-        "find_references",
-        "get_imports",
-        "get_dependents",
-        "semantic_search",
-        "code_index_status",
-        "report_file",
-        "report_symbol",
-        "get_all_memories",
-        "search_memories",
-        "retrieve",
-        # read-only git inspection (workspace helpers / future tools)
-        "git_status",
-        "git_diff",
-    }
-)
-
-# State-changing file/content tools.
-_WRITE_TOOLS = frozenset(
-    {
-        "write_file",
-        "overwrite_file",
-        "create_file",
-        "replace_file",
-        "replace_in_file",
-        "append_to_file",
-        "delete_file",
-        "rename_file",
-        "add_memory",
-        "add_triple",
-        "learn_api_schema",
-        "forget_api",
-        "enforce_schema",
-    }
-)
-
-# Anything that touches the network.
-_NETWORK_TOOLS = frozenset(
-    {
-        "web_search",
-        "fetch_page",
-        "fetch_page_text",
-        "make_http_request",
-        "check_connectivity",
-    }
-)
+# Tool -> category classification is DERIVED from the canonical definitions
+# table (STEP 2A) at call time, so a canonical metadata change propagates
+# immediately: read-only non-network tools classify READ, state-changing
+# file/memory/learning tools classify WRITE, network-domain tools classify
+# NETWORK, and shell tools classify SHELL.  Only deliberate policy choices
+# are listed here explicitly: ``retrieve`` is read-only research that
+# read-only agents rely on (READ, not NETWORK), plus the non-registered
+# action names (future git tools, the overwrite_file pending-action type,
+# alias spellings) that have no canonical definition to derive from.
+_POLICY_READ = frozenset({"git_status", "git_diff"})
+_POLICY_WRITE = frozenset({"overwrite_file"})
+_POLICY_NETWORK = frozenset({"fetch_page", "web_search"})
 
 # Explicitly shell-driven tools (run_command is classified separately below).
 _SHELL_TOOLS = frozenset({"run_command", "run_parallel"})
@@ -140,13 +98,41 @@ _READONLY_COMMAND_RE = re.compile(
 _SHELL_SIDE_EFFECTS = re.compile(r"[>|;&`]|\$\(")
 
 
+def _category_for_tool(action: str) -> PermissionCategory | None:
+    """Canonical-derived category for a registered tool, or None (OTHER).
+
+    Precedence mirrors the historical sets: READ first (read-only
+    non-network tools, plus the ``retrieve`` policy carve-out), then WRITE
+    (state-changing file/memory/learning), then NETWORK (remaining network
+    domain tools).  Reads the canonical table at call time so metadata
+    changes propagate immediately.
+    """
+    definition = TOOL_DEFINITIONS.get(action)
+    if definition is None:
+        return None
+    if definition.read_only and (
+        definition.domain is not ToolDomain.NETWORK or action == "retrieve"
+    ):
+        return PermissionCategory.READ
+    if (
+        not definition.read_only
+        and definition.domain
+        in (ToolDomain.FILESYSTEM, ToolDomain.MEMORY, ToolDomain.LEARNING)
+    ):
+        return PermissionCategory.WRITE
+    if definition.domain is ToolDomain.NETWORK:
+        return PermissionCategory.NETWORK
+    return None
+
+
 def classify_tool(action_type: str, target: str = "") -> PermissionCategory:
     """
     Classifies a tool call into a :class:`PermissionCategory`.
 
     ``run_command`` is target-sensitive: test commands are TEST, read-only
     commands (no shell metacharacters) are READ, everything else is SHELL.
-    Unlisted tools are OTHER (whitelisted tools with no explicit category
+    Registered tools classify from canonical metadata (call-time derived);
+    unlisted tools are OTHER (whitelisted tools with no explicit category
     default to security evaluation). Never raises.
     """
     action = (action_type or "").lower()
@@ -159,11 +145,14 @@ def classify_tool(action_type: str, target: str = "") -> PermissionCategory:
         ):
             return PermissionCategory.READ
         return PermissionCategory.SHELL
-    if action in _READ_TOOLS:
+    category = _category_for_tool(action)
+    if category is not None:
+        return category
+    if action in _POLICY_READ:
         return PermissionCategory.READ
-    if action in _WRITE_TOOLS:
+    if action in _POLICY_WRITE:
         return PermissionCategory.WRITE
-    if action in _NETWORK_TOOLS:
+    if action in _POLICY_NETWORK:
         return PermissionCategory.NETWORK
     if action in _SHELL_TOOLS:
         return PermissionCategory.SHELL

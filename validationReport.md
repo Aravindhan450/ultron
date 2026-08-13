@@ -14,13 +14,15 @@ The repository root is the working directory for all commands.
 
 | Metric | Value |
 |---|---|
-| Full automated test suite | **1287 passed, 0 failed** (`pytest -q`) |
+| Full automated test suite | **1489 passed, 0 failed** (`pytest -q`) |
 | Lint | **clean** (`ruff check .` → "All checks passed!") |
 | Live orchestration validation harness | **109/109 checks passed** (`python _orchestration_live_check.py`) |
+| Live ReAct routing harness | **4/4 PASS** (`python _react_routing_live_check.py`) |
+| Live repo-question harness | **12/12 PASS** (`python _repo_question_live_check.py`) |
 | FIX #7 uncommitted change set | 9 entries (see §9.1) |
 | Earlier fixes (FIX #1–#6) | committed in git history (`2eead6e` = FIX #1/#2, `d94f067` = FIX #3/#4, `d4d2747` = FIX #5/#6) |
 
-Verified 12 Aug 2026. Full suite runtime ≈ 22 s.
+Verified 13 Aug 2026. Full suite runtime ≈ 26 s.
 
 **Fix series overview:**
 
@@ -32,6 +34,9 @@ Verified 12 Aug 2026. Full suite runtime ≈ 22 s.
 - **FIX #6** — Memory hierarchy + ContextManager (committed)
 - **FIX #7** — Multi-agent orchestration (agent contract §7.1 → registry §7.2 → artifacts §7.3
   → supervisor delegation §7.4 → validation layer → workflow engine §7.6) (**uncommitted**)
+- **FIX #8** — Natural-language intent → tool routing for both agents (terminal normalization,
+  workspace/test-command resolution, code-intel query resolution, repository-question routing
+  + synthesis, ReAct-loop deterministic correction) — see §12 (**uncommitted**)
 
 ---
 
@@ -574,3 +579,264 @@ knowledge-graph memory), FIX #1/#2 planning/state (~153).
 - STEP SUCCESS ≠ WORKFLOW SUCCESS ≠ TASK SUCCESS — the workflow engine gates every step
   through the validator and invokes TaskState's own `mark_complete()` (guarded); it never
   forces `task.status`. A workflow may complete while the task legitimately stays incomplete.
+
+---
+
+## 12. FIX #8 — Natural-Language Intent → Tool Routing (Simple + ReAct agents)
+
+### 12.0 Executive summary (this cycle)
+
+| Metric | Value |
+|---|---|
+| Full automated test suite | **1489 passed, 0 failed** (`pytest -q`, ~26 s) |
+| Lint | **clean** (`ruff check .` → "All checks passed!") |
+| New tests this cycle | `tests/test_react_routing.py` — **26 tests** |
+| Live ReAct CLI harness | **4/4 PASS** (`python _react_routing_live_check.py`, real Ollama model) |
+| Routing gate unit matrix | 18/18 correct (see §12.3) |
+
+**What this fix series does:** the LLM decides *what the user wants*; the runtime decides
+*which tool* and *with what arguments*. A deterministic gate (`nlp/intent.py::route_request`
++ `agents/react.py::route_llm_tool_call`) classifies the request, extracts the entity, and
+selects the dedicated capability **before** any execution. Terminal is only used when it is
+the appropriate tool; repository questions never silently become web searches; symbol
+questions never silently become raw lexical dumps.
+
+---
+
+### 12.1 Fix-series history (what each cycle added, all currently in tree)
+
+| Cycle | Scope | Key artifacts |
+|---|---|---|
+| Simple-agent routing | terminal command normalization (`Execute: pwd` → `pwd`), filesystem/test/git/code-intel routing | `nlp/intent.py`, `nlp/normalize.py` |
+| Workspace-context resolution | "current directory"/"here"/"./" → real project root (was `directory not found at the`) | `WorkspaceContext`-style resolution wired into `handle_routed_intent` |
+| Test-command resolver | "Run the tests"/"Run the relevant tests" → project-aware command (`.venv/bin/python -m pytest`, never bare `pytest` → `command not found`) | `TestCommandResolver`-equivalent in the routing layer |
+| Code-intel query resolution | `taskstate`/`codingexecutor` case-insensitive + multi-word symbol normalization; VERIFIED/INFERRED/UNKNOWN; no speculative paths ("src/…/supervisor.py is *likely*…") | `coding/intelligence/resolve.py` (new) |
+| Repository-question routing + synthesis | "How does the Supervisor delegate work?" never routes to web; "where X implemented/handled" → `code_investigation` with primary-implementation synthesis, `src/`-first ranking | `code_investigation` tool, `resolve_investigation()` |
+| **ReAct routing extension (this cycle)** | the same deterministic gate applied to the LLM-driven ReAct loop; `search_web` security asymmetry fixed; bridge shares the resolve.py path | `react.py::route_llm_tool_call`, §12.2–12.9 |
+
+---
+
+### 12.2 What was built this cycle
+
+**`src/ultron/core/agents/react.py` — `route_llm_tool_call(tool_name, arguments, user_input=None)`**
+
+Deterministic correction applied inside the ReAct loop before `_route_tool`, when the coding
+gate passes:
+
+1. **Turn-level correction** — if the *turn's original request* classifies to a specific
+   symbol capability (`find_definition`/`find_references`) and the model reached for a
+   correctable tool (`code_search`, `semantic_search`, `search_web`, `web_search`), the
+   runtime executes the specific tool with the correctly extracted symbol. Consulted only on
+   the **first** tool call of a turn (`first_tool_call` flag reset per `run()`), so mid-loop
+   generic searches (legitimate exploration) are never overridden.
+2. **Argument-level correction** — if a tool call's `query`/`name` argument is itself a
+   natural-language question (e.g. `code_search(query="Where is TaskState defined?")`), the
+   call is redirected to the capability `route_request` picks, with the extracted symbol.
+3. **Web gate** — `search_web` on a repository question → `code_investigation`. Genuine
+   external questions (`What is the latest Python release?`) are never touched.
+
+Redirects are restricted by three frozensets (`_CODE_INTEL_TOOLS`, `_TURN_CORRECTABLE_TOOLS`,
+`_SPECIFIC_SYMBOL_TOOLS`) to **read-only** code-intelligence tools — never `run_command` or
+any state-modifying action, and the corrected call still flows through the boundary
+(`check_action` is re-run in `_route_tool`).
+
+**`src/ultron/security/boundary.py`** — `search_web` added to the LOW set and canonicalized
+bidirectionally with `web_search` (previously `search_web` → HIGH/confirm while `web_search`
+→ LOW/allow — an asymmetry violating AGENTS.md's bidirectional canonicalization rule).
+
+**`src/ultron/core/coding/intelligence_bridge.py`** — `query()` supports `code_investigation`;
+`_format_definitions/_format_symbols/_format_references` now delegate to `resolve.py` so the
+bridge and the registered tools share **one** resolution path (ReAct loop and deterministic
+route behave identically).
+
+**`src/ultron/core/agents/simple.py`** — `_generic_target_content` handles `search_web` +
+`code_investigation` (boundary path-confinement scan); `handle_routed_intent` maps
+`symbol_inspection` → `report_symbol`, `repository_investigation` → `code_investigation`.
+
+**`tests/test_react_routing.py`** — 26 tests: redirect matrix (repo-question on web, bare
+symbols, question-shaped args, plain lexical stays as-is, never-targets-state-modifying,
+empty args), turn-level correction (bare symbol on generic/web tools, definition vs
+reference, lexical intent not forced, no-user-input fallback, read-only guarantee), and
+ReAct-loop e2e with a scripted FakeEngine (corrected tool emitted, unknown tool errors
+without crashing, first-tool-call-only behavior).
+
+---
+
+### 12.3 Root causes + evidence transcripts
+
+#### Root cause A — repository questions hit web search in the ReAct loop
+
+**Before:** `How does the Supervisor delegate work?` in the LLM-driven loop produced
+`Confirmation Required — Search the web — …`. No deterministic detector claimed "how does X
+work", so it fell to the LLM classifier, which guessed `web_search`.
+
+**After (live CLI, real model):**
+
+```
+PASS 1. How does the Supervisor delegate work?      → repository investigation, NO web search
+```
+
+**Routing matrix (deterministic gate, fresh run):**
+
+```
+'Where is TaskState used?'                -> tool='find_references'   args={'name': 'TaskState'}
+'Where is taskstate used?'                -> tool='find_references'   args={'name': 'taskstate'}
+'Find references to TaskState'            -> tool='find_references'   args={'name': 'TaskState'}
+'How does the Supervisor delegate work?'  -> tool='code_investigation' args={'query': 'Supervisor'}
+'Where is command execution implemented?' -> tool='code_investigation' args={'query': 'command execution'}
+'What is the latest Python release?'      -> tool=None (external → not a repository question)
+```
+
+#### Root cause B — reference extraction leaked grammar ("is TaskState")
+
+**Before:** `Where is TaskState used?` extracted `is TaskState` (lazy optional `(?:is\s+)??`
+let the greedy symbol phrase swallow the wrapper), then ran a lexical dump instead of a
+reference lookup.
+
+**Fix:** greedy `is|are` consumed after "where" before the symbol phrase; `references to /
+usages of / who uses / what references / where X referenced/called / all references`
+variants added. Verified: every variant extracts only the symbol, and reference questions
+route to `find_references` (verified index evidence), not `code_search`.
+
+#### Root cause C — live ReAct failure: model emitted a bare symbol on a generic tool
+
+Live probe of `Where is taskstate used?` (real model, `gemma4:e4b`) traced the full chain:
+
+1. Model emits `code_search(query='taskstate')` — wrong tool for a reference question.
+2. Lexical `code_search` returns only docstring hits from the live-check scripts (the
+   literal text `taskstate` appears in `_react_routing_live_check.py`) — **zero verified
+   `src/` references**.
+3. With no evidence, the model fabricated a Java answer.
+
+The routing layer previously saw only the tool call's arguments; a bare `taskstate` does not
+classify. **Fix:** pass `user_input` into `route_llm_tool_call` (first tool call only) so the
+runtime classifies the *turn's* request and corrects `code_search`/`semantic_search`/
+`search_web` → `find_references(name='taskstate')`. After the fix the live harness passed:
+
+```
+PASS 2. Where is taskstate used?
+```
+
+#### Root cause D — `search_web` vs `web_search` security asymmetry
+
+```
+# BEFORE                              # AFTER
+search_web -> confirm (tier=high)     search_web -> allow (tier=low)
+web_search -> allow  (tier=low)       web_search -> allow (tier=low)
+```
+
+The registered tool is `search_web` (the name the ReAct LLM actually emits); the LOW set
+listed `web_search`, so every legitimate web call in the LLM-driven loop demanded
+confirmation. Now canonicalized bidirectionally — consistent with AGENTS.md ("both
+`web_search` and `search_web` gate identically").
+
+---
+
+### 12.4 Architecture + integration map
+
+```
+USER REQUEST
+   ↓
+nlp/intent.py::route_request          (deterministic classifier: intent + tool + arguments)
+   ↓
+SimpleAgent: handle_routed_intent     ReActAgent: route_llm_tool_call (first tool call only)
+   ↓                                    ↓
+dedicated tool selected               corrected tool + arguments
+   ↓                                    ↓
+check_action(tool, target, content)   _route_tool → check_action → boundary
+   ↓
+allow → execute / confirm → PendingAction / deny → blocked
+```
+
+- **Security ordering (ReAct):** `_coding_gate` runs **before** the correction (blocks win);
+  the corrected call then goes through `_route_tool`, which re-runs `check_action` for every
+  tool. No redirect bypasses the boundary.
+- **One resolution path:** registered tools and `CodeIntelligenceBridge` both call
+  `resolve.py` (`resolve_definition`, `resolve_symbol`, `resolve_investigation` + formatters)
+  — the ReAct loop and the deterministic route produce identical evidence-grounded answers.
+- **Redirect safety:** targets restricted to read-only `_CODE_INTEL_TOOLS`; unknown tools
+  return an error message (never crash); empty/non-dict arguments are coerced, never trusted.
+- **Turn vs argument:** turn-level correction fires once (first tool call); argument-level
+  correction fires whenever the argument itself is a question. Mid-loop bare-symbol searches
+  are left alone.
+
+---
+
+### 12.5 Automated tests — what they assert
+
+| Group | Asserts |
+|---|---|
+| Redirect matrix | repo question on `search_web` → `code_investigation`; definition question on `search_web` → `find_definition`; external web questions stay as-is; question-shaped arg on `code_search` → specific tool; plain `code_search('pytest')` stays; `find_definition(name=...)` already case-insensitive → no redirect; **never** redirects `run_command`/`write_file`/`delete_file`/`run_query`; empty args → no redirect |
+| Turn-level correction | bare symbol on `code_search`/`semantic_search`/`search_web` corrected by `user_input`; definition vs reference case; lexical intent (`Find files containing X`) never forced to reference; no `user_input` → no turn-level redirect; corrected target always read-only |
+| ReAct loop e2e (FakeEngine) | a corrected tool call is what actually executes; unknown tool produces an error observation, not a crash; `user_input` is only consulted on the first tool call |
+| Boundary | `search_web` gates LOW/allow identically to `web_search` |
+
+---
+
+### 12.6 Validation results
+
+- **New tests:** `tests/test_react_routing.py` 26/26 pass.
+- **Full suite:** 1489 passed, 0 failed (progression: 1425 → 1463 [repo-question routing]
+  → 1478 [ReAct extension] → 1487 → 1489 [turn-level + web-bare-symbol correction]),
+  ruff clean — **zero regressions**.
+- **Live ReAct CLI harness** (`_react_routing_live_check.py`, pty against the real
+  `ultron chat --agent react` with Ollama `gemma4:e4b`):
+
+```
+  PASS 1. How does the Supervisor delegate work?
+  PASS 2. Where is taskstate used?
+  PASS 3. Where is command execution implemented?
+  PASS 4. What is the latest Python release?
+RESULT: PASS
+```
+
+- **Failures found during testing, and fixes:**
+  1. Live test 2 initially returned spinner-only (harness window too short for multi-step
+     trajectories ~40 s/generation) **and** the model fabricated an answer from live-check
+     docstring hits → fixed root cause (turn-level correction, root cause C) + made the
+     harness settle-aware (wait until output stops growing, capped).
+  2. Reviewer-pass found dead code in `resolve.py` (leftover grouping helpers after the
+     merged-fallback rewrite) and a duplicated semantic query → removed.
+  3. This cycle's review found the `search_web`+bare-symbol double-misroute gap → widened
+     `_TURN_CORRECTABLE_TOOLS` to include web tools + 2 new tests.
+
+---
+
+### 12.7 Performance observations (baseline only, no premature optimization)
+
+- `route_llm_tool_call` / `route_request`: deterministic regex classification, ~sub-ms;
+  called at most twice on the first tool call of a turn — negligible vs. ~40 s per LLM
+  generation on the local model.
+- Full test suite: 25.9 s (was ~22 s at FIX #7; +35 tests).
+- ReAct live prompts: 1–3 generations each (~40 s/generation) depending on trajectory
+  length; the routing correction never adds a generation.
+
+---
+
+### 12.8 Known limitations (do NOT over-claim)
+
+- **Deterministic gate is phrasing-based** — "how does X work" routes to repository
+  investigation even for external entities (e.g. "How does Redis work?" → "No repository
+  evidence found"); per the spec's negative-test rule, auto-web-search is intentionally not
+  triggered — the user must ask explicitly ("search the web for …").
+- **Turn-level correction requires a specific-symbol classification** — if the model strips
+  the argument AND the turn is phrased so vaguely that `route_request` cannot classify it,
+  no correction fires (correct behavior: don't guess).
+- **Investigation synthesis is evidence-framed, not prose** — the summary is assembled from
+  verified facts (symbol, file, imports/dependents, tests); free-form "how it works" prose
+  remains LLM territory.
+- Semantic fallback for conceptual subjects is labeled "verify in source" (INFERRED),
+  consistent with the VERIFIED/INFERRED/UNKNOWN policy — never presented as fact.
+
+---
+
+### 12.9 Reproduction commands
+
+```bash
+cd /Users/aravindhan/ultron
+.venv/bin/python -m pytest tests/test_react_routing.py -q        # 26 passed
+.venv/bin/ruff check .                                            # All checks passed!
+.venv/bin/python -m pytest -q                                     # 1489 passed
+.venv/bin/python -u _react_routing_live_check.py                  # RESULT: PASS (needs Ollama up)
+.venv/bin/python -u _repo_question_live_check.py                  # 12/12 PASS (Simple agent path)
+```

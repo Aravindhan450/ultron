@@ -112,70 +112,23 @@ class SecurityBoundary:
         The rules are intentionally conservative: when unsure, an action is
         classified HIGH rather than LOW so the user gets asked.
         """
-        action = (action_type or "").lower()
+        # Alias spellings (db_query, fetch_page, web_search) resolve to their
+        # registered tool up front so policy branches and the canonical lookup
+        # below see one spelling. Imported lazily (see the note on
+        # get_tool_definition).
+        from ultron.core.tools.definitions import canonical_action_name
 
-        # Read-only, low-risk operations.
-        if action in {
-            "read_file",
-            # Fix #3 coding workspace inspection (read-only)
-            "list_directory",
-            "search_files",
-            "discover_workspace_summary",
-            # Fix #4 code intelligence (read-only)
-            "code_search",
-            "find_symbol",
-            "find_definition",
-            "find_references",
-            "get_imports",
-            "get_dependents",
-            "semantic_search",
-            "code_index_status",
-            "report_file",
-            "report_symbol",
-            "web_search",
-            "retrieve",
-            "check_connectivity",
-            "fetch_page_text",
-            "learn_api_schema",
-            "api_usage_hint",
-            "get_api_knowledge",
-            "forget_api",
-            "check_resources",
-            "resource_forecast",
-            "memory_connections",
-            "related_facts",
-            "discover_connections",
-            "explain_relation",
-            "enforce_schema",
-            "schema_validate",
-            "list_schemas",
-            "preflight_plan",
-            "analyze_dependencies",
-            "list_plan_actions",
-            "get_debug_context",
-            "diagnose_failure",
-            "check_dependency",
-            "run_tool_batch",
-            "synthesize_analysis",
-            "get_all_memories",
-            "search_memories",
-            "add_memory",
-            "add_triple",
-            "query_triples",
-            "query_chain",
-            "search_triples",
-            "get_all_triples",
-        }:
-            return RiskTier.LOW
+        action = canonical_action_name(action_type or "")
 
-        # HTTP requests: GET is read-only; state-changing methods are HIGH.
+        # Policy-sensitive actions whose tier depends on the ACTUAL target
+        # (HTTP method / SQL verb / shell metacharacters). These are security
+        # policy refinements over the tool's declared canonical risk.
         if action == "make_http_request":
             method = self._http_method(target, content)
             if method in _STATE_CHANGING_HTTP:
                 return RiskTier.HIGH
             return RiskTier.LOW
 
-        # Database queries: SELECT/WITH are read-only; destructive verbs are CRITICAL.
         if action == "run_query":
             sql = target or content or ""
             if not is_readonly_query(sql):
@@ -183,23 +136,6 @@ class SecurityBoundary:
                     return RiskTier.CRITICAL
                 return RiskTier.HIGH
             return RiskTier.LOW
-
-        # File writes: HIGH, escalated to CRITICAL when touching system paths.
-        # Fix #3 coding edits (create/replace/targeted edit/append/delete/
-        # rename) are state-changing and gated exactly like write_file.
-        if action in {
-            "write_file",
-            "overwrite_file",
-            "create_file",
-            "replace_file",
-            "replace_in_file",
-            "append_to_file",
-            "delete_file",
-            "rename_file",
-        }:
-            if self._touches_system_path(target):
-                return RiskTier.CRITICAL
-            return RiskTier.HIGH
 
         # Shell commands. "Read-only" is only trusted when there is no shell
         # metacharacter (redirection, pipe, chaining, substitution) that could
@@ -220,6 +156,36 @@ class SecurityBoundary:
                 if _TIER_RANK[tier.value] > _TIER_RANK[worst.value]:
                     worst = tier
             return worst
+
+        # Registered tools: the risk tier comes from the canonical definitions
+        # table (the single source of truth for tool metadata). Imported
+        # lazily: definitions pulls in coding modules that transitively import
+        # this package, so a module-level import would be circular.
+        from ultron.core.tools.definitions import get_tool_definition
+
+        definition = get_tool_definition(action)
+        if definition is not None:
+            tier = RiskTier(definition.risk.value)
+            # Policy: state-changing file tools touching system/credential
+            # paths escalate to CRITICAL regardless of the declared tier.
+            if (
+                not definition.read_only
+                and tier == RiskTier.HIGH
+                and self._touches_system_path(target)
+            ):
+                return RiskTier.CRITICAL
+            return tier
+
+        # Internal non-registered actions (security policy; no registry tool).
+        if action == "query_chain":
+            # Knowledge-graph reasoning over local memory — read-only.
+            return RiskTier.LOW
+        if action == "overwrite_file":
+            # Pending-action type for overwriting an existing file — gated
+            # exactly like the registered write tools.
+            if self._touches_system_path(target):
+                return RiskTier.CRITICAL
+            return RiskTier.HIGH
 
         # Unknown actions default to HIGH.
         return RiskTier.HIGH
