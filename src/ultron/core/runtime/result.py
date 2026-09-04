@@ -20,6 +20,8 @@ class RunResult(BaseModel):
     """
 
     run_id: str
+    task_id: str | None = None
+    parent_task_id: str | None = None
     status: RuntimeStatus
     message: ChatMessage | None = None
     task_state: TaskState | None = None

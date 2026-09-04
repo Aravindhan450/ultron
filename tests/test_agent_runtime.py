@@ -17,8 +17,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from ultron.core.agents.base import BaseAgent
+from ultron.core.agents.react import ReActAgent
 from ultron.core.runtime import (
     AgentRuntime,
+    BudgetExceededError,
     CancellationToken,
     EventBus,
     RunState,
@@ -27,7 +29,7 @@ from ultron.core.runtime import (
     RuntimeEventType,
     RuntimeStatus,
 )
-from ultron.core.types import ChatMessage, Role
+from ultron.core.types import ChatMessage, Role, TaskState
 
 
 class MockAgent(BaseAgent):
@@ -233,3 +235,133 @@ def test_runtime_agent_error_handling():
         assert "Engine crashed" in (result.error or "")
 
     _run(_test())
+
+
+def test_iteration_budget_is_enforced():
+    async def _test():
+        runtime = AgentRuntime()
+
+        class LoopingEngine:
+            async def generate(self, messages, **kwargs):
+                return '{"tool": "read_file", "arguments": {"file_path": "test.txt"}}'
+
+        agent = ReActAgent(LoopingEngine())
+        budget = RuntimeBudget(max_iterations=2, max_tool_calls=10)
+
+        result = await runtime.execute(agent, "Loop forever", budget=budget)
+        assert result.status == RuntimeStatus.BUDGET_EXCEEDED
+        assert not result.is_success
+        assert "max_iterations" in (result.termination_reason or "")
+        assert result.run_state.status == RuntimeStatus.BUDGET_EXCEEDED
+
+    _run(_test())
+
+
+def test_tool_budget_is_enforced():
+    async def _test():
+        runtime = AgentRuntime()
+
+        class LoopingEngine:
+            async def generate(self, messages, **kwargs):
+                return '{"tool": "read_file", "arguments": {"file_path": "test.txt"}}'
+
+        agent = ReActAgent(LoopingEngine())
+        budget = RuntimeBudget(max_iterations=10, max_tool_calls=1)
+
+        result = await runtime.execute(agent, "Call too many tools", budget=budget)
+        assert result.status == RuntimeStatus.BUDGET_EXCEEDED
+        assert not result.is_success
+        assert "max_tool_calls" in (result.termination_reason or "")
+
+    _run(_test())
+
+
+def test_delegation_budget_configuration_is_preserved():
+    budget = RuntimeBudget(max_delegations=2)
+    assert not budget.is_exhausted()
+    budget.record_delegation(1)
+    budget.check_delegation()
+    budget.record_delegation(1)
+    assert budget.is_exhausted()
+    assert "max_delegations" in budget.exhaustion_reason()
+    with pytest.raises(BudgetExceededError, match="max_delegations"):
+        budget.check_delegation()
+
+
+def test_cancellation_during_execution():
+    async def _test():
+        runtime = AgentRuntime()
+        token = CancellationToken()
+
+        class CancellableAgent(BaseAgent):
+            def __init__(self):
+                self.engine = MagicMock()
+
+            async def run(self, user_input: str, history=None, **kwargs) -> ChatMessage:
+                c_tok = kwargs.get("cancellation_token")
+                if c_tok:
+                    c_tok.cancel("Cancelled mid-run")
+                    c_tok.check()
+                return ChatMessage(role=Role.ASSISTANT, content="Never reached")
+
+        agent = CancellableAgent()
+        result = await runtime.execute(agent, "Task in flight", cancellation_token=token)
+        assert result.status == RuntimeStatus.CANCELLED
+        assert result.termination_reason == "Cancelled mid-run"
+        assert any(e.event_type == RuntimeEventType.RUN_CANCELLED for e in runtime.event_bus.history)
+
+    _run(_test())
+
+
+def test_task_id_is_not_task_goal():
+    async def _test():
+        runtime = AgentRuntime()
+        task = TaskState(goal="Implement user authentication")
+        assert task.task_id != task.goal
+        assert task.task_id.startswith("task_")
+
+        agent = MockAgent(response_msg=ChatMessage(role=Role.ASSISTANT, content="Auth done"))
+        result = await runtime.execute(agent, task.goal, task=task)
+        assert result.task_id == task.task_id
+        assert result.task_id != "Implement user authentication"
+        assert result.run_state.task_id == task.task_id
+
+    _run(_test())
+
+
+def test_real_runtime_events_emitted(tmp_path, monkeypatch):
+    async def _test():
+        from ultron.core.tools import paths
+
+        monkeypatch.setattr(paths, "ALLOWED_BASE_DIR", tmp_path)
+        f = tmp_path / "hello.txt"
+        f.write_text("file content")
+
+        class StepEngine:
+            def __init__(self):
+                self._calls = 0
+
+            async def generate(self, messages, **kwargs):
+                self._calls += 1
+                if self._calls == 1:
+                    return f'{{"tool": "read_file", "arguments": {{"file_path": "{f}"}}}}'
+                return "The file says file content"
+
+        runtime = AgentRuntime()
+        agent = ReActAgent(StepEngine())
+        task = TaskState(goal="Read hello.txt")
+
+        result = await runtime.execute(agent, "Read hello.txt", task=task)
+        assert result.is_success
+        assert result.status == RuntimeStatus.COMPLETED
+
+        event_types = [e.event_type for e in runtime.event_bus.history]
+        assert RuntimeEventType.RUN_STARTED in event_types
+        assert RuntimeEventType.STEP_STARTED in event_types
+        assert RuntimeEventType.MODEL_CALLED in event_types
+        assert RuntimeEventType.TOOL_STARTED in event_types
+        assert RuntimeEventType.TOOL_COMPLETED in event_types
+        assert RuntimeEventType.RUN_COMPLETED in event_types
+
+    _run(_test())
+

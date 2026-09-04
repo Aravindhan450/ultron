@@ -133,6 +133,7 @@ class RunState(BaseModel):
 
     run_id: str
     task_id: str | None = None
+    parent_task_id: str | None = None
     status: RuntimeStatus = RuntimeStatus.CREATED
     started_at: datetime | None = None
     finished_at: datetime | None = None

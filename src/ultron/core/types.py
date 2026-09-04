@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Literal
@@ -464,6 +465,8 @@ class TaskState(BaseModel):
     TaskState is created per task — no global mutable state is involved.
     """
 
+    task_id: str = Field(default_factory=lambda: f"task_{uuid.uuid4().hex[:8]}")
+    parent_task_id: str | None = None
     goal: str
     status: TaskStatus = TaskStatus.TASK_STARTED
     requirements: list[TaskRequirement] = Field(default_factory=list)

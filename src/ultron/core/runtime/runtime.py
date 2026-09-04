@@ -22,7 +22,7 @@ from typing import Any
 from ultron.core.agents.base import BaseAgent
 from ultron.core.context.manager import RepositoryContextManager
 from ultron.core.logging import get_logger
-from ultron.core.runtime.budget import RuntimeBudget
+from ultron.core.runtime.budget import BudgetExceededError, RuntimeBudget
 from ultron.core.runtime.cancellation import CancellationToken
 from ultron.core.runtime.events import EventBus, RuntimeEvent, RuntimeEventType
 from ultron.core.runtime.result import RunResult
@@ -61,13 +61,15 @@ class AgentRuntime:
         Executes an agent run through the runtime lifecycle.
         """
         run_id = f"run_{uuid.uuid4().hex[:8]}"
-        task_id = getattr(task, "goal", None) if task else None
+        task_id = getattr(task, "task_id", None) if task else None
+        parent_task_id = getattr(task, "parent_task_id", None) if task else None
         active_budget = (budget.model_copy(deep=True) if budget else self.default_budget.model_copy(deep=True))
         token = cancellation_token or CancellationToken()
 
         run_state = RunState(
             run_id=run_id,
             task_id=task_id,
+            parent_task_id=parent_task_id,
             budget=active_budget,
         )
 
@@ -107,6 +109,8 @@ class AgentRuntime:
             )
             return RunResult(
                 run_id=run_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
                 status=RuntimeStatus.CANCELLED,
                 run_state=run_state,
                 context_snapshot=context_snapshot,
@@ -114,17 +118,28 @@ class AgentRuntime:
             )
 
         # Prepare execution coroutine with agent
-        # We pass task/session/context_snapshot if the agent's run() supports it (like ReActAgent)
+        # We pass task/session/context_snapshot/budget/token/event_bus/run_state if the agent's run() supports it
         async def _run_agent() -> ChatMessage:
             kwargs: dict[str, Any] = {}
             import inspect
+
             sig = inspect.signature(agent.run)
-            if "task" in sig.parameters:
+            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
+            if has_varkw or "task" in sig.parameters:
                 kwargs["task"] = task
-            if "session" in sig.parameters:
+            if has_varkw or "session" in sig.parameters:
                 kwargs["session"] = session
-            if "context_snapshot" in sig.parameters:
+            if has_varkw or "context_snapshot" in sig.parameters:
                 kwargs["context_snapshot"] = context_snapshot
+            if has_varkw or "budget" in sig.parameters:
+                kwargs["budget"] = active_budget
+            if has_varkw or "cancellation_token" in sig.parameters:
+                kwargs["cancellation_token"] = token
+            if has_varkw or "event_bus" in sig.parameters:
+                kwargs["event_bus"] = self.event_bus
+            if has_varkw or "run_state" in sig.parameters:
+                kwargs["run_state"] = run_state
 
             return await agent.run(user_input, history, **kwargs)
 
@@ -137,6 +152,10 @@ class AgentRuntime:
             else:
                 response_msg = await agent_coro
 
+            # If cancellation was requested cooperatively during execution, raise
+            if token.is_cancelled:
+                token.check()
+
             # Successful completion or confirmation yield
             resolved_task = getattr(response_msg, "task_state", None) or task
             
@@ -148,7 +167,6 @@ class AgentRuntime:
                     changed_files = list(resolved_task.code_context.tracker.modified_files)
                 for tool_ex in resolved_task.execution_history:
                     evidence.append(f"{tool_ex.tool_name}({tool_ex.target}) -> success={tool_ex.success}")
-                    run_state.budget.record_tool_call(1)
 
             run_state.transition_to(RuntimeStatus.COMPLETED)
             await self.event_bus.emit(
@@ -165,6 +183,8 @@ class AgentRuntime:
 
             return RunResult(
                 run_id=run_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
                 status=RuntimeStatus.COMPLETED,
                 message=response_msg,
                 task_state=resolved_task,
@@ -173,6 +193,29 @@ class AgentRuntime:
                 changed_files=changed_files,
                 evidence=evidence,
                 termination_reason="Success",
+            )
+
+        except BudgetExceededError as exc:
+            reason = exc.reason or str(exc)
+            run_state.transition_to(RuntimeStatus.BUDGET_EXCEEDED, error=reason)
+            await self.event_bus.emit(
+                RuntimeEvent(
+                    event_type=RuntimeEventType.RUN_FAILED,
+                    run_id=run_id,
+                    task_id=task_id,
+                    payload={"error": reason, "status": RuntimeStatus.BUDGET_EXCEEDED.value},
+                )
+            )
+            return RunResult(
+                run_id=run_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
+                status=RuntimeStatus.BUDGET_EXCEEDED,
+                task_state=task,
+                context_snapshot=context_snapshot,
+                run_state=run_state,
+                error=reason,
+                termination_reason=reason,
             )
 
         except TimeoutError:
@@ -187,6 +230,8 @@ class AgentRuntime:
             )
             return RunResult(
                 run_id=run_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
                 status=RuntimeStatus.TIMED_OUT,
                 task_state=task,
                 context_snapshot=context_snapshot,
@@ -208,6 +253,8 @@ class AgentRuntime:
             )
             return RunResult(
                 run_id=run_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
                 status=RuntimeStatus.CANCELLED,
                 task_state=task,
                 context_snapshot=context_snapshot,
@@ -229,6 +276,8 @@ class AgentRuntime:
             )
             return RunResult(
                 run_id=run_id,
+                task_id=task_id,
+                parent_task_id=parent_task_id,
                 status=RuntimeStatus.FAILED,
                 task_state=task,
                 context_snapshot=context_snapshot,

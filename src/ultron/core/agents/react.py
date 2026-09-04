@@ -914,6 +914,10 @@ class ReActAgent(BaseAgent):
         task: TaskState | None = None,
         session: SessionMemory | None = None,
         context_snapshot: Any | None = None,
+        budget: Any | None = None,
+        cancellation_token: Any | None = None,
+        event_bus: Any | None = None,
+        run_state: Any | None = None,
     ) -> ChatMessage:
         """
         Executes the ReAct loop for a single user turn (or a task continuation).
@@ -934,6 +938,18 @@ class ReActAgent(BaseAgent):
         request, active workspace, task refs) and reads back from when
         assembling the bounded memory context block.
         """
+        from ultron.core.runtime.budget import BudgetExceededError, RuntimeBudget
+        from ultron.core.runtime.events import RuntimeEvent, RuntimeEventType
+
+        active_budget = (
+            budget
+            if budget is not None
+            else RuntimeBudget(max_iterations=self.max_iterations)
+        )
+
+        if cancellation_token is not None:
+            cancellation_token.check()
+
         system_prompt = build_system_prompt()
 
         # Structured output enforcement: inject the exact schema when the
@@ -1008,8 +1024,44 @@ class ReActAgent(BaseAgent):
                     session.note_task((task.goal or "")[:60])
 
         first_tool_call = True
-        for _ in range(self.max_iterations):
+        for _ in range(active_budget.max_iterations):
+            if cancellation_token is not None:
+                cancellation_token.check()
+
+            try:
+                active_budget.check_iteration()
+            except BudgetExceededError:
+                if run_state is not None:
+                    raise
+                break
+
+            active_budget.record_iteration(1)
+
+            if event_bus is not None:
+                event_bus.emit_sync(
+                    RuntimeEvent(
+                        event_type=RuntimeEventType.STEP_STARTED,
+                        run_id=getattr(run_state, "run_id", "run_unknown"),
+                        task_id=getattr(task, "task_id", None) or getattr(run_state, "task_id", None),
+                        payload={"step": active_budget.iterations_used, "max_iterations": active_budget.max_iterations},
+                    )
+                )
+
+            if event_bus is not None:
+                event_bus.emit_sync(
+                    RuntimeEvent(
+                        event_type=RuntimeEventType.MODEL_CALLED,
+                        run_id=getattr(run_state, "run_id", "run_unknown"),
+                        task_id=getattr(task, "task_id", None) or getattr(run_state, "task_id", None),
+                        payload={"messages_count": len(messages)},
+                    )
+                )
+
             response = (await self.engine.generate(history_to_openai_format(messages))) or ""
+
+            if cancellation_token is not None:
+                cancellation_token.check()
+
             tool_call = extract_tool_call(response)
 
             # No tool call → the model proposes a final answer. If the task is
@@ -1042,6 +1094,26 @@ class ReActAgent(BaseAgent):
             # non-dict arguments (e.g. a list) to an empty dict.
             if not isinstance(arguments, dict):
                 arguments = {}
+
+            if cancellation_token is not None:
+                cancellation_token.check()
+
+            try:
+                active_budget.check_tool_call()
+            except BudgetExceededError:
+                if run_state is not None:
+                    raise
+                outcome = f"Tool call budget exceeded ({active_budget.tool_calls_used}/{active_budget.max_tool_calls})"
+
+            if event_bus is not None:
+                event_bus.emit_sync(
+                    RuntimeEvent(
+                        event_type=RuntimeEventType.TOOL_STARTED,
+                        run_id=getattr(run_state, "run_id", "run_unknown"),
+                        task_id=getattr(task, "task_id", None) or getattr(run_state, "task_id", None),
+                        payload={"tool": tool_name, "arguments": arguments},
+                    )
+                )
 
             # CodingExecutor deterministic gate: a state-changing action that
             # has already failed identically (or a NEW action once the repair
@@ -1085,6 +1157,8 @@ class ReActAgent(BaseAgent):
             if isinstance(outcome, ChatMessage):
                 outcome = outcome.content
 
+            active_budget.record_tool_call(1)
+
             # Record the assistant's action and the tool observation so the
             # model can reason over its own previous steps — and mirror them
             # into the task transcript + history when a task is active, so
@@ -1122,6 +1196,18 @@ class ReActAgent(BaseAgent):
                         step.attempts += 1
                         step.error = str(outcome)[:300]
 
+            if event_bus is not None:
+                target, _ = _generic_target_content(tool_name, arguments)
+                succeeded = _observation_succeeded(str(outcome))
+                event_bus.emit_sync(
+                    RuntimeEvent(
+                        event_type=RuntimeEventType.TOOL_COMPLETED,
+                        run_id=getattr(run_state, "run_id", "run_unknown"),
+                        task_id=getattr(task, "task_id", None) or getattr(run_state, "task_id", None),
+                        payload={"tool": tool_name, "success": succeeded, "target": target},
+                    )
+                )
+
         # Iteration budget exhausted with an active task — never claim success.
         if task is not None and (
             task.requires_verification
@@ -1154,6 +1240,10 @@ class ReActAgent(BaseAgent):
             )
             # Fix #6: capture the incomplete-turn intelligence facts.
             _sync_task_memory(task)
+            if run_state is not None:
+                raise BudgetExceededError(
+                    f"Execution exceeded max_iterations ({active_budget.max_iterations})"
+                )
             return ChatMessage(
                 role=Role.ASSISTANT,
                 content=(
@@ -1161,6 +1251,10 @@ class ReActAgent(BaseAgent):
                     f"{detail}"
                 ),
                 task_state=task,
+            )
+        if run_state is not None:
+            raise BudgetExceededError(
+                f"Execution exceeded max_iterations ({active_budget.max_iterations})"
             )
         return ChatMessage(
             role=Role.ASSISTANT,

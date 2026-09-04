@@ -18,6 +18,14 @@ from datetime import UTC, datetime
 from pydantic import BaseModel
 
 
+class BudgetExceededError(RuntimeError):
+    """Raised when an execution budget limit is reached or exceeded."""
+
+    def __init__(self, reason: str = "Execution budget exceeded") -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class RuntimeBudget(BaseModel):
     """
     Execution constraints for an AgentRuntime execution.
@@ -32,6 +40,27 @@ class RuntimeBudget(BaseModel):
     tool_calls_used: int = 0
     delegations_used: int = 0
     started_at: datetime | None = None
+
+    def check_iteration(self) -> None:
+        """Raises BudgetExceededError if an additional iteration cannot be run."""
+        if self.iterations_used >= self.max_iterations:
+            raise BudgetExceededError(
+                f"Exceeded max_iterations limit ({self.iterations_used}/{self.max_iterations})"
+            )
+
+    def check_tool_call(self) -> None:
+        """Raises BudgetExceededError if an additional tool call cannot be run."""
+        if self.tool_calls_used >= self.max_tool_calls:
+            raise BudgetExceededError(
+                f"Exceeded max_tool_calls limit ({self.tool_calls_used}/{self.max_tool_calls})"
+            )
+
+    def check_delegation(self) -> None:
+        """Raises BudgetExceededError if an additional delegation cannot be run."""
+        if self.delegations_used >= self.max_delegations:
+            raise BudgetExceededError(
+                f"Exceeded max_delegations limit ({self.delegations_used}/{self.max_delegations})"
+            )
 
     def record_iteration(self, count: int = 1) -> None:
         """Records one reasoning/action iteration."""

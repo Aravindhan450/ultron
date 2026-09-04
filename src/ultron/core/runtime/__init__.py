@@ -8,7 +8,7 @@ Provides lifecycle management, budget enforcement, cooperative cancellation,
 and structured event observability for Ultron agents.
 """
 
-from ultron.core.runtime.budget import RuntimeBudget
+from ultron.core.runtime.budget import BudgetExceededError, RuntimeBudget
 from ultron.core.runtime.cancellation import CancellationToken
 from ultron.core.runtime.events import (
     EventBus,
@@ -32,6 +32,7 @@ __all__ = [
     "RUNTIME_TRANSITIONS",
     "TERMINAL_STATUSES",
     "AgentRuntime",
+    "BudgetExceededError",
     "CancellationToken",
     "EventBus",
     "EventListener",
