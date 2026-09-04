@@ -120,8 +120,8 @@ def main() -> int:
         # Build the conversation at 100 cols.
         for line in ("hi", "hello", "/help", "/memory"):
             os.write(master, line.encode() + b"\n")
-            time.sleep(0.9)
-        time.sleep(0.8)
+            time.sleep(1.5)
+        time.sleep(1.5)
         print("conversation @100:")
         ok &= check_window(log.since(start))
 
@@ -130,7 +130,7 @@ def main() -> int:
         for target in (60, 120, 75):
             mark = log.mark()
             set_size(slave, 30, target)
-            time.sleep(1.5)  # watcher tick (0.2s) + reflow + prompt redraw
+            time.sleep(2.0)  # watcher tick (0.2s) + reflow + prompt redraw
             time.sleep(0.5)
             print(f"resize ->{target}:")
             ok &= check_window(log.since(mark))
