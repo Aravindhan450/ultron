@@ -22,6 +22,7 @@ from ultron.core.memory.project_memory import (
     current_revision,
     project_memory_db_path,
 )
+from ultron.core.memory.provider import MemoryProvider
 from ultron.core.memory.session_memory import SessionMemory
 from ultron.core.memory.working_memory import WorkingMemory
 
@@ -30,6 +31,7 @@ __all__ = [
     "ContextManager",
     "MemoryConfidence",
     "MemoryKind",
+    "MemoryProvider",
     "MemoryRecord",
     "MemorySource",
     "MemoryValidity",

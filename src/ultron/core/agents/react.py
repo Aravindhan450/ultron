@@ -532,10 +532,9 @@ def _build_task_context_block(
         if intelligence:
             lines.append("")
             lines.append(intelligence)
-    # Fix #6: bounded, prioritized RELEVANT MEMORY (project facts about this
-    # workspace, session continuity). The ContextManager applies the budget
-    # and excludes stale/superseded records; current task/plan/observation
-    # facts above always outrank memory.
+    # Bounded, prioritized RELEVANT MEMORY (project facts about this
+    # workspace, session continuity) supplied by MemoryProvider.
+    # Current task/plan/observation facts above always outrank memory.
     memory_block = _build_memory_context_block(task, session)
     if memory_block:
         lines.append("")
@@ -559,16 +558,15 @@ def _build_memory_context_block(
     task: TaskState | None, session: SessionMemory | None
 ) -> str:
     """
-    Fix #6: the bounded RELEVANT MEMORY section for the current task.
+    The bounded RELEVANT MEMORY section for the current task.
 
     Project memory (workspace-scoped, valid records only) and session memory
-    are assembled by the ContextManager under its budget + priority rules.
-    Returns '' when neither store has anything relevant — memory never
-    floods the prompt.
+    are provided by MemoryProvider. Returns '' when neither store has anything
+    relevant — memory never floods the prompt.
     """
     if task is None or task.code_context is None:
         return ""
-    from ultron.core.memory.context_manager import ContextManager
+    from ultron.core.memory.provider import MemoryProvider
 
     store = task.code_context.ensure_project_memory()
     if store is None and (session is None or session.is_empty):
@@ -579,12 +577,26 @@ def _build_memory_context_block(
         workspace = str(
             getattr(task.code_context.workspace, "project_root", "") or ""
         )
-    return ContextManager().memory_block(
-        project_records=records,
-        session=session,
+
+    provider = MemoryProvider()
+    items = provider.provide_project_memory(
+        records=records,
         workspace=workspace,
         task_terms=_memory_task_terms(task),
+        max_records=6,
     )
+    session_items = provider.provide_session_memory(session)
+
+    if not items and not session_items:
+        return ""
+
+    blocks: list[str] = []
+    if items:
+        blocks.append("PROJECT MEMORY:\n" + "\n".join(it.content for it in items))
+    if session_items:
+        blocks.append("SESSION MEMORY:\n" + "\n".join(it.content for it in session_items))
+
+    return "\n\n".join(blocks)
 
 
 def _sync_task_memory(task: TaskState | None) -> None:
@@ -901,6 +913,7 @@ class ReActAgent(BaseAgent):
         history: list[ChatMessage] | None = None,
         task: TaskState | None = None,
         session: SessionMemory | None = None,
+        context_snapshot: Any | None = None,
     ) -> ChatMessage:
         """
         Executes the ReAct loop for a single user turn (or a task continuation).

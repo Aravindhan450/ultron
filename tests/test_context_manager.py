@@ -303,3 +303,80 @@ def test_context_manager_memory_provider_integration(sandbox):
     )
     assert snapshot.total_estimated_tokens > 0
     assert any("Project Fact" in item.title or "Session Memory" in item.title for item in snapshot.items)
+
+
+def test_react_agent_uses_memory_provider_not_legacy_context_manager():
+    import inspect
+
+    import ultron.core.agents.react as react_module
+
+    source = inspect.getsource(react_module)
+    assert "from ultron.core.memory.context_manager import ContextManager" not in source
+    assert "MemoryProvider" in source
+
+
+def test_legacy_context_manager_delegation_to_memory_provider(sandbox):
+    from ultron.core.memory.context_manager import ContextManager
+    from ultron.core.memory.models import (
+        MemoryConfidence,
+        MemoryKind,
+        MemoryRecord,
+        MemorySource,
+    )
+    from ultron.core.memory.session_memory import SessionMemory
+
+    records = [
+        MemoryRecord(
+            kind=MemoryKind.PROJECT,
+            name="auth_service",
+            content="Authentication uses JWT tokens",
+            source=MemorySource.CODE_INTELLIGENCE,
+            confidence=MemoryConfidence.DIRECT_OBSERVATION,
+            workspace=str(sandbox),
+        ),
+    ]
+    session = SessionMemory()
+    session.note_request("User requested login feature")
+
+    legacy_cm = ContextManager()
+    mem_block = legacy_cm.memory_block(
+        project_records=records,
+        session=session,
+        workspace=str(sandbox),
+        task_terms=["auth"],
+    )
+    assert "PROJECT MEMORY:" in mem_block
+    assert "JWT tokens" in mem_block
+    assert "SESSION MEMORY:" in mem_block
+    assert "login feature" in mem_block
+
+
+def test_canonical_pipeline_agent_runtime_to_react(sandbox):
+    import asyncio
+
+    from ultron.core.agents.react import ReActAgent
+
+    class PipelineFakeEngine:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.calls = []
+
+        async def generate(self, messages, **kwargs):
+            self.calls.append(messages)
+            return self.responses.pop(0) if self.responses else "Done."
+
+    async def _test():
+        engine = PipelineFakeEngine(["I have inspected the context."])
+        agent = ReActAgent(engine=engine)
+        runtime = AgentRuntime()
+        task = TaskState(goal="Inspect context pipeline")
+
+        result = await runtime.execute(agent, "Inspect context", task=task)
+        assert result.is_success
+        assert result.context_snapshot is not None
+        assert any(item.title == "User Request" for item in result.context_snapshot.items)
+        assert any(item.title == "Active Task State" for item in result.context_snapshot.items)
+        assert len(engine.calls) > 0
+
+    asyncio.run(_test())
+

@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
-from ultron.core.coding.context import CodeContext
-from ultron.core.coding.workspace import CodingWorkspace
 from ultron.core.context.models import (
     ContextItem,
     ContextPriority,
@@ -21,11 +19,13 @@ from ultron.core.context.models import (
     ContextSourceType,
 )
 from ultron.core.context.retrieval import RepositoryRetriever, estimate_tokens
-from ultron.core.memory.session_memory import SessionMemory
-from ultron.core.types import TaskState
 
 if TYPE_CHECKING:
+    from ultron.core.coding.context import CodeContext
+    from ultron.core.coding.workspace import CodingWorkspace
     from ultron.core.memory.provider import MemoryProvider
+    from ultron.core.memory.session_memory import SessionMemory
+    from ultron.core.types import TaskState
 
 
 class ContextBudgetConfig(BaseModel):

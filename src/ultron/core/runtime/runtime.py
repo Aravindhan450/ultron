@@ -114,7 +114,7 @@ class AgentRuntime:
             )
 
         # Prepare execution coroutine with agent
-        # We pass task/session if the agent's run() supports it (like ReActAgent)
+        # We pass task/session/context_snapshot if the agent's run() supports it (like ReActAgent)
         async def _run_agent() -> ChatMessage:
             kwargs: dict[str, Any] = {}
             import inspect
@@ -123,6 +123,8 @@ class AgentRuntime:
                 kwargs["task"] = task
             if "session" in sig.parameters:
                 kwargs["session"] = session
+            if "context_snapshot" in sig.parameters:
+                kwargs["context_snapshot"] = context_snapshot
 
             return await agent.run(user_input, history, **kwargs)
 
