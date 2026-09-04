@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from ultron.core.context.models import ContextSnapshot
 from ultron.core.runtime.state import RunState, RuntimeStatus
 from ultron.core.types import ChatMessage, TaskState
 
@@ -22,6 +23,7 @@ class RunResult(BaseModel):
     status: RuntimeStatus
     message: ChatMessage | None = None
     task_state: TaskState | None = None
+    context_snapshot: ContextSnapshot | None = None
     run_state: RunState
     evidence: list[str] = Field(default_factory=list)
     changed_files: list[str] = Field(default_factory=list)

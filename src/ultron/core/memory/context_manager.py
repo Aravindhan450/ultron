@@ -36,15 +36,11 @@ Rules:
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from pydantic import BaseModel, Field
 
 from ultron.core.memory.models import (
-    MemoryConfidence,
     MemoryKind,
     MemoryRecord,
-    MemoryValidity,
 )
 from ultron.core.memory.session_memory import SessionMemory
 from ultron.core.memory.working_memory import WorkingMemory
@@ -199,64 +195,37 @@ class ContextManager(BaseModel):
         workspace: str,
         task_terms: list[str],
     ) -> str:
-        valid = [
-            r
-            for r in _records_for_kind(records, MemoryKind.PROJECT)
-            if r.validity is MemoryValidity.VALID
-        ]
-        if not valid:
+        from ultron.core.memory.provider import MemoryProvider
+
+        items = MemoryProvider().provide_project_memory(
+            records=records,
+            workspace=workspace,
+            task_terms=task_terms,
+            max_records=6,
+        )
+        if not items:
             return ""
-        # Prefer workspace-scoped records for project tasks (exact match on
-        # resolved paths — a substring test could conflate sibling dirs).
-        try:
-            resolved_workspace = str(Path(workspace).resolve()) if workspace else ""
-        except (OSError, ValueError):
-            resolved_workspace = workspace
-        scoped = [
-            r
-            for r in valid
-            if r.workspace
-            and resolved_workspace
-            and str(Path(r.workspace).resolve()) == resolved_workspace
-        ]
-        pool = scoped or valid
-        # Cheap deterministic relevance: shared keyword between fact and task.
-        if task_terms:
-            keywords = [t.lower() for t in task_terms if len(t) >= 3]
-            ranked = sorted(
-                pool,
-                key=lambda r: -sum(
-                    1 for k in keywords if k in (r.name + " " + r.content).lower()
-                ),
-            )
-            pool = ranked
-        lines = [r.to_prompt_line() for r in pool[:6]]
+        lines = [item.content for item in items]
         return _clip("\n".join(lines), self.budget.max_project_memory_chars)
 
     def _section_session(self, session: SessionMemory | None) -> str:
-        if session is None or session.is_empty:
+        from ultron.core.memory.provider import MemoryProvider
+
+        items = MemoryProvider().provide_session_memory(session)
+        if not items:
             return ""
-        return _clip(
-            "\n".join(session.to_context_lines()),
-            self.budget.max_session_chars,
-        )
+        return _clip(items[0].content, self.budget.max_session_chars)
 
     def _section_long_term(
         self, records: list[MemoryRecord] | None
     ) -> str:
-        valid = [
-            r
-            for r in _records_for_kind(records, MemoryKind.LONG_TERM)
-            if r.validity is MemoryValidity.VALID
-            and r.confidence
-            not in (MemoryConfidence.INFERRED, MemoryConfidence.UNKNOWN)
-        ]
-        if not valid:
+        from ultron.core.memory.provider import MemoryProvider
+
+        items = MemoryProvider().provide_long_term_memory(records, max_records=6)
+        if not items:
             return ""
-        return _clip(
-            "\n".join(r.to_prompt_line() for r in valid[:6]),
-            self.budget.max_long_term_chars,
-        )
+        lines = [item.content for item in items]
+        return _clip("\n".join(lines), self.budget.max_long_term_chars)
 
     # ------------------------------------------------------------------
     # Assembly

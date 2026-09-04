@@ -8,7 +8,7 @@ deduplication, token budgeting, and compaction.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
@@ -23,6 +23,9 @@ from ultron.core.context.models import (
 from ultron.core.context.retrieval import RepositoryRetriever, estimate_tokens
 from ultron.core.memory.session_memory import SessionMemory
 from ultron.core.types import TaskState
+
+if TYPE_CHECKING:
+    from ultron.core.memory.provider import MemoryProvider
 
 
 class ContextBudgetConfig(BaseModel):
@@ -47,9 +50,16 @@ class RepositoryContextManager:
         self,
         workspace: CodingWorkspace | None = None,
         budget: ContextBudgetConfig | None = None,
+        memory_provider: MemoryProvider | None = None,
     ) -> None:
         self.retriever = RepositoryRetriever(workspace=workspace)
         self.budget = budget or ContextBudgetConfig()
+        if memory_provider is None:
+            from ultron.core.memory.provider import MemoryProvider as _MemoryProvider
+
+            self.memory_provider = _MemoryProvider()
+        else:
+            self.memory_provider = memory_provider
         self._last_snapshot: ContextSnapshot | None = None
 
     @property
@@ -190,21 +200,26 @@ class RepositoryContextManager:
                     )
                 )
 
-        # 9. Session Memory Context
-        if session is not None and not session.is_empty:
-            sess_lines = session.to_context_lines()
-            if sess_lines:
-                sess_body = "\n".join(sess_lines)
-                raw_items.append(
-                    ContextItem(
-                        source_type=ContextSourceType.SESSION_MEMORY,
-                        priority=ContextPriority.SESSION_MEMORY,
-                        title="Session Memory",
-                        content=sess_body,
-                        target="session_memory",
-                        estimated_tokens=estimate_tokens(sess_body),
+        # 9. Project & Session Memory Context via MemoryProvider
+        if task is not None and task.code_context is not None:
+            store = task.code_context.ensure_project_memory()
+            if store is not None:
+                records = store.recall(limit=40)
+                ws_root = (
+                    str(getattr(task.code_context.workspace, "project_root", ""))
+                    if task.code_context.workspace
+                    else ""
+                )
+                raw_items.extend(
+                    self.memory_provider.provide_project_memory(
+                        records=records,
+                        workspace=ws_root,
+                        task_terms=[task.goal] if task.goal else None,
                     )
                 )
+
+        if session is not None and not session.is_empty:
+            raw_items.extend(self.memory_provider.provide_session_memory(session))
 
         # 10. Structured Artifacts
         if artifacts:
@@ -232,6 +247,32 @@ class RepositoryContextManager:
         # Render prompt text
         blocks = [item.prompt_block() for item in accepted_items]
         return "\n\n".join(blocks)
+
+    def assemble_snapshot(
+        self,
+        user_request: str,
+        task: TaskState | None = None,
+        code_context: CodeContext | None = None,
+        session: SessionMemory | None = None,
+        requested_files: list[str] | None = None,
+        candidate_symbols: list[str] | None = None,
+        search_queries: list[str] | None = None,
+        artifacts: list[Any] | None = None,
+    ) -> ContextSnapshot:
+        """
+        Assembles context and returns the structured ContextSnapshot directly.
+        """
+        self.build_context(
+            user_request=user_request,
+            task=task,
+            code_context=code_context,
+            session=session,
+            requested_files=requested_files,
+            candidate_symbols=candidate_symbols,
+            search_queries=search_queries,
+            artifacts=artifacts,
+        )
+        return self._last_snapshot or ContextSnapshot()
 
     def _deduplicate(self, items: list[ContextItem]) -> list[ContextItem]:
         """

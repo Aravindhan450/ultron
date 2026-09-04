@@ -84,6 +84,15 @@ class AgentRuntime:
 
         run_state.transition_to(RuntimeStatus.RUNNING)
 
+        # Assemble context snapshot for this run using canonical RepositoryContextManager
+        code_ctx = getattr(task, "code_context", None) if task else None
+        context_snapshot = self.context_manager.assemble_snapshot(
+            user_request=user_input,
+            task=task,
+            code_context=code_ctx,
+            session=session,
+        )
+
         # Check early cancellation
         if token.is_cancelled:
             run_state.request_cancellation(token.reason or "Cancelled before start")
@@ -100,6 +109,7 @@ class AgentRuntime:
                 run_id=run_id,
                 status=RuntimeStatus.CANCELLED,
                 run_state=run_state,
+                context_snapshot=context_snapshot,
                 termination_reason=token.reason or "Cancelled before start",
             )
 
@@ -156,6 +166,7 @@ class AgentRuntime:
                 status=RuntimeStatus.COMPLETED,
                 message=response_msg,
                 task_state=resolved_task,
+                context_snapshot=context_snapshot,
                 run_state=run_state,
                 changed_files=changed_files,
                 evidence=evidence,
@@ -176,6 +187,7 @@ class AgentRuntime:
                 run_id=run_id,
                 status=RuntimeStatus.TIMED_OUT,
                 task_state=task,
+                context_snapshot=context_snapshot,
                 run_state=run_state,
                 error=run_state.error,
                 termination_reason="Execution timed out",
@@ -196,6 +208,7 @@ class AgentRuntime:
                 run_id=run_id,
                 status=RuntimeStatus.CANCELLED,
                 task_state=task,
+                context_snapshot=context_snapshot,
                 run_state=run_state,
                 termination_reason=run_state.cancellation_reason or "Run cancelled",
             )
@@ -216,6 +229,7 @@ class AgentRuntime:
                 run_id=run_id,
                 status=RuntimeStatus.FAILED,
                 task_state=task,
+                context_snapshot=context_snapshot,
                 run_state=run_state,
                 error=err_msg,
                 termination_reason=f"Runtime error: {err_msg}",

@@ -210,5 +210,96 @@ def test_runtime_context_manager_integration(sandbox):
         result = await runtime.execute(agent, "Hello Ultron", task=task)
         assert result.is_success
         assert runtime.context_manager is not None
+        assert result.context_snapshot is not None
+        assert result.context_snapshot.total_estimated_tokens > 0
+        assert any(item.title == "User Request" for item in result.context_snapshot.items)
 
     asyncio.run(_test())
+
+
+def test_runtime_context_snapshot_on_cancellation(sandbox):
+    import asyncio
+
+    from ultron.core.runtime import CancellationToken
+
+    async def _test():
+        runtime = AgentRuntime()
+        agent = MockAgent()
+        token = CancellationToken()
+        token.cancel("Cancelled by user")
+
+        result = await runtime.execute(agent, "Hello Ultron", cancellation_token=token)
+        assert not result.is_success
+        assert result.context_snapshot is not None
+        assert result.context_snapshot.total_estimated_tokens > 0
+
+    asyncio.run(_test())
+
+
+def test_context_manager_memory_provider_integration(sandbox):
+    from ultron.core.memory.models import (
+        MemoryConfidence,
+        MemoryKind,
+        MemoryRecord,
+        MemorySource,
+    )
+    from ultron.core.memory.provider import MemoryProvider
+    from ultron.core.memory.session_memory import SessionMemory
+
+    provider = MemoryProvider()
+    records = [
+        MemoryRecord(
+            kind=MemoryKind.PROJECT,
+            name="auth_service",
+            content="Authentication uses JWT tokens",
+            source=MemorySource.CODE_INTELLIGENCE,
+            confidence=MemoryConfidence.DIRECT_OBSERVATION,
+            workspace=str(sandbox),
+        ),
+        MemoryRecord(
+            kind=MemoryKind.LONG_TERM,
+            name="user_pref",
+            content="User prefers pytest over unittest",
+            source=MemorySource.USER,
+            confidence=MemoryConfidence.USER_PROVIDED,
+        ),
+    ]
+
+    # Test MemoryProvider methods directly
+    proj_items = provider.provide_project_memory(records, workspace=str(sandbox), task_terms=["auth"])
+    assert len(proj_items) == 1
+    assert proj_items[0].target == "auth_service"
+    assert "JWT tokens" in proj_items[0].content
+
+    session = SessionMemory()
+    session.note_request("User requested login feature")
+    session_items = provider.provide_session_memory(session)
+    assert len(session_items) == 1
+    assert "login feature" in session_items[0].content
+
+    lt_items = provider.provide_long_term_memory(records)
+    assert len(lt_items) == 1
+    assert "pytest" in lt_items[0].content
+
+    # Test assemble_snapshot with memory items
+    cm = RepositoryContextManager(workspace=discover_workspace(str(sandbox)), memory_provider=provider)
+    task = TaskState(goal="Update authentication")
+    code_ctx = CodeContext(workspace=cm.retriever.workspace)
+    task.code_context = code_ctx
+    mem_store = code_ctx.ensure_project_memory()
+    if mem_store is not None:
+        mem_store.store(
+            "auth_service",
+            "Authentication uses JWT tokens",
+            source=MemorySource.CODE_INTELLIGENCE,
+            confidence=MemoryConfidence.DIRECT_OBSERVATION,
+        )
+
+    snapshot = cm.assemble_snapshot(
+        user_request="Update authentication logic",
+        task=task,
+        code_context=code_ctx,
+        session=session,
+    )
+    assert snapshot.total_estimated_tokens > 0
+    assert any("Project Fact" in item.title or "Session Memory" in item.title for item in snapshot.items)
