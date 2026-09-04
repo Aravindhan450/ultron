@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     model: str = "gemini-2.5-flash"
     llama_cpp_base_url: str = "http://127.0.0.1:8080"
     timeout: float = 120.0
+    llama_server_binary: str = "llama-server"
+    llama_server_model_path: str | None = None
+    llama_server_host: str = "127.0.0.1"
+    llama_server_port: int = 8080
+    llama_server_context_length: int = 32768
+    llama_server_gpu_layers: int = 99
+    llama_server_startup_timeout: float = 60.0
+    llama_server_shutdown_timeout: float = 5.0
     wake_word: str = "ultron"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     data_dir: Path = Field(default_factory=lambda: Path.home() / ".ultron")
@@ -26,6 +34,7 @@ class Settings(BaseSettings):
     security_mode: Literal["strict", "permissive", "interactive"] = "interactive"
     database_type: Literal["sqlite", "postgres"] = "sqlite"
     database_url: str | None = None
+
 
 # Global settings singleton
 settings = Settings()

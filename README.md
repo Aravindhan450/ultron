@@ -43,12 +43,8 @@ Ultron is under active development. The core is real and usable today:
 ## Requirements
 
 - Python **3.11+**
-- `llama.cpp` (`llama-server`) running locally with a GGUF model:
-
-```bash
-llama-server -m /path/to/model.gguf -ngl 99 -c 32768 --port 8080 --host 127.0.0.1
-```
-
+- `llama.cpp` installed locally (e.g. `brew install llama.cpp`)
+- A local GGUF model file configured via `ULTRON_LLAMA_SERVER_MODEL_PATH` or located in `~/models/*.gguf`.
 
 ## Installation
 
@@ -91,12 +87,17 @@ All settings can also be set via environment variables prefixed with `ULTRON_`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ULTRON_MODEL` | `default` | Active model identifier — synced with `llama-server` loaded model or switched at runtime with `/model` |
-| `ULTRON_LLAMA_CPP_BASE_URL` | `http://127.0.0.1:8080` | Endpoint of the running `llama-server` instance |
+| `ULTRON_LLAMA_SERVER_MODEL_PATH` | — | Path to the local `.gguf` model file to serve |
+| `ULTRON_LLAMA_SERVER_BINARY` | `llama-server` | Binary name or full path to the `llama-server` executable |
+| `ULTRON_LLAMA_SERVER_HOST` | `127.0.0.1` | Host address for `llama-server` |
+| `ULTRON_LLAMA_SERVER_PORT` | `8080` | Port for `llama-server` |
+| `ULTRON_LLAMA_SERVER_GPU_LAYERS` | `99` | Number of model layers to offload to GPU/Metal |
+| `ULTRON_LLAMA_SERVER_CONTEXT_LENGTH` | `32768` | Context window size |
+| `ULTRON_MODEL` | `default` | Active model identifier — synced with loaded GGUF |
 | `ULTRON_SECURITY_MODE` | `interactive` | Security mode for the boundary: `permissive`, `interactive`, or `strict` |
 | `ULTRON_WAKE_WORD` | `ultron` | Wake word for the planned voice mode |
 | `ULTRON_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `ULTRON_DATA_DIR` | `~/.ultron` | Where the log file (`ultron.log`) is written |
+| `ULTRON_DATA_DIR` | `~/.ultron` | Where the log file (`ultron.log`) and `llama-server.log` are written |
 | `ULTRON_DATABASE_TYPE` | `sqlite` | Backend for the DB query tool: `sqlite` or `postgres` |
 
 `ULTRON_MEMORY_BACKEND` and `ULTRON_WAKE_WORD` are reserved for upcoming features and not yet enforced. `ULTRON_SECURITY_MODE` drives the security boundary's decisions (see [Security model](#security-model)); the boundary is wired into the agent tool-call flow — every tool call in both the simple and ReAct agents is routed through `boundary.check()` before execution.
@@ -107,7 +108,7 @@ All settings can also be set via environment variables prefixed with `ULTRON_`.
 
 ### Start chatting
 
-Make sure `llama-server` is running first (see [Requirements](#requirements)), then:
+Ultron automatically starts and manages `llama-server` for your chat session:
 
 ```bash
 ultron chat
@@ -118,6 +119,9 @@ Launch with the ReAct agent instead:
 ```bash
 ultron chat --agent react
 ```
+
+When you exit (via `/exit`, `/quit`, or `Ctrl+C`), Ultron cleanly terminates only the `llama-server` instance it started. If an existing `llama-server` is already active on the port, Ultron safely connects without hijacking or terminating it.
+
 
 The chat session opens a **responsive Rich UI**: an adaptive banner, Markdown-rendered responses, and a prompt with a live bottom toolbar showing the active model, agent, status, and security mode. The whole interface is terminal-width-aware — narrow the window and the banner degrades to a compact wordmark, the toolbar drops non-essential segments, and panels tighten, so nothing ever wraps or breaks. Resize mid-session and the prompt + toolbar re-flow instantly. Type naturally — *"read config.py"*, *"create notes.txt with hello in it"*, *"what did I tell you about FastAPI?"*. Risky actions render a confirmation card that you approve or reject. Read-only actions execute immediately and their results are shown.
 

@@ -4,6 +4,7 @@ import typer
 
 from ultron import __version__
 from ultron.core.config import settings
+from ultron.core.engine.server import LlamaServerManager
 from ultron.core.intelligence.prompt_assembly import build_response_guidance
 from ultron.core.logging import get_logger
 from ultron.core.types import ChatMessage, PendingAction, TaskState
@@ -908,12 +909,16 @@ async def async_chat(agent_type: str = "simple"):
             # None and stay on the fast path (no plan, no extra LLM call). A
             # request that genuinely needs clarification is surfaced to the
             # user instead of executing blindly.
+            from ultron.core.runtime import AgentRuntime
+
+            runtime = AgentRuntime()
             prepared_task = None
 
             async def _plan_and_run(
                 _agent=agent,
                 _input=trimmed_input,
                 _history=truncated_history,
+                _runtime=runtime,
             ):
                 nonlocal prepared_task
                 if isinstance(_agent, ReActAgent):
@@ -940,21 +945,29 @@ async def async_chat(agent_type: str = "simple"):
                         if resumed is None:
                             return None
                         prepared_task = resumed
-                        return await _agent.run(
+                        run_res = await _runtime.execute(
+                            _agent,
                             resumed.goal,
                             _history,
                             task=resumed,
                             session=memory_session,
                         )
+                        return run_res.message
                     prepared_task = await prepare_task_for_execution(
                         _input, _agent.engine
                     )
                     if prepared_task is not None and prepared_task.clarification_required:
                         return None
-                    return await _agent.run(
-                        _input, _history, task=prepared_task, session=memory_session
+                    run_res = await _runtime.execute(
+                        _agent,
+                        _input,
+                        _history,
+                        task=prepared_task,
+                        session=memory_session,
                     )
-                return await _agent.run(_input, _history)
+                    return run_res.message
+                run_res = await _runtime.execute(_agent, _input, _history)
+                return run_res.message
 
             state.status = "Thinking..."
             agent_task = asyncio.create_task(_plan_and_run())
@@ -1195,10 +1208,29 @@ def chat(
         help="Agent type to use (simple or react).",
     ),
 ):
-    """
-    Start an interactive text chat session with Ultron.
-    """
-    asyncio.run(async_chat(agent_type=agent))
+    async def _run_chat_session():
+        server_manager = LlamaServerManager()
+        server_started = False
+        try:
+            # If server is already running, we verify endpoint without hijacking
+            if not server_manager.check_endpoint_occupied():
+                UI.render_status("Starting local llama-server...", status="info")
+                try:
+                    server_manager.start()
+                    server_started = True
+                    UI.render_status("llama-server is ready.", status="success")
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Failed to start llama-server: %s", exc)
+                    UI.render_error(str(exc), title="Server Startup Error")
+                    return
+            await async_chat(agent_type=agent)
+        finally:
+            if server_started:
+                UI.render_status("Stopping local llama-server...", status="info")
+                server_manager.stop()
+
+    asyncio.run(_run_chat_session())
+
 
 @app.command()
 def logs(

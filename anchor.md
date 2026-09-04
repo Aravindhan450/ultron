@@ -167,3 +167,54 @@ Project Ultron is undergoing an **Ollama → llama.cpp / llama-server** migratio
   - Model-in-the-loop: 10 / 10 scenarios passed against live Metal GPU `llama-server`.
   - Full pytest suite: 1,609 / 1,609 passed (100%).
   - Ruff lint: Clean (0 errors).
+
+### Phase 8: Llama-Server Session Lifecycle Implementation — [COMPLETED & VERIFIED]
+- **Component Added**:
+  - `src/ultron/core/engine/server.py`: Implemented `LlamaServerManager` to manage `llama-server` subprocess lifecycle.
+  - Safe binary & model path resolution, isolated process group spawning (`start_new_session=True`), readiness polling via `GET /v1/models`, safe refusal to hijack existing running servers, and idempotent process-group termination (`SIGTERM` -> timeout -> `SIGKILL`).
+- **CLI Wiring**:
+  - `src/ultron/main.py`: Wrapped `async_chat()` in a `try...finally` block ensuring `server_manager.start()` executes before chat initialization and `server_manager.stop()` cleanly terminates ONLY the started instance upon exit, interrupt (Ctrl+C), or exception.
+- **Settings Added**:
+  - `ULTRON_LLAMA_SERVER_BINARY`, `ULTRON_LLAMA_SERVER_MODEL_PATH`, `ULTRON_LLAMA_SERVER_HOST`, `ULTRON_LLAMA_SERVER_PORT`, `ULTRON_LLAMA_SERVER_CONTEXT_LENGTH`, `ULTRON_LLAMA_SERVER_GPU_LAYERS`, `ULTRON_LLAMA_SERVER_STARTUP_TIMEOUT`, `ULTRON_LLAMA_SERVER_SHUTDOWN_TIMEOUT`.
+- **Test Results**:
+  - Unit tests in `tests/test_llama_server_manager.py`: 12 / 12 passed.
+  - Full pytest suite: 1,621 / 1,621 passed (100%).
+  - Ruff lint: Clean (0 errors).
+  - Real Model-in-the-Loop: Verified auto-spawning, prompt interaction, and clean teardown upon exit.
+
+---
+
+## 5. Freebuff-Standards Coding Agent Upgrade Tracking
+
+### Phase 1: AgentRuntime Foundation — [COMPLETED & VERIFIED]
+- **Package Created**: `src/ultron/core/runtime/`
+  - `__init__.py`: Public API exports.
+  - `runtime.py`: `AgentRuntime` lifecycle coordinator.
+  - `state.py`: Explicit `RunState` and `RuntimeStatus` state machine with deterministic transition verification (`assert_runtime_transition`).
+  - `budget.py`: `RuntimeBudget` enforcing iterations, tool calls, delegations, and wall-clock timeouts.
+  - `cancellation.py`: Cooperative `CancellationToken` mechanism.
+  - `events.py`: Lightweight in-process `EventBus` with typed `RuntimeEvent` history.
+  - `result.py`: Structured `RunResult` containing outcome status, evidence, changed files, and termination reason.
+- **Integration**:
+  - `src/ultron/main.py`: Wired CLI execution paths through `AgentRuntime.execute(...)` for all `ReActAgent` and `SimpleAgent` runs while preserving `SecurityBoundary` authorization.
+- **Test Suite**:
+  - Created `tests/test_agent_runtime.py` covering lifecycle, budget limits, timeout, cancellation, and event emissions.
+  - Pytest baseline: **1,632 / 1,632 passed (100%)**.
+  - Ruff lint: Clean (0 errors).
+- **Model-in-the-Loop Validation**:
+  - Verified repository inspection task and safe coding task against live local `llama-server` on Apple Metal GPU.
+
+### Phase 2: Repository-Aware ContextManager Foundation — [COMPLETED & VERIFIED]
+- **Package Created**: `src/ultron/core/context/`
+  - `__init__.py`: Public exports.
+  - `models.py`: `ContextItem`, `ContextPriority`, `ContextRetrievalResult`, `ContextRetrievalStatus`, `ContextSnapshot`, `ContextSourceType`.
+  - `retrieval.py`: `RepositoryRetriever` querying files (with region bounding), AST symbols/references, lexical code search, and Git state with explicit `NOT_FOUND` contracts and path safety.
+  - `manager.py`: `RepositoryContextManager` assembling multi-source context, enforcing `ContextBudgetConfig`, signature-based deduplication, prioritized compaction, and emitting observable snapshots.
+- **Integration**:
+  - `src/ultron/core/runtime/runtime.py`: Integrated `RepositoryContextManager` into `AgentRuntime` lifecycle coordinator.
+- **Test Suite**:
+  - Created `tests/test_context_manager.py` (9/9 unit tests passing).
+  - Pytest suite upgraded: **1,641 / 1,641 passed (100%)**.
+  - Ruff status: Clean (0 errors).
+- **Model-in-the-Loop Validation**:
+  - 4 real live model scenarios executed against Metal GPU `llama-server` (Repository discovery, context retrieval, missing resource `NOT_FOUND` reporting, and automated tool/test execution).
