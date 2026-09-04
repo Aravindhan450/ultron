@@ -167,54 +167,75 @@ async def handle_slash_command(
         print_help_table(console)
         return True, False
 
-    if clean_cmd == "/model":
-        import questionary
+    if clean_cmd == "/model" or clean_cmd.startswith("/model "):
+        from ultron.core.config import settings
 
-        from ultron.core.config import settings, update_env_file
+        backend_name = "llama.cpp (llama-server)"
+        base_url = (
+            getattr(agent.engine, "base_url", settings.llama_cpp_base_url)
+            if agent and hasattr(agent, "engine")
+            else settings.llama_cpp_base_url
+        )
 
-        models: list[str] = []
-        if agent and hasattr(agent, "engine") and hasattr(agent.engine, "list_models"):
+        server_model: str | None = None
+        if agent and hasattr(agent, "engine") and hasattr(agent.engine, "get_active_model"):
+            server_model = await agent.engine.get_active_model()
+        elif agent and hasattr(agent, "engine") and hasattr(agent.engine, "list_models"):
             models = await agent.engine.list_models()
+            server_model = models[0] if models else None
 
-        if not models:
-            console.print(f"[bold {RED}]No local models found or failed to fetch model list from Ollama.[/bold {RED}]\n")
-            return True, False
-
-        old_model = state.active_model if state else (getattr(session, "active_model", settings.model) if session else settings.model)
-
-        selected_model = await questionary.select(
-            "Select model:",
-            choices=models,
-            default=old_model if old_model in models else models[0],
-        ).ask_async()
-
-        if selected_model:
-            import os
+        # Synchronize active model state with true server reality when reachable
+        if server_model:
+            effective_model = server_model
             if state:
-                state.active_model = selected_model
+                state.active_model = effective_model
             if session:
-                session.active_model = selected_model
-            settings.model = selected_model
-            os.environ["ULTRON_MODEL"] = selected_model
+                session.active_model = effective_model
             if agent and hasattr(agent, "engine"):
                 if hasattr(agent.engine, "set_model"):
-                    agent.engine.set_model(selected_model)
+                    agent.engine.set_model(effective_model)
                 else:
-                    agent.engine.default_model = selected_model
-                    agent.engine.model = selected_model
-            update_env_file("ULTRON_MODEL", selected_model)
-            # Refresh the banner in place: the resize reflow replays it from a
-            # rebuild block that reads the current model, so re-running that
-            # block shows the new model without wiping the conversation.
-            if reflow is not None:
-                reflow.rebuild()
-
-            console.print(
-                f"[{GREEN}]✓[/{GREEN}] Switched model  "
-                f"[{MUTED}]{old_model}[/{MUTED}] → [bold {ACCENT}]{selected_model}[/bold {ACCENT}]"
+                    agent.engine.default_model = effective_model
+                    agent.engine.model = effective_model
+        else:
+            effective_model = (
+                state.active_model
+                if state
+                else (getattr(session, "active_model", settings.model) if session else settings.model)
             )
 
+        console.print(f"[bold {ACCENT}]🧠 Model & Backend Status:[/bold {ACCENT}]")
+        console.print(f"  [{MUTED}]Active Server Model:[/{MUTED}] [bold {TEXT}]{effective_model}[/bold {TEXT}]")
+        console.print(f"  [{MUTED}]Backend:[/{MUTED}]             [bold {TEXT}]{backend_name}[/bold {TEXT}]")
+        console.print(f"  [{MUTED}]Server Endpoint:[/{MUTED}]     [bold {TEXT}]{base_url}[/bold {TEXT}]")
+
+        parts = clean_cmd.split(maxsplit=1)
+        if len(parts) > 1:
+            requested_model = parts[1].strip()
+            if requested_model:
+                if server_model and (
+                    requested_model == server_model
+                    or requested_model == server_model.split("/")[-1]
+                    or requested_model == "default"
+                ):
+                    console.print(f"[{GREEN}]✓[/{GREEN}] Model '{requested_model}' matches currently loaded server model.\n")
+                    return True, False
+
+                # Reject attempted switch to an unloaded/different model
+                console.print(
+                    f"\n[bold {YELLOW}]Notice:[/bold {YELLOW}] Dynamic model switching is not supported by llama-server.\n"
+                    f"llama-server serves a single loaded GGUF model per process.\n"
+                    f"To switch to [bold {TEXT}]{requested_model}[/bold {TEXT}], stop the current server and restart it with:\n"
+                    f"  [bold {ACCENT}]llama-server -m /path/to/{requested_model}.gguf -ngl 99[/bold {ACCENT}]\n"
+                )
+                return True, False
+
+        console.print(
+            f"[{MUTED}]Note: llama-server serves the loaded GGUF directly. To switch models, restart llama-server with a different -m <model.gguf>.[/{MUTED}]\n"
+        )
         return True, False
+
+
 
     if clean_cmd == "/agent" or clean_cmd.startswith("/agent "):
         import questionary

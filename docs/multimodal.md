@@ -7,9 +7,9 @@
 ## Motivation
 
 Ultron can read files, but a `read chart.png` returns binary garbage — images
-were invisible to the model. Modern vision-capable local models (llava,
-qwen2.5vl, etc., via Ollama) can interpret pictures, but the agent had no way
-to *send* them: no detector, no handler, no capability check.
+were invisible to the model. Vision-capable models (e.g. Qwen2.5-VL, LLaVA,
+MiniCPM-V via llama.cpp / llama-server) can interpret pictures when started
+with a multimodal projector (`--mmproj`).
 
 This upgrade closes that gap: attach an image (a diagram, chart, graph, or
 handwritten sketch) and Ultron reasons across the modality — describing what
@@ -19,9 +19,7 @@ it shows, explaining the data, or writing code that implements the diagram.
 
 ### How it works
 
-Ollama's `/api/chat` accepts an `images` array (base64-encoded) on any
-message, and the engine already passes messages straight through. So the
-feature is mostly agent-side:
+The agent builds a backend-neutral message structure with image data, and `LlamaCppEngine` translates it to standard OpenAI-compatible chat completion image payloads (`image_url` data URIs) sent to `llama-server`'s `/v1/chat/completions`:
 
 1. **Detector** — `detect_image_intent` recognizes vision phrasing
    ("analyze this chart.png", "look at the graph in plot.png", "what's in
@@ -36,10 +34,9 @@ feature is mostly agent-side:
    base64-encodes it, and sends it to the engine as an image part alongside a
    prompt derived from the user's request ("interpret the visual data
    precisely and act on it — e.g. write code implementing what is shown").
-4. **Capability check** — `OllamaEngine.supports_images()` queries
-   `/api/show` for the `vision` capability. If the active model can't see
-   images, Ultron says so and gives the exact commands to switch
-   (`ollama pull llava` → `/model`), instead of failing mid-request.
+4. **Capability check** — `LlamaCppEngine.supports_images()` queries
+   `/props` for vision/multimodal capabilities (`modalities.vision` or `has_mmproj`). If the active server model can't see
+   images, Ultron explains that the current model is text-only and instructs how to launch `llama-server` with `--mmproj`.
 
 ### Security model
 
@@ -48,9 +45,10 @@ Image analysis is a *read* of a local file, so it uses the existing
 
 - **Path escapes** are denied by the guardrails before the file is touched.
 - The read is LOW risk and auto-allowed in every mode.
-- Only the file's bytes leave the machine (to the local Ollama server) — the
+- Only the file's bytes leave the machine (to the local llama-server) — the
   same trust boundary as every other tool call. The base64 image never enters
   the audit log or the reply text.
+
 
 ### Response style
 

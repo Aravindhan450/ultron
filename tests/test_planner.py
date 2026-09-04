@@ -1,8 +1,8 @@
 """Tests for the multi-step intent detector and the task planner.
 
-``plan_task`` is exercised against a scripted fake engine — no live model
-needed (the old root-level ``test_planner.py`` smoke script required Ollama).
+``plan_task`` is exercised against a scripted fake engine — no live model needed.
 """
+
 
 import asyncio
 import json

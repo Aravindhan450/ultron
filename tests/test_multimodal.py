@@ -3,9 +3,10 @@ Tests for multimodal image analysis.
 
 detect_image_intent routes vision phrasing ("analyze chart.png") to the
 vision model; handle_image base64-encodes the image, sends it to the engine
-as an Ollama image part, and degrades gracefully when the active model can't
+as a multimodal image part, and degrades gracefully when the active model can't
 see images. A real 1x1 PNG is used; no external network is needed.
 """
+
 
 import asyncio
 import base64
@@ -110,8 +111,8 @@ def test_handle_image_sends_base64_image_part(image_file):
 def test_handle_image_vision_unavailable(image_file):
     engine = FakeEngine(vision=False)
     msg = _run(handle_image(str(image_file), "analyze this chart", engine))
-    assert "can't see images" in msg.content
-    assert "ollama pull llava" in msg.content
+    assert "does not support vision" in msg.content
+    assert "llama-server" in msg.content
     assert engine.calls == []  # no request was sent
 
 
@@ -120,7 +121,7 @@ def test_handle_image_unknown_capability_proceeds(image_file):
     # "no vision" hint — the request proceeds and real errors surface.
     engine = FakeEngine(vision=None)
     msg = _run(handle_image(str(image_file), "analyze this chart", engine))
-    assert "can't see images" not in msg.content
+    assert "does not support vision" not in msg.content
     assert "analysis result" in msg.content
     assert len(engine.calls) == 1
 
@@ -153,53 +154,59 @@ def test_handle_image_polishes_response(image_file):
 
 
 # ---------------------------------------------------------------------------
-# Engine capability check (local fake /api/show)
+# Engine capability check (local fake /props)
 # ---------------------------------------------------------------------------
 
 
-class _ShowHandler(BaseHTTPRequestHandler):
-    capabilities: tuple[str, ...] = ("vision",)
+class _PropsHandler(BaseHTTPRequestHandler):
+    vision_enabled: bool = True
 
-    def do_POST(self):
-        caps = b", ".join((f'"{c}"').encode() for c in self.capabilities)
-        body = b'{"capabilities": [' + caps + b"]}"
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    def do_GET(self):
+        if self.path == "/props":
+            val = b"true" if self.vision_enabled else b"false"
+            body = b'{"modalities": {"vision": ' + val + b"}}"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def log_message(self, *a):
         pass
 
 
 @pytest.fixture
-def show_server():
-    server = HTTPServer(("127.0.0.1", 0), _ShowHandler)
+def props_server():
+    server = HTTPServer(("127.0.0.1", 0), _PropsHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_port}"
     server.shutdown()
 
 
-def test_supports_images_true(show_server):
-    from ultron.core.engine.ollama import OllamaEngine
+def test_supports_images_true(props_server):
+    from ultron.core.engine.llama_cpp import LlamaCppEngine
 
-    engine = OllamaEngine(base_url=show_server)
-    assert _run(engine.supports_images("llava")) is True
+    engine = LlamaCppEngine(base_url=props_server)
+    assert _run(engine.supports_images()) is True
 
 
-def test_supports_images_false(show_server, monkeypatch):
-    from ultron.core.engine.ollama import OllamaEngine
+def test_supports_images_false(props_server, monkeypatch):
+    from ultron.core.engine.llama_cpp import LlamaCppEngine
 
-    monkeypatch.setattr(_ShowHandler, "capabilities", ())
-    engine = OllamaEngine(base_url=show_server)
-    assert _run(engine.supports_images("llama3")) is False
+    monkeypatch.setattr(_PropsHandler, "vision_enabled", False)
+    engine = LlamaCppEngine(base_url=props_server)
+    assert _run(engine.supports_images()) is False
 
 
 def test_supports_images_unreachable_is_unknown():
-    from ultron.core.engine.ollama import OllamaEngine
+    from ultron.core.engine.llama_cpp import LlamaCppEngine
 
-    engine = OllamaEngine(base_url="http://127.0.0.1:1")  # nothing listening
-    assert _run(engine.supports_images("llama3")) is None
+    engine = LlamaCppEngine(base_url="http://127.0.0.1:1")  # nothing listening
+    assert _run(engine.supports_images()) is None
+
 
 
 # ---------------------------------------------------------------------------

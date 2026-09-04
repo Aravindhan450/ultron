@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     )
 
     model: str = "gemini-2.5-flash"
+    llama_cpp_base_url: str = "http://127.0.0.1:8080"
+    timeout: float = 120.0
     wake_word: str = "ultron"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     data_dir: Path = Field(default_factory=lambda: Path.home() / ".ultron")

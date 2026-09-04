@@ -225,3 +225,90 @@ def test_security_bare_shows_status(monkeypatch):
     assert handled is True
     # The status panel + hint are rendered even when the picker is cancelled.
     assert any("Switch anytime" in m for m in console.messages)
+
+
+# ---------------------------------------------------------------------------
+# /model tests
+# ---------------------------------------------------------------------------
+
+
+class FakeModelEngine:
+    def __init__(self, active_model="qwen2.5-coder-7b-instruct-q4_k_m.gguf", base_url="http://127.0.0.1:8080"):
+        self.active_model = active_model
+        self.default_model = active_model
+        self.base_url = base_url
+
+    async def get_active_model(self):
+        return self.active_model
+
+    async def list_models(self):
+        return [self.active_model] if self.active_model else []
+
+    def set_model(self, name):
+        self.default_model = name
+
+
+def test_model_status_display_syncs_with_server():
+    console = FakeConsole()
+    engine = FakeModelEngine(active_model="qwen2.5-coder-7b-instruct-q4_k_m.gguf")
+    agent = SimpleAgent(engine=engine)
+    session = SimpleNamespace(active_model="stale-old-model")
+
+    handled, should_exit = _run(
+        handle_slash_command("/model", console, [], agent=agent, session=session)
+    )
+    assert handled is True
+    assert should_exit is False
+    assert session.active_model == "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+    assert engine.default_model == "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+    assert any("Active Server Model:" in m for m in console.messages)
+    assert any("qwen2.5-coder-7b-instruct-q4_k_m.gguf" in m for m in console.messages)
+    assert any("llama.cpp" in m for m in console.messages)
+
+
+def test_model_matching_request_accepted():
+    console = FakeConsole()
+    engine = FakeModelEngine(active_model="qwen2.5-coder-7b-instruct-q4_k_m.gguf")
+    agent = SimpleAgent(engine=engine)
+    session = SimpleNamespace(active_model="qwen2.5-coder-7b-instruct-q4_k_m.gguf")
+
+    handled, _ = _run(
+        handle_slash_command("/model qwen2.5-coder-7b-instruct-q4_k_m.gguf", console, [], agent=agent, session=session)
+    )
+    assert handled is True
+    assert session.active_model == "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+    assert any("matches currently loaded server model" in m for m in console.messages)
+
+
+def test_model_switch_to_unloaded_model_rejected():
+    console = FakeConsole()
+    engine = FakeModelEngine(active_model="qwen2.5-coder-7b-instruct-q4_k_m.gguf")
+    agent = SimpleAgent(engine=engine)
+    session = SimpleNamespace(active_model="qwen2.5-coder-7b-instruct-q4_k_m.gguf")
+
+    handled, _ = _run(
+        handle_slash_command("/model llama-3-8b.gguf", console, [], agent=agent, session=session)
+    )
+    assert handled is True
+    # State MUST NOT be updated to the unloaded model
+    assert session.active_model == "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+    assert engine.default_model == "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+    assert any("Dynamic model switching is not supported" in m for m in console.messages)
+    assert any("llama-server -m /path/to/llama-3-8b.gguf" in m for m in console.messages)
+
+
+def test_model_server_offline_falls_back_gracefully():
+    from ultron.core.config import settings
+
+    console = FakeConsole()
+    engine = FakeModelEngine(active_model=None)
+    agent = SimpleAgent(engine=engine)
+    session = SimpleNamespace(active_model=settings.model)
+
+    handled, _ = _run(
+        handle_slash_command("/model", console, [], agent=agent, session=session)
+    )
+    assert handled is True
+    assert any("Model & Backend Status" in m for m in console.messages)
+    assert not any("Ollama" in m for m in console.messages)
+

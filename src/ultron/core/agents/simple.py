@@ -1620,14 +1620,15 @@ async def handle_image(path: str, user_input: str, engine) -> ChatMessage:
     """
     Analyzes an image with a vision-capable model.
 
-    Reads the image file, base64-encodes it, and sends it to the engine as an
-    Ollama image part alongside a prompt derived from the user's request.
+    Reads the image file, base64-encodes it, and sends it to the engine as a
+    multimodal image part alongside a prompt derived from the user's request.
     Gated by the security boundary like any file read (path escapes and
     secret-bearing content are denied before the file is touched).
 
     When the active model cannot see images, explains how to switch to a
     vision model instead of failing obscurely.
     """
+
     import base64
     from pathlib import Path
 
@@ -1655,12 +1656,12 @@ async def handle_image(path: str, user_input: str, engine) -> ChatMessage:
             return ChatMessage(
                 role=Role.ASSISTANT,
                 content=(
-                    f"The active model '{model}' can't see images yet. Pull a "
-                    "vision-capable model and select it, e.g.:\n"
-                    "  ollama pull llava\n"
-                    "  /model  →  llava"
+                    f"The active model '{model}' does not support vision/image analysis.\n"
+                    "To analyze images, launch llama-server with a multimodal/vision model "
+                    "(e.g. `--mmproj <projector.gguf>` or a vision GGUF model)."
                 ),
             )
+
 
     try:
         encoded = base64.b64encode(image_file.read_bytes()).decode("ascii")

@@ -1,6 +1,7 @@
 # Repository Guidelines
 
-Ultron is a local-first, permission-gated AI assistant CLI (Python 3.11+, Typer + Rich + prompt_toolkit). It talks to local LLMs via Ollama, uses 38 registered tools to act on the machine, remembers facts as a knowledge graph, and routes every tool call through a security boundary (risk classifier + guardrails). See `PROJECT_CONTEXT.md` for the full vision and end-to-end architecture.
+Ultron is a local-first, permission-gated AI assistant CLI (Python 3.11+, Typer + Rich + prompt_toolkit). It talks to local LLMs via llama.cpp (`llama-server`), uses 38 registered tools to act on the machine, remembers facts as a knowledge graph, and routes every tool call through a security boundary (risk classifier + guardrails). See `PROJECT_CONTEXT.md` for the full vision and end-to-end architecture.
+
 
 ## Project Structure & Module Organization
 
@@ -31,7 +32,8 @@ Ultron is a local-first, permission-gated AI assistant CLI (Python 3.11+, Typer 
 
 ## Testing Guidelines
 
-- pytest; engines must be mocked/faked — never require a live Ollama.
+- pytest; engines must be mocked/faked in unit tests — never require a live server.
+
 - Every feature ships with tests; CI runs the suite on Python 3.12.
 - Slash-command logic is tested against the real `handle_slash_command` path.
 - UI behavior is unit-tested at several terminal widths; resize regressions are caught by `_reflow_e2e.py` (pty harness) in the `reflow-e2e` CI job.

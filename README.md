@@ -2,7 +2,7 @@
 
 > Local-first AI assistant — a privacy-respecting, permission-gated AI companion that lives in your terminal.
 
-Ultron is a Python CLI assistant that talks to local LLMs (via [Ollama](https://ollama.com)), uses tools to act on your machine, remembers facts across sessions, and asks for permission before anything risky happens. It runs on your own hardware — no cloud account, no telemetry — and your data stays on your machine unless you explicitly use a remote tool such as web search.
+Ultron is a Python CLI assistant that talks to local LLMs (via [llama.cpp](https://github.com/ggerganov/llama.cpp) / `llama-server`), uses tools to act on your machine, remembers facts across sessions, and asks for permission before anything risky happens. It runs on your own hardware — no cloud account, no telemetry — and your data stays on your machine unless you explicitly use a remote tool such as web search.
 
 ---
 
@@ -17,20 +17,20 @@ Ultron is under active development. The core is real and usable today:
 | ReAct agent (`--agent react`) | ✅ Implemented |
 | Tool library (38 tools) | ✅ Implemented |
 | Long-term memory (SQLite) | ✅ Implemented |
-| Local LLM via Ollama | ✅ Implemented |
+| Local LLM via llama.cpp (`llama-server`) | ✅ Implemented |
 | Security boundary (risk classifier + guardrails) | ✅ Implemented |
 | Sandboxed execution | 🚧 Planned |
 | Voice, MCP, desktop/web UI | 🚧 Planned (scaffolded but not yet built) |
 
 ## Features
 
-- **Local by default** — Ultron talks to Ollama on your machine (`localhost:11434`). Nothing leaves your computer unless you explicitly enable a remote service.
+- **Local by default** — Ultron talks to `llama-server` on your machine (`http://127.0.0.1:8080`). Nothing leaves your computer unless you explicitly enable a remote service.
 - **Two agent modes** — `simple` (fast, deterministic intent detection with an LLM fallback) and `react` (a Thought → Action → Observation loop for multi-step tool tasks).
 - **38 built-in tools** — read/write files, run shell commands (singly or in parallel batches), HTTP requests, a unified retrieval interface (`retrieve` decides between search / page fetch / connectivity check — or combines them), web search, page fetch, SQL queries (SQLite/Postgres), long-term memory, live API-schema learning, a resource monitor, personalized cross-domain memory connections, structured-output enforcement, plan preflight analysis, environmental-state debugging (failure diagnosis + dependency checks against a live environment snapshot), and inter-tool parallel processing (`run_tool_batch` runs several different tools concurrently, each gated through the security boundary, and synthesizes their results into one analysis). See [docs/retrieval.md](docs/retrieval.md), [docs/debugging.md](docs/debugging.md) and [docs/parallel-tools.md](docs/parallel-tools.md).
 - **Permission first** — every risky action (shell commands, file writes, non-read-only SQL, state-changing HTTP) shows a confirmation prompt before it executes. Read-only actions run automatically.
 - **Layered security** — the security boundary classifies every tool action into a risk tier (`low` → `critical`) and runs guardrails that scan for leaked credentials and PII, block unsafe URLs and path escapes, and flag dangerous shell commands before anything executes.
 - **Knowledge-graph memory** — facts persist across sessions in `.ultron_memory.db` as `subject → predicate → object` triples (with a flat-fact fallback for anything that doesn't parse). Ultron can then answer deductive questions deterministically — e.g. *"what is the capital of a country that borders Germany?"* — by walking stored edges in SQL, never by guessing. See [docs/memory-graph.md](docs/memory-graph.md).
-- **Multimodal vision** — *"analyze this chart.png"* sends the image to a vision-capable model, which reads diagrams, graphs, and sketches and acts on them (e.g. writes code from a visual spec). Non-vision models get a friendly `ollama pull llava` hint instead of a cryptic failure. See [docs/multimodal.md](docs/multimodal.md).
+- **Multimodal vision** — *"analyze this chart.png"* sends the image to a vision-capable model, which reads diagrams, graphs, and sketches and acts on them (e.g. writes code from a visual spec). Text-only models get a helpful configuration hint instead of a cryptic failure. See [docs/multimodal.md](docs/multimodal.md).
 - **Well-mannered, structured replies** — every system prompt carries shared response-style guidance (polite, lead with the answer, Markdown structure), and replies get a light deterministic polish so local models stay tidy. See [docs/multimodal.md](docs/multimodal.md) and `core/intelligence/prompt_assembly.py`.
 - **Real-time API schema inference** — Ultron learns API shapes from every HTTP call and from fetched OpenAPI specs. When an API changes (a field rename, a new required parameter, a type tightening, a moved endpoint), the validation error is parsed automatically: the change is remembered, the next request is corrected without being asked, and the tool output shows exactly what changed. See [docs/api-schema-inference.md](docs/api-schema-inference.md).
 - **Personalized learning** — every fact you store is correlated against everything else Ultron remembers: shared topics, keywords, and curated cross-domain concept bridges (e.g. *Renaissance art* ↔ *Medici politics*) surface connections with human-readable reasons, stored as a persistent link map. Ask *"connections for medici"*, *"how is renaissance art related to the medici"*, or *"discover new connections"* — including transitive novel links between indirectly-related facts. All deterministic and grounded in stored text — no hallucination. See [docs/personalized-learning.md](docs/personalized-learning.md).
@@ -43,11 +43,12 @@ Ultron is under active development. The core is real and usable today:
 ## Requirements
 
 - Python **3.11+**
-- [Ollama](https://ollama.com/download) running locally with at least one model pulled:
+- `llama.cpp` (`llama-server`) running locally with a GGUF model:
 
 ```bash
-ollama pull llama3
+llama-server -m /path/to/model.gguf -ngl 99 -c 32768 --port 8080 --host 127.0.0.1
 ```
+
 
 ## Installation
 
@@ -90,13 +91,13 @@ All settings can also be set via environment variables prefixed with `ULTRON_`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ULTRON_MODEL` | `gemini-2.5-flash` | Model name to request from Ollama — set this to a model you've actually pulled (e.g. `llama3`) or switch at runtime with `/model` |
+| `ULTRON_MODEL` | `default` | Active model identifier — synced with `llama-server` loaded model or switched at runtime with `/model` |
+| `ULTRON_LLAMA_CPP_BASE_URL` | `http://127.0.0.1:8080` | Endpoint of the running `llama-server` instance |
 | `ULTRON_SECURITY_MODE` | `interactive` | Security mode for the boundary: `permissive`, `interactive`, or `strict` |
 | `ULTRON_WAKE_WORD` | `ultron` | Wake word for the planned voice mode |
 | `ULTRON_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `ULTRON_DATA_DIR` | `~/.ultron` | Where the log file (`ultron.log`) is written |
 | `ULTRON_DATABASE_TYPE` | `sqlite` | Backend for the DB query tool: `sqlite` or `postgres` |
-| `ULTRON_DATABASE_URL` | — | e.g. `test_db.sqlite` or a Postgres DSN |
 
 `ULTRON_MEMORY_BACKEND` and `ULTRON_WAKE_WORD` are reserved for upcoming features and not yet enforced. `ULTRON_SECURITY_MODE` drives the security boundary's decisions (see [Security model](#security-model)); the boundary is wired into the agent tool-call flow — every tool call in both the simple and ReAct agents is routed through `boundary.check()` before execution.
 
@@ -106,7 +107,7 @@ All settings can also be set via environment variables prefixed with `ULTRON_`.
 
 ### Start chatting
 
-Make sure Ollama is running first (see [Requirements](#requirements)), then:
+Make sure `llama-server` is running first (see [Requirements](#requirements)), then:
 
 ```bash
 ultron chat
@@ -125,7 +126,7 @@ The chat session opens a **responsive Rich UI**: an adaptive banner, Markdown-re
 | Command | Action |
 |---------|--------|
 | `/help` | Show the command table |
-| `/model` | List and switch Ollama models interactively (persists to `.env`) |
+| `/model` | Inspect active model & llama.cpp server status |
 | `/agent` | Switch agent type (`simple` or `react`), or `/agent react` to switch directly |
 | `/security` | Show the active security mode + per-tier policy; `/security <permissive\|interactive\|strict>` switches modes live (persists to `.env`) |
 | `/clear` | Reset conversation history |
@@ -141,6 +142,14 @@ ultron run               # Print the active configuration and stay running (Ctrl
 ultron logs              # Show the last 50 log lines
 ultron logs -n 200       # Show more lines
 ultron logs -f           # Follow the log in real time
+```
+
+### Security audit log
+
+Every action verdict (decision, action type, risk tier, target, reason) is written in real time to `~/.ultron/security_audit.jsonl`. Inspect or tail it:
+
+```bash
+tail -f ~/.ultron/security_audit.jsonl | jq '.decision, .action_type'
 ```
 
 ## What you can ask it
@@ -214,7 +223,8 @@ src/ultron/
 ├── main.py            # Typer CLI entry point
 ├── core/
 │   ├── agents/        # BaseAgent + the simple and react agents
-│   ├── engine/        # LLM backends (Ollama implemented; cloud/vllm/mlx planned)
+│   ├── engine/        # LLM backends (LlamaCppEngine implemented; cloud/vllm/mlx planned)
+
 │   ├── tools/         # Tool registry, builtin tools, and SQLite memory
 │   ├── learning/      # Real-time API schema inference (drift detection + usage prediction)
 │   ├── config.py      # Settings (env vars / .env)

@@ -6,7 +6,8 @@ Semantic search foundation (Fix #4).
 This layer provides the metadata-rich chunk representation and the
 search contract, WITHOUT hard-coding any embedding provider. An
 :class:`Embedder` protocol is the seam: implementations can plug in local
-embeddings (Ollama, MLX, ...) later without touching the facade.
+embeddings (llama.cpp, MLX, ...) later without touching the facade.
+
 
 Key rules:
 
@@ -35,7 +36,8 @@ from ultron.core.coding.intelligence.symbols import SymbolKind
 
 
 class Embedder(Protocol):
-    """Any local embedding provider (Ollama / MLX / on-disk model)."""
+    """Any local embedding provider (llama.cpp / MLX / on-disk model)."""
+
 
     def available(self) -> bool: ...
 

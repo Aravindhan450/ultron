@@ -1,6 +1,6 @@
 """Live validation of the ReAct-loop routing correction through the REAL CLI.
 
-Starts `ultron chat --agent react` in a pty with a REAL local LLM (Ollama)
+Starts `ultron chat --agent react` in a pty with a REAL local LLM (llama-server)
 and drives prompts that exercise the routing correction layer:
 
   1. How does the Supervisor delegate work?  -> repository investigation,

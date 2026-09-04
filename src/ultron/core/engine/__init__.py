@@ -1,14 +1,20 @@
 from ultron.core.config import settings
 from ultron.core.engine.base import BaseEngine
-from ultron.core.engine.ollama import OllamaEngine
+from ultron.core.engine.llama_cpp import LlamaCppEngine
+
+__all__ = ["BaseEngine", "LlamaCppEngine", "get_engine"]
+
 
 
 def get_engine(name: str | None = None) -> BaseEngine:
     """
     Factory function to get the appropriate LLM engine backend.
-    
-    Currently supports and defaults to the Ollama backend.
+
+    Defaults to the LlamaCppEngine backend.
     """
     model_name = name or settings.model
-    # Since Ollama is the only implemented engine for now, we default to it.
-    return OllamaEngine(default_model=model_name)
+    return LlamaCppEngine(
+        base_url=settings.llama_cpp_base_url,
+        default_model=model_name,
+        timeout=settings.timeout,
+    )
