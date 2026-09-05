@@ -1207,13 +1207,24 @@ def chat(
         "-a",
         help="Agent type to use (simple or react).",
     ),
+    no_server: bool = typer.Option(
+        False,
+        "--no-server",
+        help="Skip starting local llama-server (e.g. for testing or when using external endpoint).",
+    ),
 ):
+    import os
+
+    skip_server = no_server or (
+        os.environ.get("ULTRON_NO_SERVER", "").lower() in ("1", "true", "yes")
+    )
+
     async def _run_chat_session():
         server_manager = LlamaServerManager()
         server_started = False
         try:
-            # If server is already running, we verify endpoint without hijacking
-            if not server_manager.check_endpoint_occupied():
+            # If server is not skipped and not already running, start local server
+            if not skip_server and not server_manager.check_endpoint_occupied():
                 UI.render_status("Starting local llama-server...", status="info")
                 try:
                     server_manager.start()

@@ -108,9 +108,10 @@ def main() -> int:
     env = dict(os.environ)
     current_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{src_dir}:{current_pp}" if current_pp else src_dir
+    env["ULTRON_NO_SERVER"] = "1"
 
     proc = subprocess.Popen(
-        [python_exe, "-m", "ultron.main", "chat"],
+        [python_exe, "-m", "ultron.main", "chat", "--no-server"],
         stdin=slave,
         stdout=slave,
         stderr=slave,
