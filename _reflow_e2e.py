@@ -100,9 +100,17 @@ def main() -> int:
     master, slave = pty.openpty()
     set_size(slave, 30, 100)
 
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    venv_python = os.path.join(root_dir, ".venv", "bin", "python")
+    python_exe = venv_python if os.path.exists(venv_python) else sys.executable
+
+    src_dir = os.path.join(root_dir, "src")
     env = dict(os.environ)
+    current_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{src_dir}:{current_pp}" if current_pp else src_dir
+
     proc = subprocess.Popen(
-        [sys.executable, "-m", "ultron.main", "chat"],
+        [python_exe, "-m", "ultron.main", "chat"],
         stdin=slave,
         stdout=slave,
         stderr=slave,
@@ -112,16 +120,43 @@ def main() -> int:
     )
     log = PtyLog(master)
     ok = True
+
+    def wait_for_pattern(pattern: str, min_count: int = 1, timeout: float = 8.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            clean = ANSI.sub("", log.since(0))
+            if clean.count(pattern) >= min_count:
+                return True
+            if proc.poll() is not None:
+                return False
+            time.sleep(0.05)
+        return False
+
     try:
         # Mark immediately so the startup banner lands inside the first window.
         start = log.mark()
-        time.sleep(2.5)  # banner + first prompt
+        if not wait_for_pattern("Ultron AI", timeout=10.0):
+            if proc.poll() is not None:
+                err_text = log.since(0)
+                print(f"Child process failed to start (exit code {proc.returncode}):\n{err_text}")
+            else:
+                print("Timed out waiting for startup banner.")
+
+        time.sleep(0.5)
 
         # Build the conversation at 100 cols.
-        for line in ("hi", "hello", "/help", "/memory"):
-            os.write(master, line.encode() + b"\n")
-            time.sleep(1.5)
-        time.sleep(1.5)
+        steps = [
+            ("hi", "Hello! How can I help you today?", 1),
+            ("hello", "Hello! How can I help you today?", 2),
+            ("/help", "Available Commands", 1),
+            ("/memory", "Memory graph", 1),
+        ]
+        for cmd, marker, want_count in steps:
+            os.write(master, cmd.encode() + b"\n")
+            wait_for_pattern(marker, min_count=want_count, timeout=8.0)
+            time.sleep(0.3)
+
+        time.sleep(0.5)
         print("conversation @100:")
         ok &= check_window(log.since(start))
 
@@ -130,8 +165,15 @@ def main() -> int:
         for target in (60, 120, 75):
             mark = log.mark()
             set_size(slave, 30, target)
-            time.sleep(2.0)  # watcher tick (0.2s) + reflow + prompt redraw
-            time.sleep(0.5)
+            # Wait until the transcript re-renders at the new size
+            deadline = time.time() + 4.0
+            while time.time() < deadline:
+                clean = ANSI.sub("", log.since(mark))
+                if all(clean.count(m) >= want for m, want in MARKERS.items()):
+                    time.sleep(0.3)
+                    break
+                time.sleep(0.1)
+
             print(f"resize ->{target}:")
             ok &= check_window(log.since(mark))
 
