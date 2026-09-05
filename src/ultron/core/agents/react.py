@@ -233,44 +233,58 @@ def build_system_prompt() -> str:
     )
 
 
+def _clean_json_escapes(s: str) -> str:
+    """Escapes raw backslashes and unescaped triple quotes that break JSON string literals."""
+    s = s.replace('"""', r'\"\"\"')
+    return re.sub(r"(?<!\\)\\(?![\"\\/bfnrtu]|u[0-9a-fA-F]{4})", r"\\\\", s)
+
+
 def _parse_json_object(text: str) -> Any:
     """
-    Parses a JSON object, falling back to the first '{' .. last '}' span.
-
-    Naive non-greedy extraction can truncate tool calls whose arguments
-    contain nested braces (e.g. a JSON string body). Retrying on the outer
-    brace span makes extraction robust to that case.
+    Parses a JSON object, falling back to the first '{' .. last '}' span
+    and tolerating raw code backslashes (e.g. regex patterns like \\w, \\s).
     """
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        first = text.find("{")
-        last = text.rfind("}")
-        if first != -1 and last > first:
+    candidates = [text]
+    first = text.find("{")
+    last = text.rfind("}")
+    if first != -1 and last > first and (first > 0 or last < len(text) - 1):
+        candidates.append(text[first : last + 1])
+
+    for cand in candidates:
+        try:
+            return json.loads(cand, strict=False)
+        except (json.JSONDecodeError, ValueError):
             try:
-                return json.loads(text[first : last + 1])
-            except json.JSONDecodeError:
-                return None
-        return None
+                cleaned = _clean_json_escapes(cand)
+                return json.loads(cleaned, strict=False)
+            except (json.JSONDecodeError, ValueError):
+                pass
+    return None
 
 
 def extract_tool_call(text: str) -> dict[str, Any] | None:
     """
     Extracts a JSON tool-call block from an LLM response.
 
-    Accepts either a fenced block (```json { ... } ```) or a bare JSON object.
-    Returns a dict with 'tool' and 'arguments' keys, or None when the response
-    does not contain a parseable tool call (i.e. it is a final answer).
+    Accepts either fenced blocks (```json { ... } ```), bare JSON objects, or
+    embedded {"tool": ...} blocks. Returns a dict with 'tool' and 'arguments'
+    keys, or None when the response does not contain a parseable tool call.
     """
     candidates: list[str] = []
 
-    fence_match = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL | re.IGNORECASE)
-    if fence_match:
-        candidates.append(fence_match.group(1).strip())
+    for match in re.finditer(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL | re.IGNORECASE):
+        candidates.append(match.group(1).strip())
 
     stripped = text.strip()
     if stripped.startswith("{") and stripped.endswith("}"):
         candidates.append(stripped)
+
+    # Search for embedded {"tool" spans
+    tool_idx = text.find('{"tool"')
+    if tool_idx != -1:
+        last_brace = text.rfind("}")
+        if last_brace > tool_idx:
+            candidates.append(text[tool_idx : last_brace + 1])
 
     for candidate in candidates:
         data = _parse_json_object(candidate)

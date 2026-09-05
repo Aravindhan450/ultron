@@ -35,6 +35,7 @@ class GradingReport:
             and self.tests_pass
             and self.no_unrelated_changes
             and self.non_empty_diff
+            and self.verification_executed
             and self.budget_respected
         )
 
@@ -88,14 +89,35 @@ class MITLGrader:
             )
 
         # 2. Expected implementation
-        if sandbox.file_exists(target_file):
-            content = sandbox.read_file(target_file)
-            if "a + b" in content and "a - b" not in content:
+        if hasattr(scenario, "validate_implementation") and callable(scenario.validate_implementation):
+            ok, reason = scenario.validate_implementation(sandbox)
+            if ok:
                 report.expected_implementation = True
             else:
                 report.failure_reasons.append(
-                    f"Implementation in '{target_file}' does not contain expected fix ('a + b')."
+                    reason or f"Scenario implementation validation failed for '{target_file}'."
                 )
+        elif sandbox.file_exists(target_file):
+            content = sandbox.read_file(target_file)
+            expected_patterns = getattr(scenario, "expected_patterns", None)
+            forbidden_patterns = getattr(scenario, "forbidden_patterns", None)
+            if expected_patterns or forbidden_patterns:
+                valid = True
+                for pat in (expected_patterns or []):
+                    if pat not in content:
+                        report.failure_reasons.append(
+                            f"Implementation in '{target_file}' missing expected pattern '{pat}'."
+                        )
+                        valid = False
+                for pat in (forbidden_patterns or []):
+                    if pat in content:
+                        report.failure_reasons.append(
+                            f"Implementation in '{target_file}' still contains forbidden pattern '{pat}'."
+                        )
+                        valid = False
+                report.expected_implementation = valid
+            else:
+                report.expected_implementation = bool(content.strip())
         else:
             report.failure_reasons.append(f"Target file '{target_file}' is missing from sandbox.")
 

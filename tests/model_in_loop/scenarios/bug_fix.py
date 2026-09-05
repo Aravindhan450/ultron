@@ -5,6 +5,7 @@ Calculator bug fix scenario for Model-in-the-Loop validation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -18,9 +19,9 @@ class CalculatorBugFixScenario:
 
     name: str = "calculator_bug_fix"
     prompt: str = (
-        "Fix the failing test in this calculator repository. "
+        "Fix the failing test in test_calculator.py in this calculator repository. "
         "Inspect the repository, identify the underlying implementation bug in calculator.py, "
-        "make the minimal correct change, run the tests to verify the fix, and report completion."
+        "make the minimal correct change, run pytest to verify the fix, and report completion."
     )
     target_file: str = "calculator.py"
     test_file: str = "test_calculator.py"
@@ -60,3 +61,12 @@ class CalculatorBugFixScenario:
             ),
         }
     )
+
+    def validate_implementation(self, sandbox: Any) -> tuple[bool, str | None]:
+        """Validates that calculator.py contains the correct addition fix."""
+        if not sandbox.file_exists(self.target_file):
+            return False, f"Target file '{self.target_file}' is missing from sandbox."
+        content = sandbox.read_file(self.target_file)
+        if "a + b" in content and "a - b" not in content:
+            return True, None
+        return False, f"Implementation in '{self.target_file}' does not contain expected fix ('a + b')."

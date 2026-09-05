@@ -629,7 +629,13 @@ async def execute_pending_action(action: PendingAction) -> str:
     elif action.action_type == "replace_in_file":
         import json as _json
 
-        payload = _json.loads(action.content or "{}")
+        try:
+            payload = _json.loads(action.content or "{}")
+        except (_json.JSONDecodeError, ValueError):
+            from ultron.core.agents.react import _parse_json_object
+
+            payload = _parse_json_object(action.content or "{}") or {}
+
         tool = get_tool("replace_in_file")
         result = (
             tool(action.target, str(payload.get("old", "")), str(payload.get("new", "")))

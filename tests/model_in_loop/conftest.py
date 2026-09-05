@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -53,6 +54,14 @@ def mitl_server() -> Generator[LlamaCppEngine, None, None]:
             server_manager.stop()
 
 
+def make_mitl_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: Any) -> MITLSandbox:
+    """Creates an isolated sandbox for any scenario."""
+    sandbox_dir = tmp_path / f"sandbox_{scenario.name}"
+    sandbox = MITLSandbox(root_dir=sandbox_dir, files=scenario.initial_files)
+    sandbox.apply_security_boundary(monkeypatch)
+    return sandbox
+
+
 @pytest.fixture
 def mitl_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> MITLSandbox:
     """
@@ -60,7 +69,4 @@ def mitl_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> MITLSandbox
     Strictly confines all tool operations to the sandbox.
     """
     scenario = CalculatorBugFixScenario()
-    sandbox_dir = tmp_path / "sandbox_calculator"
-    sandbox = MITLSandbox(root_dir=sandbox_dir, files=scenario.initial_files)
-    sandbox.apply_security_boundary(monkeypatch)
-    return sandbox
+    return make_mitl_sandbox(tmp_path, monkeypatch, scenario)
