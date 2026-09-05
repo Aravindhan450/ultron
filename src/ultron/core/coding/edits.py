@@ -91,6 +91,17 @@ class ModificationTracker(BaseModel):
         """The most recent *limit* modifications."""
         return self.modifications[-limit:]
 
+    @property
+    def modified_files(self) -> list[str]:
+        """Unique list of file paths successfully modified by this tracker."""
+        seen: set[str] = set()
+        result: list[str] = []
+        for m in self.modifications:
+            if m.success and m.path not in seen:
+                seen.add(m.path)
+                result.append(m.path)
+        return result
+
     def git_status(self, cwd: str | None = None) -> str:
         """Best-effort ``git status --short`` for the workspace ('' when no git)."""
         from ultron.core.coding.workspace import git_status

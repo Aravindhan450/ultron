@@ -76,16 +76,22 @@ class MemoryProvider(BaseModel):
         pool = scoped or valid
 
         if task_terms:
-            keywords = [t.lower() for t in task_terms if len(t) >= 3]
-            ranked = sorted(
-                pool,
-                key=lambda r: -sum(
-                    1
-                    for k in keywords
-                    if k in (r.name + " " + r.content).lower()
-                ),
-            )
-            pool = ranked
+            keywords = [
+                w.lower()
+                for t in task_terms
+                for w in str(t).split()
+                if len(w) >= 3
+            ]
+            if keywords:
+                ranked = sorted(
+                    pool,
+                    key=lambda r: -sum(
+                        1
+                        for k in keywords
+                        if k in (r.name + " " + r.content).lower()
+                    ),
+                )
+                pool = ranked
 
         items: list[ContextItem] = []
         for r in pool[:max_records]:

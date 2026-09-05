@@ -984,10 +984,14 @@ class ReActAgent(BaseAgent):
 
         # Explicit continuation context: goal, status, requirements, completed
         # work — so the model always knows the overall task is not finished
-        # until TaskState says it is.
-        task_block = _build_task_context_block(task, session)
-        if task_block:
-            system_prompt += "\n\n" + task_block
+        # until TaskState says it is. Injected from canonical context snapshot
+        # if provided by AgentRuntime; falls back to task continuation block.
+        if context_snapshot is not None and getattr(context_snapshot, "formatted_context", None):
+            system_prompt += "\n\n" + context_snapshot.formatted_context
+        else:
+            task_block = _build_task_context_block(task, session)
+            if task_block:
+                system_prompt += "\n\n" + task_block
 
         # Inject the ReAct system prompt at the front of the conversation,
         # preserving any existing system context (e.g. persona instructions).

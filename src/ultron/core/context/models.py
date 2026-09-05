@@ -112,6 +112,11 @@ class ContextSnapshot(BaseModel):
     compacted: bool = False
     source_contributions: dict[str, int] = Field(default_factory=dict)
 
+    @property
+    def formatted_context(self) -> str:
+        """Returns the formatted prompt string containing all accepted items."""
+        return "\n\n".join(item.prompt_block() for item in self.items)
+
 
 def estimate_tokens(text: str) -> int:
     """

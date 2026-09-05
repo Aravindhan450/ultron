@@ -395,6 +395,78 @@ def test_canonical_pipeline_agent_runtime_to_react(sandbox):
         assert any(item.title == "User Request" for item in result.context_snapshot.items)
         assert any(item.title == "Active Task State" for item in result.context_snapshot.items)
         assert len(engine.calls) > 0
+        system_msg = engine.calls[0][0]
+        assert isinstance(system_msg, dict)
+        assert system_msg["role"] == "system"
+        assert "[USER_TASK: User Request]" in system_msg["content"]
+        assert "[USER_TASK: Active Task State]" in system_msg["content"]
+
+    asyncio.run(_test())
+
+
+def test_canonical_memory_to_runtime_to_react_pipeline(sandbox):
+    import asyncio
+
+    from ultron.core.agents.react import ReActAgent
+    from ultron.core.memory import (
+        MemoryConfidence,
+        MemoryProvider,
+        MemorySource,
+        SessionMemory,
+    )
+
+    class PipelineCaptureEngine:
+        def __init__(self):
+            self.calls = []
+
+        async def generate(self, messages, **kwargs):
+            self.calls.append(messages)
+            return "Context received."
+
+    async def _test():
+        engine = PipelineCaptureEngine()
+        agent = ReActAgent(engine=engine)
+
+        session = SessionMemory()
+        session.note_request("Optimize query performance")
+
+        provider = MemoryProvider()
+        ws = discover_workspace(str(sandbox))
+        cm = RepositoryContextManager(
+            workspace=ws,
+            memory_provider=provider,
+        )
+        runtime = AgentRuntime(context_manager=cm)
+        task = TaskState(goal="Check database settings")
+        code_ctx = CodeContext(workspace=ws)
+        code_ctx.attach_task(task)
+        task.code_context = code_ctx
+        mem_store = code_ctx.ensure_project_memory()
+        if mem_store is not None:
+            mem_store.store(
+                "db_schema",
+                "PostgreSQL database with asyncpg driver",
+                source=MemorySource.CODE_INTELLIGENCE,
+                confidence=MemoryConfidence.DIRECT_OBSERVATION,
+            )
+
+        result = await runtime.execute(
+            agent,
+            "Check database settings",
+            task=task,
+            session=session,
+        )
+        assert result.is_success
+        assert result.context_snapshot is not None
+        assert any("Session Memory" in item.title for item in result.context_snapshot.items)
+        assert any("Project Fact" in item.title for item in result.context_snapshot.items)
+        assert len(engine.calls) > 0
+        system_msg = engine.calls[0][0]
+        assert isinstance(system_msg, dict)
+        assert system_msg["role"] == "system"
+        assert "Session Memory" in system_msg["content"]
+        assert "Optimize query performance" in system_msg["content"]
+        assert "PostgreSQL database with asyncpg driver" in system_msg["content"]
 
     asyncio.run(_test())
 
