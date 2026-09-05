@@ -33,3 +33,10 @@ packages = ["src/ultron"]
 
 [tool.ruff]
 target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not mitl'"
+markers = [
+    "mitl: Model-in-the-loop tests requiring local llama-server and GGUF model",
+]

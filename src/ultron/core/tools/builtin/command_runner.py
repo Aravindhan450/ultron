@@ -21,6 +21,15 @@ def _run_one(command: str, timeout: int) -> str:
     recorded for future forecasts. Measurement never changes the command's
     output format or error contract.
     """
+    import os
+    import sys
+    from pathlib import Path
+
+    env = dict(os.environ)
+    venv_bin = str(Path(sys.executable).parent)
+    if venv_bin and venv_bin not in env.get("PATH", "").split(os.pathsep):
+        env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
+
     start = time.monotonic()
     cpu_before, rss_before = rm.child_usage()
 
@@ -31,6 +40,7 @@ def _run_one(command: str, timeout: int) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
         )
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return f"Error: {exc!s}"
