@@ -12,6 +12,10 @@ from typing import Any
 from tests.model_in_loop.harness.runner import ExecutionTrace
 from tests.model_in_loop.harness.sandbox import MITLSandbox
 
+REAL_MITL_SCENARIO_COUNT: int = 6
+DETERMINISTIC_CONTRACT_SCENARIO_COUNT: int = 4
+TOTAL_VALIDATION_SCENARIO_COUNT: int = 10
+
 
 class FailureTaxonomy(str, Enum):
     """Failure classification taxonomy for MITL benchmarks."""
@@ -49,44 +53,13 @@ class BenchmarkResult:
     unrelated_changes: list[str] = field(default_factory=list)
     failure_category: FailureTaxonomy | None = None
     terminal_state: str = "COMPLETED"
-
-
-@dataclass
-class BenchmarkMatrix:
-    """Aggregated results across multiple MITL benchmark scenarios."""
-
-    total_scenarios: int
-    reports: list[GradingReport] = field(default_factory=list)
-    results: list[BenchmarkResult] = field(default_factory=list)
-
-    @property
-    def passed_scenarios(self) -> int:
-        return sum(1 for r in self.reports if r.is_success)
-
-    @property
-    def failed_scenarios(self) -> int:
-        return self.total_scenarios - self.passed_scenarios
-
-    @property
-    def pass_rate(self) -> float:
-        return self.passed_scenarios / self.total_scenarios if self.total_scenarios > 0 else 0.0
-
-    def summary(self) -> str:
-        lines = [
-            "=== MITL BENCHMARK MATRIX SUMMARY ===",
-            f"Total Scenarios: {self.total_scenarios}",
-            f"Passed: {self.passed_scenarios}/{self.total_scenarios} ({self.pass_rate * 100:.1f}%)",
-            f"Failed: {self.failed_scenarios}/{self.total_scenarios}",
-            "--- Scenario Breakdown ---",
-        ]
-        for r in self.reports:
-            lines.append(f"  {r.scenario_name}: {'PASS' if r.is_success else 'FAIL'}")
-        return "\n".join(lines)
+    scenario_type: str = "real"  # "real" or "contract"
 
 
 @dataclass
 class GradingReport:
     scenario_name: str
+    scenario_type: str = "real"  # "real" or "contract"
     correct_file_modified: bool = False
     expected_implementation: bool = False
     tests_pass: bool = False
@@ -137,8 +110,9 @@ class GradingReport:
 
     def summary(self) -> str:
         status = "PASS" if self.is_success else "FAIL"
+        category_header = "REAL MITL" if self.scenario_type == "real" else "DETERMINISTIC CONTRACT"
         lines = [
-            f"=== MITL GRADING REPORT: {self.scenario_name} [{status}] ===",
+            f"=== {category_header} GRADING REPORT: {self.scenario_name} [{status}] ===",
             f"  1. Correct file(s) modified: {'PASS' if self.correct_file_modified else 'FAIL'}",
             f"  2. Expected implementation: {'PASS' if self.expected_implementation else 'FAIL'}",
             f"  3. Independent tests pass: {'PASS' if self.tests_pass else 'FAIL'}",
@@ -187,7 +161,119 @@ class GradingReport:
             unrelated_changes=[] if self.no_unrelated_changes else self.failure_reasons,
             failure_category=self.failure_category,
             terminal_state=terminal_state,
+            scenario_type=self.scenario_type,
         )
+
+
+@dataclass
+class BenchmarkMatrix:
+    """
+    Aggregated results across the Ultron Phase 3.3 Reliability Benchmark.
+    Explicitly separates Real MITL Coding Scenarios from Deterministic Safety / Contract Scenarios.
+    """
+
+    real_mitl_reports: list[GradingReport] = field(default_factory=list)
+    contract_reports: list[GradingReport] = field(default_factory=list)
+    real_mitl_results: list[BenchmarkResult] = field(default_factory=list)
+    contract_results: list[BenchmarkResult] = field(default_factory=list)
+
+    # Legacy/direct initializer compatibility
+    total_scenarios: int = TOTAL_VALIDATION_SCENARIO_COUNT
+    reports: list[GradingReport] = field(default_factory=list)
+    results: list[BenchmarkResult] = field(default_factory=list)
+
+    @property
+    def real_mitl_passed(self) -> int:
+        reports = self.real_mitl_reports or [r for r in self.reports if getattr(r, "scenario_type", "real") == "real"]
+        return sum(1 for r in reports if r.is_success)
+
+    @property
+    def real_mitl_total(self) -> int:
+        if self.real_mitl_reports:
+            return len(self.real_mitl_reports)
+        explicit_real = [r for r in self.reports if getattr(r, "scenario_type", "real") == "real"]
+        return len(explicit_real) if explicit_real else REAL_MITL_SCENARIO_COUNT
+
+    @property
+    def contract_passed(self) -> int:
+        reports = self.contract_reports or [r for r in self.reports if getattr(r, "scenario_type", "real") == "contract"]
+        return sum(1 for r in reports if r.is_success)
+
+    @property
+    def contract_total(self) -> int:
+        if self.contract_reports:
+            return len(self.contract_reports)
+        explicit_contracts = [r for r in self.reports if getattr(r, "scenario_type", "real") == "contract"]
+        return len(explicit_contracts) if explicit_contracts else DETERMINISTIC_CONTRACT_SCENARIO_COUNT
+
+    @property
+    def total_validation_passed(self) -> int:
+        if self.reports and not self.real_mitl_reports and not self.contract_reports:
+            return sum(1 for r in self.reports if r.is_success)
+        return self.real_mitl_passed + self.contract_passed
+
+    @property
+    def total_validation_count(self) -> int:
+        if self.reports and not self.real_mitl_reports and not self.contract_reports:
+            return self.total_scenarios if self.total_scenarios else len(self.reports)
+        return self.real_mitl_total + self.contract_total
+
+    @property
+    def passed_scenarios(self) -> int:
+        return self.total_validation_passed
+
+    @property
+    def failed_scenarios(self) -> int:
+        return max(0, self.total_validation_count - self.passed_scenarios)
+
+    @property
+    def pass_rate(self) -> float:
+        total = self.total_validation_count
+        return self.passed_scenarios / total if total > 0 else 0.0
+
+    def summary(self) -> str:
+        lines = [
+            "============================================================",
+            "ULTRON PHASE 3.3 RELIABILITY BENCHMARK",
+            "============================================================",
+            "",
+            "Real MITL Coding Scenarios",
+            "--------------------------",
+        ]
+
+        real_reports = self.real_mitl_reports or [r for r in self.reports if getattr(r, "scenario_type", "real") == "real"]
+        if real_reports:
+            for idx, r in enumerate(real_reports, 1):
+                status = "PASS" if r.is_success else "FAIL"
+                lines.append(f"{idx}. {r.scenario_name:<26} {status}")
+        else:
+            lines.append("  (No real MITL runs recorded)")
+
+        lines.append("")
+        lines.append(f"Real MITL Result: {self.real_mitl_passed}/{self.real_mitl_total}")
+        lines.append("")
+        lines.append("Deterministic Contract Scenarios")
+        lines.append("---------------------------------")
+
+        contract_reports = self.contract_reports or [r for r in self.reports if getattr(r, "scenario_type", "real") == "contract"]
+        start_idx = (len(real_reports) + 1) if real_reports else 7
+        if contract_reports:
+            for idx, r in enumerate(contract_reports, start_idx):
+                status = "PASS" if r.is_success else "FAIL"
+                lines.append(f"{idx}. {r.scenario_name:<26} {status}")
+        else:
+            lines.append("  (No contract runs recorded)")
+
+        lines.append("")
+        lines.append(f"Contract Result: {self.contract_passed}/{self.contract_total}")
+        lines.append("")
+        lines.append("============================================================")
+        lines.append(f"Total Validation: {self.total_validation_passed}/{self.total_validation_count}")
+        lines.append(f"Real MITL:        {self.real_mitl_passed}/{self.real_mitl_total}")
+        lines.append(f"Contracts:        {self.contract_passed}/{self.contract_total}")
+        lines.append("============================================================")
+
+        return "\n".join(lines)
 
 
 class MITLGrader:
@@ -203,8 +289,12 @@ class MITLGrader:
         trace: Any | None = None,
         max_duration: float = 180.0,
         max_iterations: int = 15,
+        scenario_type: str = "real",
     ) -> GradingReport:
-        report = GradingReport(scenario_name=getattr(scenario, "name", "mitl_scenario"))
+        report = GradingReport(
+            scenario_name=getattr(scenario, "name", "mitl_scenario"),
+            scenario_type=scenario_type,
+        )
 
         # Determine target and allowed files (supports multi-file scenarios)
         raw_targets = getattr(scenario, "target_files", None)
@@ -239,22 +329,7 @@ class MITLGrader:
         else:
             report.correct_file_modified = True
 
-        # 2. Expected implementation
-        if hasattr(scenario, "validate_implementation") and callable(scenario.validate_implementation):
-            ok, reason = scenario.validate_implementation(sandbox)
-            if ok:
-                report.expected_implementation = True
-            else:
-                report.failure_reasons.append(
-                    reason or f"Scenario implementation validation failed for {target_files}."
-                )
-        elif target_files and all(sandbox.file_exists(tf) for tf in target_files):
-            report.expected_implementation = True
-        else:
-            missing = [tf for tf in target_files if not sandbox.file_exists(tf)]
-            report.failure_reasons.append(f"Target files missing from sandbox: {missing}")
-
-        # 3. Independent test execution
+        # 2. Independent behavioral test execution (authoritative correctness signal)
         exit_code, stdout, stderr = sandbox.run_pytest(timeout=30.0)
         report.pytest_exit_code = exit_code
         report.pytest_output = stdout + ("\n" + stderr if stderr else "")
@@ -264,6 +339,24 @@ class MITLGrader:
             report.failure_reasons.append(
                 f"Independent pytest run failed with exit code {exit_code}:\n{report.pytest_output}"
             )
+
+        # 3. Expected implementation validation (behavioral test is authoritative; pattern checks supplementary)
+        if target_files and all(sandbox.file_exists(tf) for tf in target_files):
+            if report.tests_pass:
+                report.expected_implementation = True
+            elif hasattr(scenario, "validate_implementation") and callable(scenario.validate_implementation):
+                ok, reason = scenario.validate_implementation(sandbox)
+                if ok:
+                    report.expected_implementation = True
+                else:
+                    report.failure_reasons.append(
+                        reason or f"Scenario implementation validation failed for {target_files}."
+                    )
+            else:
+                report.expected_implementation = False
+        else:
+            missing = [tf for tf in target_files if not sandbox.file_exists(tf)]
+            report.failure_reasons.append(f"Target files missing from sandbox: {missing}")
 
         # 4. No unrelated changes (only allowed files should be modified)
         unrelated = [

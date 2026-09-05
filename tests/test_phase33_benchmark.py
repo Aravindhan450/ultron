@@ -1,14 +1,10 @@
 """
-Phase 3.3: Model-in-the-Loop Reliability Benchmark Contract Tests.
+Phase 3.3: Model-in-the-Loop Reliability Benchmark Validation Suite.
 
-Validates the full benchmark matrix and contract behaviors:
-1. Scenario definition and contract validation for all 6 core scenarios
-2. Multi-file tracking and allowed file enforcement in MITLGrader
-3. Scenario 7: Repair Budget Exhaustion
-4. Scenario 8: Mid-execution Cancellation Handling
-5. Scenario 9: Out-of-scope modification rejection
-6. Scenario 10: Hard verification enforcement
-7. Benchmark result matrix aggregation and taxonomy reporting
+Explicitly distinguishes:
+- 6 Real MITL Coding Scenarios (Model-in-the-loop autonomous coding with real engine)
+- 4 Deterministic Safety / Contract Scenarios (Proving invariants deterministically)
+- 10 Total Validation Scenarios
 """
 
 from __future__ import annotations
@@ -21,6 +17,9 @@ import pytest
 
 from tests.model_in_loop.conftest import make_mitl_sandbox
 from tests.model_in_loop.harness.grader import (
+    DETERMINISTIC_CONTRACT_SCENARIO_COUNT,
+    REAL_MITL_SCENARIO_COUNT,
+    TOTAL_VALIDATION_SCENARIO_COUNT,
     BenchmarkMatrix,
     FailureTaxonomy,
     GradingReport,
@@ -58,7 +57,7 @@ def _tool_call(tool: str, **arguments) -> str:
 
 
 # ===========================================================================
-# 1. Scenarios Contract Validation
+# 1. Real MITL Scenarios Contract Validation (Scenarios 1 - 6)
 # ===========================================================================
 
 
@@ -73,8 +72,8 @@ def _tool_call(tool: str, **arguments) -> str:
         PriceCalculatorScenario,
     ],
 )
-def test_all_benchmark_scenarios_structure_and_sandbox(tmp_path, monkeypatch, scenario_cls):
-    """Verifies that each scenario cleanly initializes its sandbox and files."""
+def test_real_mitl_scenarios_structure_and_sandbox(tmp_path, monkeypatch, scenario_cls):
+    """Verifies that each of the 6 real MITL scenarios cleanly initializes its sandbox and files."""
     scenario = scenario_cls()
     sandbox = make_mitl_sandbox(tmp_path, monkeypatch, scenario)
 
@@ -123,19 +122,18 @@ def test_grader_multi_file_tracking(tmp_path, monkeypatch):
 
 
 # ===========================================================================
-# 3. Scenario 7: Repair Budget Exhaustion Contract
+# 3. Deterministic Contract Scenario 7: Repair Budget Exhaustion
 # ===========================================================================
 
 
-def test_benchmark_scenario7_budget_exhaustion(tmp_path, monkeypatch):
+def test_deterministic_contract_budget_exhaustion(tmp_path, monkeypatch):
     """
-    Scenario 7 Contract: Exhausted repair budget leads to graceful termination
+    Deterministic Contract Scenario 7: Exhausted repair budget leads to graceful termination
     and failed grading report with REPAIR_BUDGET_EXHAUSTED failure taxonomy.
     """
     scenario = CalculatorBugFixScenario()
     sandbox = make_mitl_sandbox(tmp_path, monkeypatch, scenario)
 
-    # Simulate a trace where budget was exceeded
     class DummyTrace:
         duration_seconds = 12.5
         iterations = 10
@@ -144,7 +142,12 @@ def test_benchmark_scenario7_budget_exhaustion(tmp_path, monkeypatch):
         final_response = "Unable to fix bug within allocated budget."
 
     trace = DummyTrace()
-    report = MITLGrader.grade(scenario=scenario, sandbox=sandbox, trace=trace)
+    report = MITLGrader.grade(
+        scenario=scenario,
+        sandbox=sandbox,
+        trace=trace,
+        scenario_type="contract",
+    )
 
     assert not report.is_success
     assert report.failure_taxonomy in (
@@ -154,13 +157,13 @@ def test_benchmark_scenario7_budget_exhaustion(tmp_path, monkeypatch):
 
 
 # ===========================================================================
-# 4. Scenario 8: Cancellation Contract
+# 4. Deterministic Contract Scenario 8: Cancellation Handling
 # ===========================================================================
 
 
-def test_benchmark_scenario8_cancellation_handling(tmp_path, monkeypatch):
+def test_deterministic_contract_cancellation_handling(tmp_path, monkeypatch):
     """
-    Scenario 8 Contract: Mid-execution cancellation sets CANCELLED taxonomy
+    Deterministic Contract Scenario 8: Mid-execution cancellation sets CANCELLED taxonomy
     and produces a clean report without hanging or leaking resources.
     """
     scenario = CalculatorBugFixScenario()
@@ -173,19 +176,24 @@ def test_benchmark_scenario8_cancellation_handling(tmp_path, monkeypatch):
         error = "Task cancelled by user"
         final_response = "Operation cancelled."
 
-    report = MITLGrader.grade(scenario=scenario, sandbox=sandbox, trace=CancelledTrace())
+    report = MITLGrader.grade(
+        scenario=scenario,
+        sandbox=sandbox,
+        trace=CancelledTrace(),
+        scenario_type="contract",
+    )
     assert not report.is_success
     assert report.failure_taxonomy == FailureTaxonomy.CANCELLED
 
 
 # ===========================================================================
-# 5. Scenario 9: Out-of-Scope Modification Rejection
+# 5. Deterministic Contract Scenario 9: Out-of-Scope Modification Rejection
 # ===========================================================================
 
 
-def test_benchmark_scenario9_scope_rejection(tmp_path, monkeypatch):
+def test_deterministic_contract_scope_rejection(tmp_path, monkeypatch):
     """
-    Scenario 9 Contract: Modifying files outside the scenario scope
+    Deterministic Contract Scenario 9: Modifying files outside the scenario scope
     is flagged by no_unrelated_changes and assigns OUT_OF_SCOPE_MODIFICATION taxonomy.
     """
     scenario = CalculatorBugFixScenario()
@@ -199,30 +207,36 @@ def test_benchmark_scenario9_scope_rejection(tmp_path, monkeypatch):
     # Unrelated modification
     sandbox.write_file("unrelated_module.py", "# Malicious or out of scope change\nx = 1\n")
 
-    report = MITLGrader.grade(scenario=scenario, sandbox=sandbox, trace=None)
+    report = MITLGrader.grade(
+        scenario=scenario,
+        sandbox=sandbox,
+        trace=None,
+        scenario_type="contract",
+    )
     assert not report.no_unrelated_changes
     assert not report.is_success
     assert report.failure_taxonomy == FailureTaxonomy.OUT_OF_SCOPE_MODIFICATION
 
 
 # ===========================================================================
-# 6. Scenario 10: Hard Verification Enforcement
+# 6. Deterministic Contract Scenario 10: Hard Verification Enforcement
 # ===========================================================================
 
 
-def test_benchmark_scenario10_verification_enforcement(tmp_path, monkeypatch):
+def test_deterministic_contract_verification_enforcement():
     """
-    Scenario 10 Contract: If tests are not executed or pass, verification_executed
+    Deterministic Contract Scenario 10: If tests are not executed, verification_executed
     is False, grading is rejected, and failure taxonomy is VERIFICATION_FAILED.
     """
     report = GradingReport(
         scenario_name="verification_enforcement_test",
+        scenario_type="contract",
         correct_file_modified=True,
         expected_implementation=True,
         tests_pass=True,
         no_unrelated_changes=True,
         non_empty_diff=True,
-        verification_executed=False,  # <--- Agent didn't run verification
+        verification_executed=False,  # <--- Agent omitted verification
         budget_respected=True,
     )
     assert not report.is_success
@@ -230,38 +244,73 @@ def test_benchmark_scenario10_verification_enforcement(tmp_path, monkeypatch):
 
 
 # ===========================================================================
-# 7. Benchmark Matrix Aggregator
+# 7. Benchmark Matrix Aggregator & Separation Validation
 # ===========================================================================
 
 
-def test_benchmark_matrix_aggregation():
-    """Verifies that BenchmarkResult computes pass rates and aggregates reports correctly."""
-    r1 = GradingReport(
-        scenario_name="scen_1",
-        correct_file_modified=True,
-        expected_implementation=True,
-        tests_pass=True,
-        no_unrelated_changes=True,
-        non_empty_diff=True,
-        verification_executed=True,
-        budget_respected=True,
-    )
-    r2 = GradingReport(
-        scenario_name="scen_2",
-        correct_file_modified=True,
-        expected_implementation=False,
-        tests_pass=False,
-        no_unrelated_changes=True,
-        non_empty_diff=True,
-        verification_executed=True,
-        budget_respected=True,
+def test_benchmark_matrix_aggregation_and_separation():
+    """
+    Verifies that BenchmarkMatrix strictly distinguishes:
+    - Real MITL Scenarios (6)
+    - Deterministic Contract Scenarios (4)
+    - Total Validation Scenarios (10)
+    """
+    assert REAL_MITL_SCENARIO_COUNT == 6
+    assert DETERMINISTIC_CONTRACT_SCENARIO_COUNT == 4
+    assert TOTAL_VALIDATION_SCENARIO_COUNT == 10
+
+    # 6 Real MITL reports (5 pass, 1 fail)
+    real_reports = [
+        GradingReport(
+            scenario_name=f"real_scen_{i}",
+            scenario_type="real",
+            correct_file_modified=True,
+            expected_implementation=True,
+            tests_pass=(i != 6),
+            no_unrelated_changes=True,
+            non_empty_diff=True,
+            verification_executed=True,
+            budget_respected=True,
+        )
+        for i in range(1, 7)
+    ]
+
+    # 4 Deterministic Contract reports (all 4 pass)
+    contract_reports = [
+        GradingReport(
+            scenario_name=name,
+            scenario_type="contract",
+            correct_file_modified=True,
+            expected_implementation=True,
+            tests_pass=True,
+            no_unrelated_changes=True,
+            non_empty_diff=True,
+            verification_executed=True,
+            budget_respected=True,
+        )
+        for name in [
+            "Budget Exhaustion",
+            "Cancellation",
+            "Scope Enforcement",
+            "Verification Gate",
+        ]
+    ]
+
+    matrix = BenchmarkMatrix(
+        real_mitl_reports=real_reports,
+        contract_reports=contract_reports,
     )
 
-    benchmark = BenchmarkMatrix(total_scenarios=2, reports=[r1, r2])
-    assert benchmark.passed_scenarios == 1
-    assert benchmark.failed_scenarios == 1
-    assert benchmark.pass_rate == 0.5
-    summary = benchmark.summary()
-    assert "Passed: 1/2 (50.0%)" in summary
-    assert "scen_1: PASS" in summary
-    assert "scen_2: FAIL" in summary
+    assert matrix.real_mitl_passed == 5
+    assert matrix.real_mitl_total == 6
+    assert matrix.contract_passed == 4
+    assert matrix.contract_total == 4
+    assert matrix.total_validation_passed == 9
+    assert matrix.total_validation_count == 10
+
+    summary = matrix.summary()
+    assert "Real MITL Coding Scenarios" in summary
+    assert "Real MITL Result: 5/6" in summary
+    assert "Deterministic Contract Scenarios" in summary
+    assert "Contract Result: 4/4" in summary
+    assert "Total Validation: 9/10" in summary
