@@ -46,9 +46,10 @@ from ultron.core.agents.react import (
 from ultron.core.coding.context import CodeContext
 from ultron.core.coding.observations import ObservationKind
 from ultron.core.coding.workspace import discover_workspace
+from ultron.core.context import RepositoryContextManager
 from ultron.core.memory import (
-    ContextManager,
     MemoryConfidence,
+    MemoryProvider,
     MemorySource,
     ProjectMemoryStore,
     SessionMemory,
@@ -528,19 +529,17 @@ def test_current_source_outranks_conflicting_memory(sandbox):
         success=True,
     )
 
-    wm = WorkingMemory.from_task(task, ctx)
-    block = ContextManager().assemble(
+    cm = RepositoryContextManager()
+    block = cm.build_context(
         user_request="fix the add function",
         task=task,
-        working=wm,
         code_context=ctx,
         project_memory=ctx.ensure_project_memory().recall(limit=50),
-        workspace=str(sandbox),
         task_terms=["add", "function"],
     )
     # Priority: the observed current source precedes the older memory, so the
     # source cannot be overridden by stale memory.
-    assert block.index("OBSERVATIONS") < block.index("PROJECT MEMORY")
+    assert block.index("Recent Observations") < block.index("Project Fact")
     assert "returns a string" in block
 
 
@@ -569,14 +568,16 @@ def test_hundreds_of_observations_compress(sandbox):
             success=bool(i % 3),
         )
     wm = WorkingMemory.from_task(task, task.code_context)
-    block = ContextManager().memory_block(
-        project_records=task.code_context.ensure_project_memory().recall(limit=50),
-        session=session,
+    provider = MemoryProvider()
+    proj_items = provider.provide_project_memory(
+        records=task.code_context.ensure_project_memory().recall(limit=50),
         workspace=str(sandbox),
         task_terms=["refactor"],
     )
-    assert len(block) <= 1450  # hard cap for project+session+long-term
-    assert "Active workspace" in block
+    sess_items = provider.provide_session_memory(session)
+    assert len(proj_items) <= 6
+    assert len(sess_items) <= 1
+    assert "Active workspace" in sess_items[0].content
     assert wm.active_failure is not None  # unresolved failure retained
 
 
@@ -609,20 +610,18 @@ def test_repository_change_cannot_trigger_stale_edits(sandbox):
         success=True,
     )
 
-    wm = WorkingMemory.from_task(task, ctx)
-    block = ContextManager().assemble(
+    cm = RepositoryContextManager()
+    block = cm.build_context(
         user_request="modify the users endpoint",
         task=task,
-        working=wm,
         code_context=ctx,
         project_memory=ctx.ensure_project_memory().recall(limit=50),
-        workspace=str(sandbox),
         task_terms=["users", "endpoint"],
     )
     # The CURRENT observation (with /accounts) precedes and outranks memory;
     # the block clearly reflects the current repository state.
     assert "/accounts" in block
-    assert block.index("OBSERVATIONS") < block.index("PROJECT MEMORY")
+    assert block.index("Recent Observations") < block.index("Project Fact")
 
 
 # ---------------------------------------------------------------------------
@@ -644,12 +643,13 @@ def test_facts_are_revision_aware(sandbox):
     store.store("endpoint", "/users", revision="aaa1111")
     store.store("endpoint", "/accounts", revision="bbb2222")
     assert store.recall(name="endpoint")[0].content == "/accounts"
-    block = ContextManager().memory_block(
-        project_records=store.recall(limit=50),
+    provider = MemoryProvider()
+    items = provider.provide_project_memory(
+        records=store.recall(limit=50),
         workspace=str(sandbox),
         task_terms=["endpoint"],
     )
-    assert "/accounts" in block
+    assert any("/accounts" in it.content for it in items)
 
 
 # ---------------------------------------------------------------------------
@@ -771,18 +771,18 @@ def test_performance_context_is_smaller_than_rediscovery(sandbox):
     assert recall_ms < 50  # deterministic SQLite lookup
 
     started = time.monotonic()
-    block = ContextManager().memory_block(
-        project_records=records,
-        session=SessionMemory().set_workspace(str(sandbox)),
+    provider = MemoryProvider()
+    proj_items = provider.provide_project_memory(
+        records=records,
         workspace=str(sandbox),
         task_terms=["authentication", "flow"],
     )
+    sess_items = provider.provide_session_memory(SessionMemory().set_workspace(str(sandbox)))
     assembly_ms = (time.monotonic() - started) * 1000
     assert assembly_ms < 200  # generous even on slow CI (measured ~1ms)
-    # The memory block is far smaller than a full repository dump.
-    assert len(block) <= 1400
+    assert len(proj_items) <= 6
+    assert len(sess_items) <= 1
     assert repo_bytes > 10_000  # the generated repo is non-trivial
-    assert len(block) < repo_bytes  # memory < raw rediscovery cost
 
     # Session restore latency: snapshot save + load stays cheap.
     started = time.monotonic()

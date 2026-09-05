@@ -32,17 +32,8 @@ from ultron.core.context.models import (
     ContextRetrievalResult,
     ContextRetrievalStatus,
     ContextSourceType,
+    estimate_tokens,
 )
-
-
-def estimate_tokens(text: str) -> int:
-    """
-    Standard documented estimation of token count (~4 characters per token).
-    Clearly distinguished as an estimation.
-    """
-    if not text:
-        return 0
-    return max(1, (len(text) + 3) // 4)
 
 
 class RepositoryRetriever:

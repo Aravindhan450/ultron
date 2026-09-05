@@ -111,3 +111,14 @@ class ContextSnapshot(BaseModel):
     dropped_items_count: int = 0
     compacted: bool = False
     source_contributions: dict[str, int] = Field(default_factory=dict)
+
+
+def estimate_tokens(text: str) -> int:
+    """
+    Standard documented estimation of token count (~4 characters per token).
+    Clearly distinguished as an estimation.
+    """
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+

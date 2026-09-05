@@ -23,6 +23,7 @@ from ultron.core.context.retrieval import RepositoryRetriever, estimate_tokens
 if TYPE_CHECKING:
     from ultron.core.coding.context import CodeContext
     from ultron.core.coding.workspace import CodingWorkspace
+    from ultron.core.memory.models import MemoryRecord
     from ultron.core.memory.provider import MemoryProvider
     from ultron.core.memory.session_memory import SessionMemory
     from ultron.core.types import TaskState
@@ -69,7 +70,7 @@ class RepositoryContextManager:
 
     def build_context(
         self,
-        user_request: str,
+        user_request: str = "",
         task: TaskState | None = None,
         code_context: CodeContext | None = None,
         session: SessionMemory | None = None,
@@ -77,6 +78,9 @@ class RepositoryContextManager:
         candidate_symbols: list[str] | None = None,
         search_queries: list[str] | None = None,
         artifacts: list[Any] | None = None,
+        project_memory: list[MemoryRecord] | None = None,
+        long_term_memory: list[MemoryRecord] | None = None,
+        task_terms: list[str] | None = None,
     ) -> str:
         """
         Assembles prioritized, deduplicated, and budgeted context.
@@ -200,26 +204,50 @@ class RepositoryContextManager:
                     )
                 )
 
-        # 9. Project & Session Memory Context via MemoryProvider
-        if task is not None and task.code_context is not None:
+        # 9. Project & Session & Long-Term Memory Context via MemoryProvider
+        if project_memory:
+            ws_root = (
+                str(getattr(code_context.workspace, "project_root", ""))
+                if code_context and code_context.workspace
+                else (
+                    str(getattr(task.code_context.workspace, "project_root", ""))
+                    if task and task.code_context and task.code_context.workspace
+                    else str(getattr(self.retriever.workspace, "project_root", ""))
+                )
+            )
+            terms = task_terms or ([task.goal] if task and task.goal else ([user_request] if user_request else None))
+            raw_items.extend(
+                self.memory_provider.provide_project_memory(
+                    records=project_memory,
+                    workspace=ws_root,
+                    task_terms=terms,
+                )
+            )
+        elif task is not None and task.code_context is not None:
             store = task.code_context.ensure_project_memory()
             if store is not None:
                 records = store.recall(limit=40)
                 ws_root = (
                     str(getattr(task.code_context.workspace, "project_root", ""))
                     if task.code_context.workspace
-                    else ""
+                    else str(getattr(self.retriever.workspace, "project_root", ""))
                 )
+                terms = task_terms or ([task.goal] if task.goal else ([user_request] if user_request else None))
                 raw_items.extend(
                     self.memory_provider.provide_project_memory(
                         records=records,
                         workspace=ws_root,
-                        task_terms=[task.goal] if task.goal else None,
+                        task_terms=terms,
                     )
                 )
 
         if session is not None and not session.is_empty:
             raw_items.extend(self.memory_provider.provide_session_memory(session))
+
+        if long_term_memory:
+            raw_items.extend(
+                self.memory_provider.provide_long_term_memory(long_term_memory)
+            )
 
         # 10. Structured Artifacts
         if artifacts:
@@ -250,7 +278,7 @@ class RepositoryContextManager:
 
     def assemble_snapshot(
         self,
-        user_request: str,
+        user_request: str = "",
         task: TaskState | None = None,
         code_context: CodeContext | None = None,
         session: SessionMemory | None = None,
@@ -258,6 +286,9 @@ class RepositoryContextManager:
         candidate_symbols: list[str] | None = None,
         search_queries: list[str] | None = None,
         artifacts: list[Any] | None = None,
+        project_memory: list[MemoryRecord] | None = None,
+        long_term_memory: list[MemoryRecord] | None = None,
+        task_terms: list[str] | None = None,
     ) -> ContextSnapshot:
         """
         Assembles context and returns the structured ContextSnapshot directly.
@@ -271,6 +302,9 @@ class RepositoryContextManager:
             candidate_symbols=candidate_symbols,
             search_queries=search_queries,
             artifacts=artifacts,
+            project_memory=project_memory,
+            long_term_memory=long_term_memory,
+            task_terms=task_terms,
         )
         return self._last_snapshot or ContextSnapshot()
 
@@ -314,20 +348,27 @@ class RepositoryContextManager:
             else:
                 # If high-priority item (USER_TASK or DIRECT_FILE), try compacting
                 if item.priority in (ContextPriority.USER_TASK, ContextPriority.DIRECT_FILE):
-                    remaining_room = max(50, self.budget.max_total_tokens - tokens_used)
-                    if remaining_room > 80:
-                        clipped_content = item.content[: remaining_room * 4] + " ... [truncated]"
-                        compacted_item = item.model_copy(
-                            update={
-                                "content": clipped_content,
-                                "estimated_tokens": estimate_tokens(clipped_content),
-                            }
-                        )
-                        accepted.append(compacted_item)
-                        tokens_used += compacted_item.estimated_tokens
-                        characters_used += len(clipped_content)
-                        any_truncated = True
-                        break
+                    remaining_room = self.budget.max_total_tokens - tokens_used
+                    if remaining_room >= 10:
+                        max_chars = max(0, remaining_room * 4 - 20)
+                        clipped_content = item.content[:max_chars].rstrip() + " ... [truncated]"
+                        item_tok = estimate_tokens(clipped_content)
+                        while item_tok > remaining_room and max_chars > 20:
+                            max_chars -= 20
+                            clipped_content = item.content[:max_chars].rstrip() + " ... [truncated]"
+                            item_tok = estimate_tokens(clipped_content)
+                        if item_tok <= remaining_room:
+                            compacted_item = item.model_copy(
+                                update={
+                                    "content": clipped_content,
+                                    "estimated_tokens": item_tok,
+                                }
+                            )
+                            accepted.append(compacted_item)
+                            tokens_used += compacted_item.estimated_tokens
+                            characters_used += len(clipped_content)
+                            any_truncated = True
+                            break
                 dropped_count += 1
 
         snapshot = ContextSnapshot(

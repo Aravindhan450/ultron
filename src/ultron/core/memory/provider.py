@@ -18,8 +18,8 @@ from ultron.core.context.models import (
     ContextItem,
     ContextPriority,
     ContextSourceType,
+    estimate_tokens,
 )
-from ultron.core.context.retrieval import estimate_tokens
 from ultron.core.memory.models import (
     MemoryConfidence,
     MemoryKind,

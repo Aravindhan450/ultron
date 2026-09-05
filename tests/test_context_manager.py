@@ -315,15 +315,25 @@ def test_react_agent_uses_memory_provider_not_legacy_context_manager():
     assert "MemoryProvider" in source
 
 
-def test_legacy_context_manager_delegation_to_memory_provider(sandbox):
-    from ultron.core.memory.context_manager import ContextManager
-    from ultron.core.memory.models import (
+def test_legacy_context_manager_is_completely_removed():
+    with pytest.raises(ImportError):
+        import ultron.core.memory.context_manager  # noqa: F401
+
+    import ultron.core.memory as memory_pkg
+
+    assert not hasattr(memory_pkg, "ContextManager")
+    assert not hasattr(memory_pkg, "ContextBudget")
+
+
+def test_canonical_memory_provider_to_repository_context_manager_pipeline(sandbox):
+    from ultron.core.memory import (
         MemoryConfidence,
         MemoryKind,
+        MemoryProvider,
         MemoryRecord,
         MemorySource,
+        SessionMemory,
     )
-    from ultron.core.memory.session_memory import SessionMemory
 
     records = [
         MemoryRecord(
@@ -338,17 +348,25 @@ def test_legacy_context_manager_delegation_to_memory_provider(sandbox):
     session = SessionMemory()
     session.note_request("User requested login feature")
 
-    legacy_cm = ContextManager()
-    mem_block = legacy_cm.memory_block(
-        project_records=records,
+    provider = MemoryProvider()
+    cm = RepositoryContextManager(workspace=discover_workspace(str(sandbox)), memory_provider=provider)
+    snapshot = cm.assemble_snapshot(
+        user_request="How does login work?",
+        project_memory=records,
         session=session,
-        workspace=str(sandbox),
         task_terms=["auth"],
     )
-    assert "PROJECT MEMORY:" in mem_block
-    assert "JWT tokens" in mem_block
-    assert "SESSION MEMORY:" in mem_block
-    assert "login feature" in mem_block
+
+    assert snapshot.total_estimated_tokens > 0
+    item_titles = [item.title for item in snapshot.items]
+    assert any("Project Fact" in t for t in item_titles)
+    assert any("Session Memory" in t for t in item_titles)
+    
+    # Evidence verified
+    proj_item = next(item for item in snapshot.items if "Project Fact" in item.title)
+    assert "JWT tokens" in proj_item.content
+    sess_item = next(item for item in snapshot.items if "Session Memory" in item.title)
+    assert "login feature" in sess_item.content
 
 
 def test_canonical_pipeline_agent_runtime_to_react(sandbox):

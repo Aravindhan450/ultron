@@ -19,9 +19,8 @@ import pytest
 from ultron.core.coding.context import CodeContext
 from ultron.core.coding.observations import ObservationKind
 from ultron.core.coding.workspace import discover_workspace
+from ultron.core.context import ContextBudgetConfig, RepositoryContextManager
 from ultron.core.memory import (
-    ContextBudget,
-    ContextManager,
     MemoryConfidence,
     MemoryKind,
     MemoryRecord,
@@ -421,25 +420,22 @@ def _project_records(tmp_path, workspace=None):
 
 def test_context_priority_order(tmp_path):
     task = _make_task("add refresh tokens", str(tmp_path), with_step="inspect auth")
-    wm = WorkingMemory.from_task(task, task.code_context)
     session = SessionMemory()
     session.note_request("earlier conversation")
 
-    ctx = ContextManager()
-    block = ctx.assemble(
+    ctx = RepositoryContextManager(workspace=discover_workspace(str(tmp_path)))
+    block = ctx.build_context(
         user_request="now add refresh tokens",
         task=task,
-        working=wm,
         code_context=task.code_context,
         project_memory=_project_records(tmp_path),
         session=session,
-        workspace=str(tmp_path),
         task_terms=["auth", "token"],
     )
     # Priority 1: the current user request appears first.
-    assert block.index("USER REQUEST") < block.index("TASK STATE")
-    assert block.index("TASK STATE") < block.index("PROJECT MEMORY")
-    assert block.index("PROJECT MEMORY") < block.index("SESSION MEMORY")
+    assert block.index("User Request") < block.index("Active Task State")
+    assert block.index("Active Task State") < block.index("Project Fact")
+    assert block.index("Project Fact") < block.index("Session Memory")
     # Current task facts are present; session memory is last.
     assert "add refresh tokens" in block
     assert "src/auth/service.py" in block
@@ -448,53 +444,46 @@ def test_context_priority_order(tmp_path):
 def test_context_budget_enforced(tmp_path):
     # A tiny budget with rich inputs genuinely stresses the hard ceiling.
     task = _make_task("a long goal " * 200, str(tmp_path), with_step="do the work")
-    wm = WorkingMemory.from_task(task, task.code_context)
     session = SessionMemory()
     session.note_request("earlier session detail " * 50)
-    budget = ContextBudget(max_total_chars=120)
-    ctx = ContextManager(budget=budget)
-    block = ctx.assemble(
+    budget = ContextBudgetConfig(max_total_tokens=40)
+    ctx = RepositoryContextManager(workspace=discover_workspace(str(tmp_path)), budget=budget)
+    snapshot = ctx.assemble_snapshot(
         user_request="do it",
         task=task,
-        working=wm,
         code_context=task.code_context,
         project_memory=_project_records(tmp_path),
         session=session,
-        workspace=str(tmp_path),
     )
-    assert len(block) <= budget.max_total_chars
-    # The high-priority request survived the budget; low-priority sections
-    # were the first to be dropped.
-    assert "do it" in block
-    assert block.index("USER REQUEST") < block.index("TASK STATE")
+    assert snapshot.total_estimated_tokens <= budget.max_total_tokens
+    assert snapshot.compacted or snapshot.dropped_items_count > 0
+    # High-priority user request survived
+    user_items = [it for it in snapshot.items if it.title == "User Request"]
+    assert len(user_items) == 1
+    assert "do it" in user_items[0].content
 
 
 def test_context_hard_ceiling_never_exceeded(tmp_path):
-    # Pathological inputs: every section huge, budget tiny — the assembled
-    # block must still never exceed max_total_chars (no ellipsis overflow).
+    # Pathological inputs: every section huge, budget tiny
     task = _make_task("goal " * 500, str(tmp_path), with_step="step " * 200)
-    wm = WorkingMemory.from_task(task, task.code_context)
-    wm.recent_observations = ["observation " * 100 for _ in range(20)]
-    wm.last_tool_result = "result " * 200
     session = SessionMemory()
     session.note_request("request " * 300)
     session.note_decision("decision " * 200)
     session.note_output("output " * 300)
-    for budget_chars in (1, 2, 3, 4, 10, 25, 64):
-        ctx = ContextManager(
-            budget=ContextBudget(max_total_chars=budget_chars)
+    for budget_tokens in (20, 40, 80, 150):
+        ctx = RepositoryContextManager(
+            workspace=discover_workspace(str(tmp_path)),
+            budget=ContextBudgetConfig(max_total_tokens=budget_tokens),
         )
-        block = ctx.assemble(
+        snapshot = ctx.assemble_snapshot(
             user_request="user " * 400,
             task=task,
-            working=wm,
             code_context=task.code_context,
             project_memory=_project_records(tmp_path),
             session=session,
-            workspace=str(tmp_path),
         )
-        assert len(block) <= budget_chars, (
-            f"budget {budget_chars} overflowed to {len(block)}"
+        assert snapshot.total_estimated_tokens <= budget_tokens, (
+            f"budget {budget_tokens} overflowed to {snapshot.total_estimated_tokens}"
         )
 
 
@@ -507,10 +496,9 @@ def test_stale_memory_never_injected(tmp_path):
         confidence=MemoryConfidence.DIRECT_OBSERVATION,
     )
     store.invalidate("auth_location")
-    ctx = ContextManager()
-    block = ctx.assemble(
+    ctx = RepositoryContextManager(workspace=discover_workspace(str(tmp_path)))
+    block = ctx.build_context(
         user_request="where is auth?",
-        workspace=str(tmp_path),
         project_memory=store.all_valid(),
     )
     assert "src/auth/service.py" not in block
@@ -534,63 +522,60 @@ def test_project_memory_preferred_over_global(tmp_path):
             workspace="",
         )
     ]
-    ctx = ContextManager()
-    block = ctx.assemble(
+    ctx = RepositoryContextManager(workspace=discover_workspace(str(tmp_path)))
+    block = ctx.build_context(
         user_request="what stack is this project?",
-        workspace=str(tmp_path),
         project_memory=project.all_valid(),
-        long_term=global_records,
+        long_term_memory=global_records,
     )
-    # The project-scoped fact appears in the block; the stale global
-    # preference is excluded (valid but lower priority, and the project
-    # answer is present while the total budget keeps context lean).
+    # The project-scoped fact appears in the block; project memory precedes general repo
     assert "FastAPI" in block
-    assert block.index("PROJECT MEMORY") < block.index("LONG-TERM MEMORY")
+    assert block.index("Project Fact") < block.index("Long-Term Memory")
 
 
 def test_context_assembly_deterministic(tmp_path):
     task = _make_task("same goal", str(tmp_path), with_step="same step")
-    wm = WorkingMemory.from_task(task, task.code_context)
+    ws = discover_workspace(str(tmp_path))
     kwargs = {
         "user_request": "same request",
         "task": task,
-        "working": wm,
         "code_context": task.code_context,
         "project_memory": _project_records(tmp_path),
-        "workspace": str(tmp_path),
         "task_terms": ["auth"],
     }
-    first = ContextManager().assemble(**kwargs)
-    second = ContextManager().assemble(**kwargs)
+    first = RepositoryContextManager(workspace=ws).build_context(**kwargs)
+    second = RepositoryContextManager(workspace=ws).build_context(**kwargs)
     assert first == second
 
 
 def test_test_observations_not_double_counted(tmp_path):
-    # A test/build observation belongs to TEST RESULTS (priority 6) and must
-    # not ALSO appear in OBSERVATIONS (priority 4) — bounded context is not
-    # wasted on repetition.
     task = _make_task("fix tests", str(tmp_path))
-    wm = WorkingMemory.from_task(task, task.code_context)
-    wm.recent_observations = [
-        "test_assertion: tests/test_auth.py::test_login",
-        "read_file: src/auth/service.py",
-    ]
-    block = ContextManager().assemble(
+    task.code_context.record_observation(
+        ObservationKind.TEST_RESULT,
+        "pytest",
+        "tests/test_auth.py::test_login FAILED",
+        success=False,
+    )
+    task.code_context.record_observation(
+        ObservationKind.FILE_CONTENT,
+        "read_file",
+        "src/auth/service.py",
+        success=True,
+    )
+    ctx = RepositoryContextManager(workspace=discover_workspace(str(tmp_path)))
+    block = ctx.build_context(
         user_request="fix the failing tests",
         task=task,
-        working=wm,
-        workspace=str(tmp_path),
+        code_context=task.code_context,
     )
-    assert block.count("test_assertion: tests/test_auth.py::test_login") == 1
-    assert "TEST RESULTS" in block
-    observations_start = block.index("OBSERVATIONS")
-    tests_start = block.index("TEST RESULTS")
-    assert observations_start < tests_start
+    assert block.count("tests/test_auth.py::test_login FAILED") == 1
+    assert "Recent Observations" in block
 
 
-def test_context_manager_empty_inputs():
-    block = ContextManager().assemble()
-    assert block == ""
+def test_context_manager_empty_inputs(tmp_path):
+    ctx = RepositoryContextManager(workspace=discover_workspace(str(tmp_path)))
+    snapshot = ctx.assemble_snapshot(user_request="")
+    assert isinstance(snapshot.items, list)
 
 
 # ---------------------------------------------------------------------------

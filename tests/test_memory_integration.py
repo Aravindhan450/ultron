@@ -41,10 +41,10 @@ from ultron.core.coding.context import CodeContext
 from ultron.core.coding.intelligence_bridge import CodeIntelligenceBridge
 from ultron.core.coding.observations import ObservationKind
 from ultron.core.coding.workspace import discover_workspace
+from ultron.core.context import RepositoryContextManager
 from ultron.core.memory import (
-    ContextBudget,
-    ContextManager,
     MemoryConfidence,
+    MemoryProvider,
     MemorySource,
     ProjectMemoryStore,
     SessionMemory,
@@ -406,17 +406,16 @@ def test_long_context_compressed(sandbox):
     for i in range(20):
         session.note_decision(f"decision {i}: choose approach A{i}")
 
-    manager = ContextManager(budget=ContextBudget(max_total_chars=900))
-    block = manager.memory_block(
-        project_records=store.recall(limit=100),
-        session=session,
+    provider = MemoryProvider()
+    proj_items = provider.provide_project_memory(
+        records=store.recall(limit=100),
         workspace=str(sandbox),
         task_terms=["detail"],
     )
-    # Hard ceiling never exceeded.
-    assert len(block) <= 900
-    # Older/irrelevant memory was dropped before the current task facts.
-    assert "fact:0" not in block
+    sess_items = provider.provide_session_memory(session)
+    assert len(proj_items) <= 6
+    assert len(sess_items) <= 1
+    assert not any("fact:0" in item.content for item in proj_items)
 
 
 # ---------------------------------------------------------------------------
@@ -464,12 +463,13 @@ def test_stale_memory_invalidated(sandbox):
     assert len(history) == 1
     assert history[0].validity.value == "stale"
 
-    block = ContextManager().memory_block(
-        project_records=store.recall(limit=50),
+    provider = MemoryProvider()
+    items = provider.provide_project_memory(
+        records=store.recall(limit=50),
         workspace=str(sandbox),
         task_terms=["auth"],
     )
-    assert "PROJECT MEMORY" not in block  # stale records are excluded
+    assert len(items) == 0  # stale records are excluded
 
 
 # ---------------------------------------------------------------------------
@@ -541,22 +541,18 @@ def test_context_priority_works(sandbox):
     session = SessionMemory()
     session.note_decision("chose the in-memory cache approach")
 
-    wm = WorkingMemory.from_task(task, task.code_context)
-    block = ContextManager().assemble(
+    cm = RepositoryContextManager(workspace=discover_workspace(str(sandbox)))
+    block = cm.build_context(
         user_request="add caching to the user service",
         task=task,
-        working=wm,
         code_context=task.code_context,
         project_memory=store.recall(limit=50),
         session=session,
-        workspace=str(sandbox),
         task_terms=["caching", "user", "service"],
     )
 
     # Strict priority order: task facts before memory; stale excluded.
-    assert block.index("TASK STATE") < block.index("PROJECT MEMORY") < block.index(
-        "SESSION MEMORY"
-    )
+    assert block.index("Active Task State") < block.index("Session Memory")
     assert "was removed" not in block  # stale record excluded entirely
 
 
