@@ -96,6 +96,12 @@ class MITLSandbox:
             raise FileNotFoundError(f"File not found in sandbox: {relative_path}")
         return target.read_text(encoding="utf-8")
 
+    def write_file(self, relative_path: str, content: str) -> None:
+        """Writes content to a file in the sandbox directory."""
+        target = self.path / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
     def file_exists(self, relative_path: str) -> bool:
         """Checks if a file exists in the sandbox."""
         return (self.path / relative_path).exists()
