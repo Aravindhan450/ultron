@@ -50,7 +50,9 @@ class ModelLifecycleManager:
     Enforces a strict ONE ACTIVE MODEL policy to protect system memory.
     """
 
-    def __init__(self, models_dir: Path | None = None) -> None:
+    def __init__(self, models_dir: Path | None = None, no_server: bool = False, endpoint_url: str = "http://127.0.0.1:8080") -> None:
+        self.no_server = no_server
+        self.default_endpoint_url = endpoint_url
         self.models_dir = models_dir
         self._lock = threading.RLock()
         self._states: dict[str, LifecycleState] = {}
@@ -108,6 +110,15 @@ class ModelLifecycleManager:
             self._states[model_spec.model_id] = LifecycleState.LOADING
             self._active_spec = model_spec
             
+            if self.no_server:
+                self._states[model_spec.model_id] = LifecycleState.LOADED
+                logger.info("no_server is active; skipping actual model load for %s.", model_spec.model_id)
+                return ModelHandle(
+                    model_spec=model_spec,
+                    endpoint_url=self.default_endpoint_url,
+                    state=LifecycleState.LOADED
+                )
+            
             try:
                 # Use LlamaServerManager to manage the subprocess
                 model_path = model_spec.resolve_path(self.models_dir)
@@ -148,6 +159,10 @@ class ModelLifecycleManager:
         with self._lock:
             if self._active_spec and self._active_spec.model_id == model_id:
                 self._states[model_id] = LifecycleState.UNLOADING
+                if self.no_server:
+                    self._states[model_id] = LifecycleState.UNLOADED
+                    self._active_spec = None
+                    return
                 if self._active_server:
                     logger.info("Stopping model server for %s...", model_id)
                     try:

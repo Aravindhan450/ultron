@@ -62,10 +62,23 @@ class AgentRuntime:
 
     def _build_routing_request(self, user_input: str, task: TaskState | None) -> RoutingRequest:
         if not task:
+            from ultron.core.intelligence.task_classification import (
+                classify_task_deterministic,
+            )
+            classification = classify_task_deterministic(user_input)
+            
+            coding = False
+            if classification.task_type == TaskType.SOFTWARE_ENGINEERING:
+                coding = True
+                
+            complexity = ComplexityLevel.SIMPLE
+            if classification.task_type == TaskType.MULTI_STEP:
+                complexity = ComplexityLevel.MODERATE
+
             return RoutingRequest(
                 task_description=user_input,
-                complexity=ComplexityLevel.SIMPLE,
-                coding=False,
+                complexity=complexity,
+                coding=coding,
                 context_size=ContextSize.LIGHT,
                 task_state=TaskRoutingState.INITIAL,
                 memory_pressure=MemoryPressure.LOW,

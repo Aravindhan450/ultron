@@ -122,3 +122,49 @@ async def test_g_react_compatibility(runtime):
     agent.run = AsyncMock(return_value=ChatMessage(role=Role.ASSISTANT, content="hi"))
     await runtime.execute(agent, "hello")
     assert agent.engine.base_url == "http://mock:8080"
+
+@pytest.mark.anyio
+async def test_repair_re_enters_routing(catalog, lifecycle_manager):
+    from ultron.core.intelligence.model_router import ModelRouter
+    from ultron.core.runtime.runtime import AgentRuntime
+    from ultron.core.types import TaskState, TaskType, TaskError, TaskStatus
+    
+    router = ModelRouter(catalog)
+    runtime = AgentRuntime(router=router, lifecycle_manager=lifecycle_manager)
+    agent = DummyAgent()
+    
+    # Task fails a tool and goes into repair (1 error)
+    task = TaskState(goal="code it", task_type=TaskType.SOFTWARE_ENGINEERING)
+    task.errors.append(TaskError(message="Syntax error"))
+    task.status = TaskStatus.TASK_RUNNING
+    
+    await runtime.execute(agent, "fix it", task=task)
+    called_model = runtime.lifecycle_manager.ensure_loaded.call_args[0][0]
+    
+    # Repair in a coding task keeps it at CODING role.
+    assert called_model.role == ModelRole.CODING
+
+@pytest.mark.anyio
+async def test_escalation_re_enters_routing(catalog, lifecycle_manager):
+    from ultron.core.intelligence.model_router import ModelRouter
+    from ultron.core.runtime.runtime import AgentRuntime
+    from ultron.core.types import TaskState, TaskType, TaskError, TaskStatus
+    
+    router = ModelRouter(catalog)
+    runtime = AgentRuntime(router=router, lifecycle_manager=lifecycle_manager)
+    agent = DummyAgent()
+    
+    # Task fails multiple times and escalates (3 errors)
+    task = TaskState(goal="code it", task_type=TaskType.SOFTWARE_ENGINEERING)
+    task.errors.extend([
+        TaskError(message="Syntax error 1"),
+        TaskError(message="Syntax error 2"),
+        TaskError(message="Syntax error 3")
+    ])
+    task.status = TaskStatus.TASK_RUNNING
+    
+    await runtime.execute(agent, "fix it again", task=task)
+    called_model = runtime.lifecycle_manager.ensure_loaded.call_args[0][0]
+    
+    # Escalation pushes a coding task to PRIMARY role.
+    assert called_model.role == ModelRole.PRIMARY

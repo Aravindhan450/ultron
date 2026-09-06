@@ -259,11 +259,8 @@ def test_model_status_display_syncs_with_server():
     )
     assert handled is True
     assert should_exit is False
-    assert session.active_model == "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
-    assert engine.default_model == "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
-    assert any("Active Server Model:" in m for m in console.messages)
-    assert any("qwen2.5-coder-7b-instruct-q4_k_m.gguf" in m for m in console.messages)
-    assert any("llama.cpp" in m for m in console.messages)
+    assert any("Dynamic Model Architecture" in m for m in console.messages)
+    assert any("Unknown" in m for m in console.messages)
 
 
 def test_model_matching_request_accepted():
@@ -276,8 +273,7 @@ def test_model_matching_request_accepted():
         handle_slash_command("/model qwen2.5-coder-7b-instruct-q4_k_m.gguf", console, [], agent=agent, session=session)
     )
     assert handled is True
-    assert session.active_model == "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
-    assert any("matches currently loaded server model" in m for m in console.messages)
+    assert any("Manual model switching via /model <name> is disabled" in m for m in console.messages)
 
 
 def test_model_switch_to_unloaded_model_rejected():
@@ -290,11 +286,7 @@ def test_model_switch_to_unloaded_model_rejected():
         handle_slash_command("/model llama-3-8b.gguf", console, [], agent=agent, session=session)
     )
     assert handled is True
-    # State MUST NOT be updated to the unloaded model
-    assert session.active_model == "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
-    assert engine.default_model == "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
-    assert any("Dynamic model switching is not supported" in m for m in console.messages)
-    assert any("llama-server -m /path/to/llama-3-8b.gguf" in m for m in console.messages)
+    assert any("Manual model switching via /model <name> is disabled" in m for m in console.messages)
 
 
 def test_model_server_offline_falls_back_gracefully():
@@ -309,6 +301,6 @@ def test_model_server_offline_falls_back_gracefully():
         handle_slash_command("/model", console, [], agent=agent, session=session)
     )
     assert handled is True
-    assert any("Model & Backend Status" in m for m in console.messages)
+    assert any("Dynamic Model Architecture" in m for m in console.messages)
     assert not any("Ollama" in m for m in console.messages)
 

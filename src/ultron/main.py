@@ -149,6 +149,7 @@ async def handle_slash_command(
     session=None,
     state=None,
     reflow=None,
+    _runtime=None,
 ) -> tuple[bool, bool]:
     """
     Handles slash commands entered by the user.
@@ -169,72 +170,35 @@ async def handle_slash_command(
 
     if clean_cmd == "/model" or clean_cmd.startswith("/model "):
         from ultron.core.config import settings
-
-        backend_name = "llama.cpp (llama-server)"
-        base_url = (
-            getattr(agent.engine, "base_url", settings.llama_cpp_base_url)
-            if agent and hasattr(agent, "engine")
-            else settings.llama_cpp_base_url
-        )
-
-        server_model: str | None = None
-        if agent and hasattr(agent, "engine") and hasattr(agent.engine, "get_active_model"):
-            server_model = await agent.engine.get_active_model()
-        elif agent and hasattr(agent, "engine") and hasattr(agent.engine, "list_models"):
-            models = await agent.engine.list_models()
-            server_model = models[0] if models else None
-
-        # Synchronize active model state with true server reality when reachable
-        if server_model:
-            effective_model = server_model
-            if state:
-                state.active_model = effective_model
-            if session:
-                session.active_model = effective_model
-            if agent and hasattr(agent, "engine"):
-                if hasattr(agent.engine, "set_model"):
-                    agent.engine.set_model(effective_model)
-                else:
-                    agent.engine.default_model = effective_model
-                    agent.engine.model = effective_model
+        
+        console.print(f"[bold {ACCENT}]🧠 Dynamic Model Architecture (Phase 3.5):[/bold {ACCENT}]")
+        
+        if _runtime and hasattr(_runtime, 'lifecycle_manager'):
+            lm = _runtime.lifecycle_manager
+            active = lm._active_spec
+            status = lm.get_status(active.model_id).value if active else "None"
+            
+            console.print(f"  [{MUTED}]Active Server Model:[/{MUTED}] [bold {TEXT}]{active.model_id if active else 'None'} ({status})[/bold {TEXT}]")
+            console.print(f"  [{MUTED}]Backend:[/{MUTED}]             [bold {TEXT}]llama.cpp (llama-server)[/bold {TEXT}]")
+            if not lm.no_server:
+                console.print(f"  [{MUTED}]Dynamic Routing:[/{MUTED}]   [bold {GREEN}]ENABLED[/bold {GREEN}]")
+            else:
+                console.print(f"  [{MUTED}]Dynamic Routing:[/{MUTED}]   [bold {YELLOW}]NO_SERVER[/bold {YELLOW}] (Bypassing subprocess)")
         else:
-            effective_model = (
-                state.active_model
-                if state
-                else (getattr(session, "active_model", settings.model) if session else settings.model)
-            )
-
-        console.print(f"[bold {ACCENT}]🧠 Model & Backend Status:[/bold {ACCENT}]")
-        console.print(f"  [{MUTED}]Active Server Model:[/{MUTED}] [bold {TEXT}]{effective_model}[/bold {TEXT}]")
-        console.print(f"  [{MUTED}]Backend:[/{MUTED}]             [bold {TEXT}]{backend_name}[/bold {TEXT}]")
-        console.print(f"  [{MUTED}]Server Endpoint:[/{MUTED}]     [bold {TEXT}]{base_url}[/bold {TEXT}]")
+            console.print(f"  [{MUTED}]Active Server Model:[/{MUTED}] [bold {TEXT}]Unknown[/bold {TEXT}]")
 
         parts = clean_cmd.split(maxsplit=1)
         if len(parts) > 1:
-            requested_model = parts[1].strip()
-            if requested_model:
-                if server_model and (
-                    requested_model == server_model
-                    or requested_model == server_model.split("/")[-1]
-                    or requested_model == "default"
-                ):
-                    console.print(f"[{GREEN}]✓[/{GREEN}] Model '{requested_model}' matches currently loaded server model.\n")
-                    return True, False
-
-                # Reject attempted switch to an unloaded/different model
-                console.print(
-                    f"\n[bold {YELLOW}]Notice:[/bold {YELLOW}] Dynamic model switching is not supported by llama-server.\n"
-                    f"llama-server serves a single loaded GGUF model per process.\n"
-                    f"To switch to [bold {TEXT}]{requested_model}[/bold {TEXT}], stop the current server and restart it with:\n"
-                    f"  [bold {ACCENT}]llama-server -m /path/to/{requested_model}.gguf -ngl 99[/bold {ACCENT}]\n"
-                )
-                return True, False
-
-        console.print(
-            f"[{MUTED}]Note: llama-server serves the loaded GGUF directly. To switch models, restart llama-server with a different -m <model.gguf>.[/{MUTED}]\n"
-        )
+            
+            console.print(
+                f"\n[bold {YELLOW}]Notice:[/bold {YELLOW}] Manual model switching via /model <name> is disabled in Phase 3.5.\n"
+                f"Model selection is now deterministically managed by the [bold {TEXT}]ModelRouter[/bold {TEXT}].\n"
+            )
+        else:
+            console.print(
+                f"\n[{MUTED}]Note: Model switching is dynamically managed by the AgentRuntime based on task complexity.[/{MUTED}]\n"
+            )
         return True, False
-
 
 
     if clean_cmd == "/agent" or clean_cmd.startswith("/agent "):
@@ -720,6 +684,7 @@ async def continue_task_after_confirmation(
     result: str,
     history: list[ChatMessage],
     session=None,
+    runtime=None,
 ) -> ChatMessage:
     """
     Feeds a confirmed action's result back into the task as an observation and
@@ -733,9 +698,12 @@ async def continue_task_after_confirmation(
     the confirmation round-trip.
     """
     task.last_observation = result
+    if runtime:
+        run_res = await runtime.execute(agent, task.goal, history, task=task, session=session)
+        return run_res.message
     return await agent.run(task.goal, history, task=task, session=session)
 
-async def async_chat(agent_type: str = "simple"):
+async def async_chat(agent_type: str = "simple", no_server: bool = False):
     """
     Asynchronous runner for the interactive chat session.
 
@@ -815,7 +783,7 @@ async def async_chat(agent_type: str = "simple"):
 
     catalog = get_default_catalog()
     model_router = ModelRouter(catalog)
-    lifecycle_manager = ModelLifecycleManager()
+    lifecycle_manager = ModelLifecycleManager(no_server=no_server)
 
     # Record every renderable printed during the session and, on terminal
     # resize while the chat prompt is live, re-render the whole conversation
@@ -827,397 +795,400 @@ async def async_chat(agent_type: str = "simple"):
     reflow.add(lambda: print_banner(state.active_model))
     reflow.start()
 
-    while True:
-        try:
-            state.status = "Ready"
+    try:
+        while True:
+            try:
+                state.status = "Ready"
 
-            user_input = await chat_ui.prompt_async()
-            trimmed_input = user_input.strip()
+                user_input = await chat_ui.prompt_async()
+                trimmed_input = user_input.strip()
 
-            if not trimmed_input:
-                continue
+                if not trimmed_input:
+                    continue
 
-            if trimmed_input.lower() in ("/exit", "/quit", "exit", "quit"):
-                reflow.stop()
-                UI.render_status("Goodbye.", status="info")
-                break
-
-            # Echo the user's message into the transcript (Claude Code style), so
-            # the conversation reads as a natural exchange. Recorded by the resize
-            # reflow like every other printed line.
-            UI.render_user_prompt(trimmed_input)
-
-            if trimmed_input.startswith("/"):
-                handled, should_exit = await handle_slash_command(
-                    trimmed_input,
-                    console,
-                    history,
-                    agent=agent,
-                    session=session,
-                    state=state,
-                    reflow=reflow,
-                )
-                if hasattr(session, "reloaded_agent") and session.reloaded_agent is not None:
-                    agent = session.reloaded_agent
-                    session.reloaded_agent = None
-                # /agent queues a fresh instance here; swap it in for the next turn.
-                if getattr(session, "next_agent", None) is not None:
-                    agent = session.next_agent
-                    session.next_agent = None
-                if should_exit:
+                if trimmed_input.lower() in ("/exit", "/quit", "exit", "quit"):
                     reflow.stop()
                     UI.render_status("Goodbye.", status="info")
                     break
-                if handled:
-                    continue
 
-            truncated_history = truncate_history(history, max_messages=10)
+                # Echo the user's message into the transcript (Claude Code style), so
+                # the conversation reads as a natural exchange. Recorded by the resize
+                # reflow like every other printed line.
+                UI.render_user_prompt(trimmed_input)
 
-            import threading
+                if trimmed_input.startswith("/"):
+                    handled, should_exit = await handle_slash_command(
+                        trimmed_input,
+                        console,
+                        history,
+                        agent=agent,
+                        session=session,
+                        state=state,
+                        reflow=reflow,
+                    )
+                    if hasattr(session, "reloaded_agent") and session.reloaded_agent is not None:
+                        agent = session.reloaded_agent
+                        session.reloaded_agent = None
+                    # /agent queues a fresh instance here; swap it in for the next turn.
+                    if getattr(session, "next_agent", None) is not None:
+                        agent = session.next_agent
+                        session.next_agent = None
+                    if should_exit:
+                        reflow.stop()
+                        UI.render_status("Goodbye.", status="info")
+                        break
+                    if handled:
+                        continue
 
-            def _listen_for_esc(cancel_evt: threading.Event):
-                import select
-                import sys
-                import termios
-                import tty
-                if not sys.stdin.isatty():
-                    return
-                try:
-                    fd = sys.stdin.fileno()
-                    old_settings = termios.tcgetattr(fd)
-                except (OSError, ValueError):
-                    return
-                try:
-                    tty.setcbreak(fd)
-                    while not cancel_evt.is_set():
-                        r, _, _ = select.select([fd], [], [], 0.05)
-                        if r:
-                            ch = sys.stdin.read(1)
-                            if ch == "\x1b":
-                                r_next, _, _ = select.select([fd], [], [], 0.05)
-                                if not r_next:
-                                    cancel_evt.set()
-                                    break
-                                else:
-                                    sys.stdin.read(10)
-                except (OSError, ValueError) as exc:
-                    logger.debug("ESC listener failed: %s", exc)
-                finally:
+                truncated_history = truncate_history(history, max_messages=10)
+
+                import threading
+
+                def _listen_for_esc(cancel_evt: threading.Event):
+                    import select
+                    import sys
+                    import termios
+                    import tty
+                    if not sys.stdin.isatty():
+                        return
                     try:
-                        termios.tcflush(fd, termios.TCIFLUSH)
-                    except (OSError, ValueError) as exc:
-                        logger.debug("termios tcflush failed: %s", exc)
+                        fd = sys.stdin.fileno()
+                        old_settings = termios.tcgetattr(fd)
+                    except (OSError, ValueError):
+                        return
                     try:
-                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                        tty.setcbreak(fd)
+                        while not cancel_evt.is_set():
+                            r, _, _ = select.select([fd], [], [], 0.05)
+                            if r:
+                                ch = sys.stdin.read(1)
+                                if ch == "\x1b":
+                                    r_next, _, _ = select.select([fd], [], [], 0.05)
+                                    if not r_next:
+                                        cancel_evt.set()
+                                        break
+                                    else:
+                                        sys.stdin.read(10)
                     except (OSError, ValueError) as exc:
-                        logger.debug("termios tcsetattr failed: %s", exc)
-
-            cancel_event = threading.Event()
-            esc_thread = threading.Thread(target=_listen_for_esc, args=(cancel_event,), daemon=True)
-            esc_thread.start()
-
-            # Plan-aware execution (ReAct agent only): understand + classify
-            # the request and, when it is a complex task type, prepare a
-            # TaskState carrying a validated structured plan before the agent
-            # runs. Informational / simple / file-operation requests return
-            # None and stay on the fast path (no plan, no extra LLM call). A
-            # request that genuinely needs clarification is surfaced to the
-            # user instead of executing blindly.
-            from ultron.core.runtime import AgentRuntime
-
-            runtime = AgentRuntime(
-                router=model_router,
-                lifecycle_manager=lifecycle_manager
-            )
-            prepared_task = None
-
-            async def _plan_and_run(
-                _agent=agent,
-                _input=trimmed_input,
-                _history=truncated_history,
-                _runtime=runtime,
-            ):
-                nonlocal prepared_task
-                if isinstance(_agent, ReActAgent):
-                    if _input in ("/resume", "/continue"):
-                        # Fix #6: restore the last persisted task for this
-                        # workspace (goal, plan, completed/remaining steps,
-                        # transcript) and continue it — never a fresh start.
-                        from pathlib import Path
-
-                        from ultron.core.coding.workspace import discover_workspace
-                        from ultron.core.memory.task_store import load_task
-
-                        # Tasks are saved under the workspace project root, so
-                        # resolve it the same way (cwd fallback for safety).
+                        logger.debug("ESC listener failed: %s", exc)
+                    finally:
                         try:
-                            resume_root = discover_workspace(
-                                str(Path.cwd())
-                            ).project_root
-                        except (OSError, ValueError):
-                            resume_root = str(Path.cwd())
-                        resumed = load_task(resume_root)
-                        if resumed is None:
-                            resumed = load_task(Path.cwd())
-                        if resumed is None:
+                            termios.tcflush(fd, termios.TCIFLUSH)
+                        except (OSError, ValueError) as exc:
+                            logger.debug("termios tcflush failed: %s", exc)
+                        try:
+                            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                        except (OSError, ValueError) as exc:
+                            logger.debug("termios tcsetattr failed: %s", exc)
+
+                cancel_event = threading.Event()
+                esc_thread = threading.Thread(target=_listen_for_esc, args=(cancel_event,), daemon=True)
+                esc_thread.start()
+
+                # Plan-aware execution (ReAct agent only): understand + classify
+                # the request and, when it is a complex task type, prepare a
+                # TaskState carrying a validated structured plan before the agent
+                # runs. Informational / simple / file-operation requests return
+                # None and stay on the fast path (no plan, no extra LLM call). A
+                # request that genuinely needs clarification is surfaced to the
+                # user instead of executing blindly.
+                from ultron.core.runtime import AgentRuntime
+
+                runtime = AgentRuntime(
+                    router=model_router,
+                    lifecycle_manager=lifecycle_manager
+                )
+                prepared_task = None
+
+                async def _plan_and_run(
+                    _agent=agent,
+                    _input=trimmed_input,
+                    _history=truncated_history,
+                    _runtime=runtime,
+                ):
+                    nonlocal prepared_task
+                    if isinstance(_agent, ReActAgent):
+                        if _input in ("/resume", "/continue"):
+                            # Fix #6: restore the last persisted task for this
+                            # workspace (goal, plan, completed/remaining steps,
+                            # transcript) and continue it — never a fresh start.
+                            from pathlib import Path
+
+                            from ultron.core.coding.workspace import discover_workspace
+                            from ultron.core.memory.task_store import load_task
+
+                            # Tasks are saved under the workspace project root, so
+                            # resolve it the same way (cwd fallback for safety).
+                            try:
+                                resume_root = discover_workspace(
+                                    str(Path.cwd())
+                                ).project_root
+                            except (OSError, ValueError):
+                                resume_root = str(Path.cwd())
+                            resumed = load_task(resume_root)
+                            if resumed is None:
+                                resumed = load_task(Path.cwd())
+                            if resumed is None:
+                                return None
+                            prepared_task = resumed
+                            run_res = await _runtime.execute(
+                                _agent,
+                                resumed.goal,
+                                _history,
+                                task=resumed,
+                                session=memory_session,
+                            )
+                            return run_res.message
+                        prepared_task = await prepare_task_for_execution(
+                            _input, _agent.engine
+                        )
+                        if prepared_task is not None and prepared_task.clarification_required:
                             return None
-                        prepared_task = resumed
                         run_res = await _runtime.execute(
                             _agent,
-                            resumed.goal,
+                            _input,
                             _history,
-                            task=resumed,
+                            task=prepared_task,
                             session=memory_session,
                         )
                         return run_res.message
-                    prepared_task = await prepare_task_for_execution(
-                        _input, _agent.engine
-                    )
-                    if prepared_task is not None and prepared_task.clarification_required:
-                        return None
-                    run_res = await _runtime.execute(
-                        _agent,
-                        _input,
-                        _history,
-                        task=prepared_task,
-                        session=memory_session,
-                    )
+                    run_res = await _runtime.execute(_agent, _input, _history)
                     return run_res.message
-                run_res = await _runtime.execute(_agent, _input, _history)
-                return run_res.message
 
-            state.status = "Thinking..."
-            agent_task = asyncio.create_task(_plan_and_run())
+                state.status = "Thinking..."
+                agent_task = asyncio.create_task(_plan_and_run())
 
-            with console.status(f"[{FAINT}]Thinking... (Press Esc to cancel)[/{FAINT}]"):
-                while not agent_task.done():
-                    if cancel_event.is_set():
-                        agent_task.cancel()
-                        break
-                    await asyncio.sleep(0.05)
+                with console.status(f"[{FAINT}]Thinking... (Press Esc to cancel)[/{FAINT}]"):
+                    while not agent_task.done():
+                        if cancel_event.is_set():
+                            agent_task.cancel()
+                            break
+                        await asyncio.sleep(0.05)
 
-            cancel_event.set()
-            esc_thread.join(timeout=0.2)
+                cancel_event.set()
+                esc_thread.join(timeout=0.2)
 
-            if agent_task.cancelled():
-                state.status = "Ready"
-                UI.render_status("Task execution cancelled by Esc key.", status="warning")
-                continue
+                if agent_task.cancelled():
+                    state.status = "Ready"
+                    UI.render_status("Task execution cancelled by Esc key.", status="warning")
+                    continue
 
-            try:
-                response_msg = await agent_task
-            except asyncio.CancelledError:
-                state.status = "Ready"
-                UI.render_status("Task execution cancelled by Esc key.", status="warning")
-                continue
+                try:
+                    response_msg = await agent_task
+                except asyncio.CancelledError:
+                    state.status = "Ready"
+                    UI.render_status("Task execution cancelled by Esc key.", status="warning")
+                    continue
 
-            if response_msg is None:
-                if trimmed_input in ("/resume", "/continue"):
+                if response_msg is None:
+                    if trimmed_input in ("/resume", "/continue"):
+                        UI.render_response(
+                            "No saved task was found in this workspace to resume."
+                        )
+                        history.append(ChatMessage(role=Role.USER, content=trimmed_input))
+                        continue
+                    # The request lacked information needed for safe planning —
+                    # surface the questions instead of executing blindly.
+                    questions = " ".join(
+                        prepared_task.clarification_questions or []
+                    )
                     UI.render_response(
-                        "No saved task was found in this workspace to resume."
+                        "I need more information before I can plan this safely: "
+                        f"{questions}"
                     )
                     history.append(ChatMessage(role=Role.USER, content=trimmed_input))
                     continue
-                # The request lacked information needed for safe planning —
-                # surface the questions instead of executing blindly.
-                questions = " ".join(
-                    prepared_task.clarification_questions or []
-                )
-                UI.render_response(
-                    "I need more information before I can plan this safely: "
-                    f"{questions}"
-                )
-                history.append(ChatMessage(role=Role.USER, content=trimmed_input))
-                continue
 
-            confirmations = 0
-            while response_msg.pending_action:
-                task = response_msg.task_state
-                # Adaptive per-turn cap: a known step count gets headroom,
-                # otherwise the constant applies — a degenerate model cannot
-                # ping-pong confirmations forever.
-                limit = MAX_CONFIRMATIONS_PER_TURN
-                if task is not None and task.total_steps > 0:
-                    limit = max(limit, task.total_steps + 2)
-                if confirmations >= limit:
-                    if task is not None:
-                        task.record_failure(
-                            "Exceeded the maximum number of confirmation steps in one turn"
-                        )
-                        remaining = task.remaining_requirements()
-                        if remaining:
-                            names = ", ".join(r.description for r in remaining)
-                            detail = f" Remaining requirements: {names}."
+                confirmations = 0
+                while response_msg.pending_action:
+                    task = response_msg.task_state
+                    # Adaptive per-turn cap: a known step count gets headroom,
+                    # otherwise the constant applies — a degenerate model cannot
+                    # ping-pong confirmations forever.
+                    limit = MAX_CONFIRMATIONS_PER_TURN
+                    if task is not None and task.total_steps > 0:
+                        limit = max(limit, task.total_steps + 2)
+                    if confirmations >= limit:
+                        if task is not None:
+                            task.record_failure(
+                                "Exceeded the maximum number of confirmation steps in one turn"
+                            )
+                            remaining = task.remaining_requirements()
+                            if remaining:
+                                names = ", ".join(r.description for r in remaining)
+                                detail = f" Remaining requirements: {names}."
+                            else:
+                                detail = ""
                         else:
                             detail = ""
+                        response_msg = ChatMessage(
+                            role=Role.ASSISTANT,
+                            content=(
+                                "I stopped after too many confirmation steps; the task is "
+                                f"incomplete.{detail} Please continue with a more specific "
+                                "request."
+                            ),
+                        )
+                        break
+                    confirmations += 1
+
+                    import questionary
+
+                    action = response_msg.pending_action
+                    state.status = f"Executing Tool: {action.action_type}"
+
+                    if action.action_type == "run_command":
+                        UI.render_action_card(
+                            title="Confirmation Required",
+                            action="Execute terminal command",
+                            target=action.target,
+                        )
+                    elif action.action_type == "read_file":
+                        UI.render_action_card(
+                            title="Confirmation Required",
+                            action="Read file",
+                            target=action.target,
+                        )
+                    elif action.action_type == "write_file":
+                        preview = (action.content or "")[:120]
+                        if len(action.content or "") > 120:
+                            preview += "…"
+                        UI.render_action_card(
+                            title="Confirmation Required",
+                            action="Create new file",
+                            target=action.target,
+                            preview=preview,
+                        )
+                    elif action.action_type == "overwrite_file":
+                        UI.render_action_card(
+                            title="Confirmation Required",
+                            action="Overwrite existing file",
+                            target=action.target,
+                        )
+                    elif action.action_type == "web_search":
+                        UI.render_action_card(
+                            title="Confirmation Required",
+                            action="Search the web",
+                            target=action.target,
+                        )
+                    elif action.action_type == "fetch_page":
+                        UI.render_action_card(
+                            title="Confirmation Required",
+                            action="Fetch web page",
+                            target=action.target,
+                        )
+                    elif action.action_type == "db_query":
+                        # Note: db_query represents a higher-risk action type because non-SELECT queries
+                        # modify or delete database state, so explicit interactive confirmation is required.
+                        UI.render_action_card(
+                            title="Database Warning: Confirmation Required",
+                            action="Execute database query",
+                            target=action.target,
+                        )
+                    elif action.action_type == "execute_plan":
+                        # Proactive plan approval: the full step + permission
+                        # preview was shown by the agent; here the user approves
+                        # the whole chain in one card instead of being prompted
+                        # per step mid-execution.
+                        import json as _json
+
+                        steps = _json.loads(action.target or "[]")
+                        UI.render_action_card(
+                            title="Plan Approval Required",
+                            action=f"Execute {len(steps)}-step plan",
+                            # The full plan is shown in the preview; dumping the raw
+                            # JSON into the chip line would wreck the layout.
+                            target="",
+                            preview=(action.content or "")[:500],
+                        )
+                    elif action.action_type in ("create_file", "replace_file", "replace_in_file", "append_to_file", "delete_file", "rename_file"):
+                        # Fix #3 coding file operations — confirmed like write_file.
+                        preview = (action.content or "")[:120]
+                        if len(action.content or "") > 120:
+                            preview += "…"
+                        UI.render_action_card(
+                            title="File Operation Confirmation Required",
+                            action=action.action_type.replace("_", " "),
+                            target=action.target,
+                            preview=preview if action.action_type in ("create_file", "replace_file", "replace_in_file", "append_to_file") else "",
+                        )
                     else:
-                        detail = ""
-                    response_msg = ChatMessage(
-                        role=Role.ASSISTANT,
-                        content=(
-                            "I stopped after too many confirmation steps; the task is "
-                            f"incomplete.{detail} Please continue with a more specific "
-                            "request."
-                        ),
-                    )
-                    break
-                confirmations += 1
+                        UI.render_action_card(
+                            title="Confirmation Required",
+                            action=action.action_type,
+                            target=action.target or "",
+                        )
 
-                import questionary
+                    choice = await questionary.select(
+                        "Do you want to allow this action?",
+                        choices=["Yes, allow", "No, don't allow"],
+                    ).ask_async()
 
-                action = response_msg.pending_action
-                state.status = f"Executing Tool: {action.action_type}"
+                    if choice == "Yes, allow":
+                        result = await execute_pending_action(action)
+                    else:
+                        result = "Action cancelled by user."
 
-                if action.action_type == "run_command":
-                    UI.render_action_card(
-                        title="Confirmation Required",
-                        action="Execute terminal command",
-                        target=action.target,
-                    )
-                elif action.action_type == "read_file":
-                    UI.render_action_card(
-                        title="Confirmation Required",
-                        action="Read file",
-                        target=action.target,
-                    )
-                elif action.action_type == "write_file":
-                    preview = (action.content or "")[:120]
-                    if len(action.content or "") > 120:
-                        preview += "…"
-                    UI.render_action_card(
-                        title="Confirmation Required",
-                        action="Create new file",
-                        target=action.target,
-                        preview=preview,
-                    )
-                elif action.action_type == "overwrite_file":
-                    UI.render_action_card(
-                        title="Confirmation Required",
-                        action="Overwrite existing file",
-                        target=action.target,
-                    )
-                elif action.action_type == "web_search":
-                    UI.render_action_card(
-                        title="Confirmation Required",
-                        action="Search the web",
-                        target=action.target,
-                    )
-                elif action.action_type == "fetch_page":
-                    UI.render_action_card(
-                        title="Confirmation Required",
-                        action="Fetch web page",
-                        target=action.target,
-                    )
-                elif action.action_type == "db_query":
-                    # Note: db_query represents a higher-risk action type because non-SELECT queries
-                    # modify or delete database state, so explicit interactive confirmation is required.
-                    UI.render_action_card(
-                        title="Database Warning: Confirmation Required",
-                        action="Execute database query",
-                        target=action.target,
-                    )
-                elif action.action_type == "execute_plan":
-                    # Proactive plan approval: the full step + permission
-                    # preview was shown by the agent; here the user approves
-                    # the whole chain in one card instead of being prompted
-                    # per step mid-execution.
-                    import json as _json
+                    if task is not None:
+                        # The original task survives confirmation: the result is fed
+                        # back as an observation and the agent continues working
+                        # toward the goal until TaskState reports it complete.
+                        UI.render_tool_execution(action.action_type, result)
+                        response_msg = await continue_task_after_confirmation(
+                            agent, task, result, history, session=memory_session
+                        )
+                    else:
+                        # No task (e.g. SimpleAgent path) — behave exactly as before:
+                        # one confirmed action per turn, result shown directly.
+                        response_msg = ChatMessage(role=Role.ASSISTANT, content=result)
+                        break
 
-                    steps = _json.loads(action.target or "[]")
-                    UI.render_action_card(
-                        title="Plan Approval Required",
-                        action=f"Execute {len(steps)}-step plan",
-                        # The full plan is shown in the preview; dumping the raw
-                        # JSON into the chip line would wreck the layout.
-                        target="",
-                        preview=(action.content or "")[:500],
-                    )
-                elif action.action_type in ("create_file", "replace_file", "replace_in_file", "append_to_file", "delete_file", "rename_file"):
-                    # Fix #3 coding file operations — confirmed like write_file.
-                    preview = (action.content or "")[:120]
-                    if len(action.content or "") > 120:
-                        preview += "…"
-                    UI.render_action_card(
-                        title="File Operation Confirmation Required",
-                        action=action.action_type.replace("_", " "),
-                        target=action.target,
-                        preview=preview if action.action_type in ("create_file", "replace_file", "replace_in_file", "append_to_file") else "",
-                    )
+                state.status = "Ready"
+
+                # Fix #6: persist the task snapshot so an interrupted session or a
+                # process restart can resume it (/resume). Only INCOMPLETE tasks
+                # are saved (a finished task has nothing to resume) and the store
+                # prunes old snapshots. Gated: never Ultron's own repository,
+                # never payloads carrying credential patterns.
+                if response_msg.task_state is not None:
+                    from pathlib import Path
+
+                    from ultron.core.memory.task_store import save_task
+
+                    _task = response_msg.task_state
+                    if not _task.is_complete():
+                        _ws = _task.code_context.workspace if _task.code_context else None
+                        _root = getattr(_ws, "project_root", None) if _ws is not None else None
+                        save_task(_task, _root or Path.cwd())
+
+                import re
+                tool_match = re.match(
+                    r"^Executed tool '(?:\[[^']*\])?([^'\]]+)(?:\[/[^']*\])?':\n\n(.*)$",
+                    response_msg.content,
+                    re.DOTALL,
+                )
+                if tool_match:
+                    # Every print is recorded by the resize reflow, so tool
+                    # executions and plain responses reflow automatically.
+                    UI.render_tool_execution(tool_match.group(1), tool_match.group(2))
                 else:
-                    UI.render_action_card(
-                        title="Confirmation Required",
-                        action=action.action_type,
-                        target=action.target or "",
-                    )
+                    UI.render_response(response_msg.content)
 
-                choice = await questionary.select(
-                    "Do you want to allow this action?",
-                    choices=["Yes, allow", "No, don't allow"],
-                ).ask_async()
+                history.append(ChatMessage(role=Role.USER, content=trimmed_input))
+                history.append(ChatMessage(role=Role.ASSISTANT, content=response_msg.content))
 
-                if choice == "Yes, allow":
-                    result = await execute_pending_action(action)
-                else:
-                    result = "Action cancelled by user."
+            except KeyboardInterrupt:
+                reflow.stop()
+                UI.render_status("Chat interrupted. Goodbye.", status="warning")
+                break
+            except Exception as e:  # noqa: BLE001 — CLI boundary: never crash the chat
+                logger.error(f"Error during chat execution: {e}")
+                UI.render_error(str(e), title="Runtime Error")
 
-                if task is not None:
-                    # The original task survives confirmation: the result is fed
-                    # back as an observation and the agent continues working
-                    # toward the goal until TaskState reports it complete.
-                    UI.render_tool_execution(action.action_type, result)
-                    response_msg = await continue_task_after_confirmation(
-                        agent, task, result, history, session=memory_session
-                    )
-                else:
-                    # No task (e.g. SimpleAgent path) — behave exactly as before:
-                    # one confirmed action per turn, result shown directly.
-                    response_msg = ChatMessage(role=Role.ASSISTANT, content=result)
-                    break
 
-            state.status = "Ready"
-
-            # Fix #6: persist the task snapshot so an interrupted session or a
-            # process restart can resume it (/resume). Only INCOMPLETE tasks
-            # are saved (a finished task has nothing to resume) and the store
-            # prunes old snapshots. Gated: never Ultron's own repository,
-            # never payloads carrying credential patterns.
-            if response_msg.task_state is not None:
-                from pathlib import Path
-
-                from ultron.core.memory.task_store import save_task
-
-                _task = response_msg.task_state
-                if not _task.is_complete():
-                    _ws = _task.code_context.workspace if _task.code_context else None
-                    _root = getattr(_ws, "project_root", None) if _ws is not None else None
-                    save_task(_task, _root or Path.cwd())
-
-            import re
-            tool_match = re.match(
-                r"^Executed tool '(?:\[[^']*\])?([^'\]]+)(?:\[/[^']*\])?':\n\n(.*)$",
-                response_msg.content,
-                re.DOTALL,
-            )
-            if tool_match:
-                # Every print is recorded by the resize reflow, so tool
-                # executions and plain responses reflow automatically.
-                UI.render_tool_execution(tool_match.group(1), tool_match.group(2))
-            else:
-                UI.render_response(response_msg.content)
-
-            history.append(ChatMessage(role=Role.USER, content=trimmed_input))
-            history.append(ChatMessage(role=Role.ASSISTANT, content=response_msg.content))
-
-        except KeyboardInterrupt:
-            reflow.stop()
-            UI.render_status("Chat interrupted. Goodbye.", status="warning")
-            break
-        except Exception as e:  # noqa: BLE001 — CLI boundary: never crash the chat
-            logger.error(f"Error during chat execution: {e}")
-            UI.render_error(str(e), title="Runtime Error")
-
-    # Phase 3.5: Cleanup dynamically loaded models
-    lifecycle_manager.shutdown()
+    finally:
+        # Phase 3.5: Cleanup dynamically loaded models
+        lifecycle_manager.shutdown()
 
 @app.command()
 def chat(
@@ -1235,10 +1206,14 @@ def chat(
 ):
 
 
+    import os
+    env_no_server = os.environ.get("ULTRON_NO_SERVER", "").lower() in ("1", "true", "yes")
+    effective_no_server = no_server or env_no_server
+
     async def _run_chat_session():
         # Dynamic Runtime Integration (Phase 3.5)
         # main.py no longer manages LlamaServerManager directly.
-        await async_chat(agent_type=agent)
+        await async_chat(agent_type=agent, no_server=effective_no_server)
 
     asyncio.run(_run_chat_session())
 
