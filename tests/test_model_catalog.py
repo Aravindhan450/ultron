@@ -262,7 +262,7 @@ class TestContextLength:
 
     def test_default_context_length(self, catalog: ModelCatalog) -> None:
         for spec in catalog.list_models():
-            assert spec.recommended_context_length == 8192
+            assert spec.recommended_context_length == 16384
 
 
 # ---------------------------------------------------------------------------

@@ -90,7 +90,7 @@ class ModelSpec(BaseModel):
         description="Declared capabilities of the model."
     )
     recommended_context_length: int = Field(
-        default=8192,
+        default=16384,
         description="Conservative default context length for this hardware profile.",
     )
 
@@ -232,7 +232,7 @@ _DEFAULT_MODELS: tuple[ModelSpec, ...] = (
             ModelCapability.AGENT,
             ModelCapability.STRUCTURED_OUTPUT,
         }),
-        recommended_context_length=8192,
+        recommended_context_length=16384,
     ),
     ModelSpec(
         model_id="gemma-3-4b-it",
@@ -249,7 +249,7 @@ _DEFAULT_MODELS: tuple[ModelSpec, ...] = (
             ModelCapability.STRUCTURED_OUTPUT,
             ModelCapability.VISION,
         }),
-        recommended_context_length=8192,
+        recommended_context_length=16384,
     ),
     ModelSpec(
         model_id="qwen2.5-coder-7b-instruct",
@@ -267,7 +267,7 @@ _DEFAULT_MODELS: tuple[ModelSpec, ...] = (
             ModelCapability.STRUCTURED_OUTPUT,
             ModelCapability.TOOL_USE,
         }),
-        recommended_context_length=8192,
+        recommended_context_length=16384,
     ),
 )
 
