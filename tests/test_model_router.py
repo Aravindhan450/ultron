@@ -114,6 +114,32 @@ def test_coding_complex(router):
     assert decision.selected_model.role == ModelRole.CODING
 
 
+def test_coding_in_progress(router):
+    req = RoutingRequest(
+        task_description="Implement feature.",
+        complexity=ComplexityLevel.MODERATE,
+        coding=True,
+        context_size=ContextSize.NORMAL,
+        task_state=TaskRoutingState.IN_PROGRESS,
+        memory_pressure=MemoryPressure.LOW,
+    )
+    decision = router.route(req)
+    assert decision.selected_model.role == ModelRole.CODING
+
+
+def test_coding_repair(router):
+    req = RoutingRequest(
+        task_description="Fix syntax error.",
+        complexity=ComplexityLevel.MODERATE,
+        coding=True,
+        context_size=ContextSize.NORMAL,
+        task_state=TaskRoutingState.REPAIR,
+        memory_pressure=MemoryPressure.LOW,
+    )
+    decision = router.route(req)
+    assert decision.selected_model.role == ModelRole.CODING
+
+
 def test_coding_escalation(router):
     req = RoutingRequest(
         task_description="Fix recursion error.",
@@ -126,6 +152,8 @@ def test_coding_escalation(router):
     decision = router.route(req)
     # Escalation on coding should prefer PRIMARY
     assert decision.selected_model.role == ModelRole.PRIMARY
+    assert "Escalation state overrides" in decision.reason
+    assert "deeper diagnosis" in decision.reason
 
 
 def test_high_memory_pressure_simple(router):
@@ -226,5 +254,37 @@ def test_missing_model_empty_catalog():
         task_state=TaskRoutingState.INITIAL,
         memory_pressure=MemoryPressure.LOW,
     )
-    with pytest.raises(RuntimeError, match="Cannot route: ModelCatalog is completely empty"):
+    with pytest.raises(RuntimeError, match="Cannot route: Required PRIMARY fallback model is missing from catalog"):
+        r.route(req)
+
+def test_primary_fallback_missing():
+    from ultron.core.intelligence.model_catalog import (
+        ModelCapability,
+        ModelCatalog,
+        ModelSpec,
+    )
+    
+    m1 = ModelSpec(
+        model_id="fast-only",
+        display_name="Fast Only",
+        family="none",
+        parameter_count="1B",
+        quantization="Q4",
+        filename="fast.gguf",
+        role=ModelRole.FAST,
+        capabilities=frozenset({ModelCapability.GENERAL}),
+    )
+    cat = ModelCatalog([m1])
+    r = ModelRouter(cat)
+    
+    req = RoutingRequest(
+        task_description="Fail.",
+        complexity=ComplexityLevel.SIMPLE,
+        coding=False,
+        context_size=ContextSize.LIGHT,
+        task_state=TaskRoutingState.INITIAL,
+        memory_pressure=MemoryPressure.LOW,
+    )
+    # The route should fail because PRIMARY fallback is missing
+    with pytest.raises(RuntimeError, match="Cannot route: Required PRIMARY fallback model is missing from catalog"):
         r.route(req)

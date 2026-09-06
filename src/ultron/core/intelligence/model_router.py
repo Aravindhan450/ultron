@@ -93,16 +93,35 @@ class ModelRouter:
 
     def route(self, request: RoutingRequest) -> RoutingDecision:
         """Evaluate the request signals and return the optimal routing decision."""
-        # Baseline fallback is always the primary model, or if unavailable, whatever we can find.
+        signals = {
+            "complexity": request.complexity.value,
+            "coding": str(request.coding),
+            "context_size": request.context_size.value,
+            "task_state": request.task_state.value,
+            "memory_pressure": request.memory_pressure.value,
+        }
+
+        # Baseline fallback is always the primary model.
         try:
             fallback = self.catalog.get_primary()
-        except KeyError:
-            # If no primary exists, fallback to the first available model
-            models = self.catalog.list_models()
-            if not models:
-                raise RuntimeError("Cannot route: ModelCatalog is completely empty.")
-            fallback = models[0]
+        except KeyError as e:
+            raise RuntimeError("Cannot route: Required PRIMARY fallback model is missing from catalog.") from e
 
+        # -------------------------------------------------------------------
+        # Explicit Routing Modes
+        # -------------------------------------------------------------------
+        if request.coding and request.task_state == TaskRoutingState.ESCALATION:
+            return RoutingDecision(
+                selected_model=fallback,
+                reason="Escalation state overrides coding specialist preference; PRIMARY selected for deeper diagnosis.",
+                confidence=ConfidenceLevel.HIGH,
+                fallback_model=fallback,
+                signals=signals,
+            )
+
+        # -------------------------------------------------------------------
+        # Normal Routing Mode
+        # -------------------------------------------------------------------
         candidates = self.catalog.list_models()
         if not candidates:
             raise RuntimeError("Cannot route: ModelCatalog is empty.")
@@ -135,14 +154,6 @@ class ModelRouter:
         if not reason_str:
             reason_str = "Selected via default fallback scoring."
 
-        signals = {
-            "complexity": request.complexity.value,
-            "coding": str(request.coding),
-            "context_size": request.context_size.value,
-            "task_state": request.task_state.value,
-            "memory_pressure": request.memory_pressure.value,
-        }
-
         return RoutingDecision(
             selected_model=best_model,
             reason=reason_str,
@@ -156,14 +167,10 @@ class ModelRouter:
         viable = []
         
         # If the task requires coding, we heavily prefer a model with CODING capability.
-        # However, the prompt says: "A model that cannot perform the task should not be selected.
-        # For example: coding task -> model must have CODING capability if a coding-capable model exists."
         has_coding_model = any(m.supports_coding for m in candidates)
         
         for m in candidates:
-            if request.coding and has_coding_model and not m.supports_coding and request.task_state != TaskRoutingState.ESCALATION:
-                # Escalation overrides the hard coding constraint because the primary model
-                # might be needed to diagnose a complex structural failure before coding resumes.
+            if request.coding and has_coding_model and not m.supports_coding:
                 continue
             viable.append(m)
             
@@ -179,17 +186,12 @@ class ModelRouter:
 
         # 1. Coding Preference
         if request.coding:
-            if request.task_state == TaskRoutingState.ESCALATION:
-                if model.role == ModelRole.PRIMARY:
-                    score += 15
-                    reasons.append("Escalation state overrides coding role; PRIMARY preferred for deep reasoning.")
-            else:
-                if model.supports_coding and model.role == ModelRole.CODING:
-                    score += 20
-                    reasons.append("Coding task; coding specialist has strongest capability match.")
-                elif model.supports_coding:
-                    score += 10
-                    reasons.append("Coding task; model has coding capability.")
+            if model.supports_coding and model.role == ModelRole.CODING:
+                score += 20
+                reasons.append("Coding task; coding specialist has strongest capability match.")
+            elif model.supports_coding:
+                score += 10
+                reasons.append("Coding task; model has coding capability.")
         else:
             # Non-coding tasks
             if model.role == ModelRole.CODING:
