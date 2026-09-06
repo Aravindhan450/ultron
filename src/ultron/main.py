@@ -4,7 +4,6 @@ import typer
 
 from ultron import __version__
 from ultron.core.config import settings
-from ultron.core.engine.server import LlamaServerManager
 from ultron.core.intelligence.prompt_assembly import build_response_guidance
 from ultron.core.logging import get_logger
 from ultron.core.types import ChatMessage, PendingAction, TaskState
@@ -809,6 +808,15 @@ async def async_chat(agent_type: str = "simple"):
 
     memory_session = SessionMemory()
 
+    # Dynamic Runtime Integration (Phase 3.5)
+    from ultron.core.intelligence.model_catalog import get_default_catalog
+    from ultron.core.intelligence.model_lifecycle import ModelLifecycleManager
+    from ultron.core.intelligence.model_router import ModelRouter
+
+    catalog = get_default_catalog()
+    model_router = ModelRouter(catalog)
+    lifecycle_manager = ModelLifecycleManager()
+
     # Record every renderable printed during the session and, on terminal
     # resize while the chat prompt is live, re-render the whole conversation
     # at the window's new width — so every response box, tool panel and table
@@ -917,7 +925,10 @@ async def async_chat(agent_type: str = "simple"):
             # user instead of executing blindly.
             from ultron.core.runtime import AgentRuntime
 
-            runtime = AgentRuntime()
+            runtime = AgentRuntime(
+                router=model_router,
+                lifecycle_manager=lifecycle_manager
+            )
             prepared_task = None
 
             async def _plan_and_run(
@@ -1205,6 +1216,9 @@ async def async_chat(agent_type: str = "simple"):
             logger.error(f"Error during chat execution: {e}")
             UI.render_error(str(e), title="Runtime Error")
 
+    # Phase 3.5: Cleanup dynamically loaded models
+    lifecycle_manager.shutdown()
+
 @app.command()
 def chat(
     agent: str = typer.Option(
@@ -1219,32 +1233,12 @@ def chat(
         help="Skip starting local llama-server (e.g. for testing or when using external endpoint).",
     ),
 ):
-    import os
 
-    skip_server = no_server or (
-        os.environ.get("ULTRON_NO_SERVER", "").lower() in ("1", "true", "yes")
-    )
 
     async def _run_chat_session():
-        server_manager = LlamaServerManager()
-        server_started = False
-        try:
-            # If server is not skipped and not already running, start local server
-            if not skip_server and not server_manager.check_endpoint_occupied():
-                UI.render_status("Starting local llama-server...", status="info")
-                try:
-                    server_manager.start()
-                    server_started = True
-                    UI.render_status("llama-server is ready.", status="success")
-                except Exception as exc:  # noqa: BLE001
-                    logger.error("Failed to start llama-server: %s", exc)
-                    UI.render_error(str(exc), title="Server Startup Error")
-                    return
-            await async_chat(agent_type=agent)
-        finally:
-            if server_started:
-                UI.render_status("Stopping local llama-server...", status="info")
-                server_manager.stop()
+        # Dynamic Runtime Integration (Phase 3.5)
+        # main.py no longer manages LlamaServerManager directly.
+        await async_chat(agent_type=agent)
 
     asyncio.run(_run_chat_session())
 

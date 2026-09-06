@@ -21,13 +21,22 @@ from typing import Any
 
 from ultron.core.agents.base import BaseAgent
 from ultron.core.context.manager import RepositoryContextManager
+from ultron.core.intelligence.model_lifecycle import ModelLifecycleManager
+from ultron.core.intelligence.model_router import (
+    ComplexityLevel,
+    ContextSize,
+    MemoryPressure,
+    ModelRouter,
+    RoutingRequest,
+    TaskRoutingState,
+)
 from ultron.core.logging import get_logger
 from ultron.core.runtime.budget import BudgetExceededError, RuntimeBudget
 from ultron.core.runtime.cancellation import CancellationToken
 from ultron.core.runtime.events import EventBus, RuntimeEvent, RuntimeEventType
 from ultron.core.runtime.result import RunResult
 from ultron.core.runtime.state import RunState, RuntimeStatus
-from ultron.core.types import ChatMessage, TaskState
+from ultron.core.types import ChatMessage, TaskState, TaskType
 
 logger = get_logger("ultron.runtime")
 
@@ -42,10 +51,58 @@ class AgentRuntime:
         event_bus: EventBus | None = None,
         default_budget: RuntimeBudget | None = None,
         context_manager: RepositoryContextManager | None = None,
+        router: ModelRouter | None = None,
+        lifecycle_manager: ModelLifecycleManager | None = None,
     ) -> None:
         self.event_bus = event_bus or EventBus()
         self.default_budget = default_budget or RuntimeBudget()
         self.context_manager = context_manager or RepositoryContextManager()
+        self.router = router
+        self.lifecycle_manager = lifecycle_manager
+
+    def _build_routing_request(self, user_input: str, task: TaskState | None) -> RoutingRequest:
+        if not task:
+            return RoutingRequest(
+                task_description=user_input,
+                complexity=ComplexityLevel.SIMPLE,
+                coding=False,
+                context_size=ContextSize.LIGHT,
+                task_state=TaskRoutingState.INITIAL,
+                memory_pressure=MemoryPressure.LOW,
+            )
+
+        coding = False
+        if task.task_type == TaskType.SOFTWARE_ENGINEERING or task.code_context is not None:
+            coding = True
+
+        complexity = ComplexityLevel.SIMPLE
+        if task.plan:
+            if len(task.plan.steps) > 3:
+                complexity = ComplexityLevel.MODERATE
+            if len(task.plan.steps) > 7:
+                complexity = ComplexityLevel.COMPLEX
+
+        state = TaskRoutingState.INITIAL
+        if task.errors:
+            if len(task.errors) > 2:
+                state = TaskRoutingState.ESCALATION
+            else:
+                state = TaskRoutingState.REPAIR
+        elif task.current_step > 0:
+            state = TaskRoutingState.IN_PROGRESS
+
+        context_size = ContextSize.NORMAL
+        if len(task.context) > 20:
+            context_size = ContextSize.HEAVY
+
+        return RoutingRequest(
+            task_description=task.goal,
+            complexity=complexity,
+            coding=coding,
+            context_size=context_size,
+            task_state=state,
+            memory_pressure=MemoryPressure.LOW,
+        )
 
     async def execute(
         self,
@@ -60,6 +117,20 @@ class AgentRuntime:
         """
         Executes an agent run through the runtime lifecycle.
         """
+        if self.router and self.lifecycle_manager:
+            # 1. Routing decision
+            req = self._build_routing_request(user_input, task)
+            decision = self.router.route(req)
+            
+            # 2. Lifecycle loading
+            handle = self.lifecycle_manager.ensure_loaded(decision.selected_model)
+            
+            # 3. Update agent's engine endpoint dynamically
+            if hasattr(agent.engine, "base_url"):
+                agent.engine.base_url = handle.endpoint_url
+            if hasattr(agent.engine, "set_model"):
+                agent.engine.set_model(handle.model_spec.model_id)
+
         run_id = f"run_{uuid.uuid4().hex[:8]}"
         task_id = getattr(task, "task_id", None) if task else None
         parent_task_id = getattr(task, "parent_task_id", None) if task else None
