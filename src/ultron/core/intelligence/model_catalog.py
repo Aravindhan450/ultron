@@ -239,8 +239,8 @@ _DEFAULT_MODELS: tuple[ModelSpec, ...] = (
         display_name="Gemma 3 4B IT",
         family="gemma-3",
         parameter_count="4B",
-        quantization="Q8_K_M",
-        filename="gemma-3-4b-it-Q8_K_M.gguf",
+        quantization="Q8_0",
+        filename="gemma-3-4b-it-Q8_0.gguf",
         role=ModelRole.FAST,
         capabilities=frozenset({
             ModelCapability.GENERAL,

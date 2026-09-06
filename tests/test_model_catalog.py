@@ -60,7 +60,7 @@ class TestQuantizations:
         assert catalog.get("qwen3-8b").quantization == "Q5_K_M"
 
     def test_gemma_quantization(self, catalog: ModelCatalog) -> None:
-        assert catalog.get("gemma-3-4b-it").quantization == "Q8_K_M"
+        assert catalog.get("gemma-3-4b-it").quantization == "Q8_0"
 
     def test_coder_quantization(self, catalog: ModelCatalog) -> None:
         assert catalog.get("qwen2.5-coder-7b-instruct").quantization == "Q8_0"
@@ -220,7 +220,7 @@ class TestModelMetadata:
         assert m.display_name == "Gemma 3 4B IT"
         assert m.family == "gemma-3"
         assert m.parameter_count == "4B"
-        assert m.filename == "gemma-3-4b-it-Q8_K_M.gguf"
+        assert m.filename == "gemma-3-4b-it-Q8_0.gguf"
 
     def test_coder_metadata(self, catalog: ModelCatalog) -> None:
         m = catalog.get("qwen2.5-coder-7b-instruct")
@@ -245,7 +245,7 @@ class TestPathResolution:
     def test_resolve_default_home_models(self, catalog: ModelCatalog) -> None:
         spec = catalog.get("gemma-3-4b-it")
         resolved = spec.resolve_path()
-        assert resolved == Path.home() / "models" / "gemma-3-4b-it-Q8_K_M.gguf"
+        assert resolved == Path.home() / "models" / "gemma-3-4b-it-Q8_0.gguf"
 
     def test_resolve_with_tmp_dir(self, catalog: ModelCatalog, tmp_path: Path) -> None:
         spec = catalog.get("qwen2.5-coder-7b-instruct")
