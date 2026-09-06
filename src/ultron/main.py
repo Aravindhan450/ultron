@@ -1135,7 +1135,7 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False):
                         # toward the goal until TaskState reports it complete.
                         UI.render_tool_execution(action.action_type, result)
                         response_msg = await continue_task_after_confirmation(
-                            agent, task, result, history, session=memory_session
+                            agent, task, result, history, session=memory_session, runtime=runtime
                         )
                     else:
                         # No task (e.g. SimpleAgent path) — behave exactly as before:
