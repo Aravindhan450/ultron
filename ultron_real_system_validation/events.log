@@ -1,0 +1,104 @@
+--- ULTRON VALIDATION LOG (FULL RUN) ---
+[20:45:33] BASELINE STARTING...
+[20:45:33] BASELINE: Ultron: RUNNING, Active model: NONE, llama-server PID: NONE
+[20:45:33] --- TEST A: Simple Task (Expect FAST Gemma - FAIL) ---
+[20:45:34] Test A Failed (Expected): Failed to load model gemma-3-4b-it: Configured GGUF model file not found: '/Users/aravindhan/models/gemma-3-4b-it-Q8_K_M.gguf'. Please verify ULTRON_LLAMA_SERVER_MODEL_PATH in .env.
+[20:45:34] --- TEST B: Reasoning Task (Expect PRIMARY Qwen3) ---
+[20:47:55] Result B: Model=qwen3-8b, Time=141.7s, Res=The minimum number of weighings required to identify the heavier coin among 8 coins is **2**.
+
+### Steps:
+1. **First Weighing**: Divide the 8 coins into three groups (3, 3, 2). Weigh the two groups of 3 against each other.
+   - If one side is heavier, the heavy coin is in that group of 3.
+   - If balanced, the heavy coin is in the remaining group of 2.
+
+2. **Second Weighing**:
+   - If the heavy coin is in a group of 3, weigh one coin against another:
+     - The heavier side reveals the coin.
+     - If balanced, the third coin is the heavy one.
+   - If the heavy coin is in the group of 2, weigh one against the other to identify the heavier one.
+
+This method ensures the heavy coin is found in **2 weighings**.
+[20:47:55] --- TEST C: Coding Task (Expect CODING Qwen2.5-coder) ---
+[20:49:28] Result C: Model=qwen2.5-coder-7b-instruct, Time=92.4s, Res=To find the longest substring without repeating characters in a given string, you can use a sliding window approach. Here's a Python function that implements this:
+
+```python
+def length_of_longest_substring(s):
+    char_index_map = {}
+    left = 0
+    max_length = 0
+
+    for right, char in enumerate(s):
+        if char in char_index_map and char_index_map[char] >= left:
+            left = char_index_map[char] + 1
+        char_index_map[char] = right
+        max_length = max(max_length, right - left + 1)
+
+    return max_length
+
+# Example usage:
+input_string = "abcabcbb"
+print("The length of the longest substring without repeating characters is:", length_of_longest_substring(input_string))
+```
+
+### Explanation:
+1. **Initialization**:
+   - `char_index_map`: A dictionary to store the last seen index of each character.
+   - `left`: The starting index of the current window.
+   - `max_length`: The length of the longest substring found so far.
+
+2. **Sliding Window**:
+   - Iterate through the string with `right` being the ending index of the current window.
+   - If the character is already in the dictionary and its index is within the current window (`char_index_map[char] >= left`), move the `left` pointer to `char_index_map[char] + 1` to ensure no repeating characters in the current window.
+   - Update the last seen index of the character in the dictionary.
+   - Calculate the length of the current window (`right - left + 1`) and update `max_length` if the current window is longer.
+
+3. **Return**:
+   - The function returns the length of the longest substring without repeating characters.
+
+This approach ensures that each character is processed at most twice, resulting in an efficient O(n) time complexity.
+[20:49:28] --- TEST D: Coding Repair (Expect CODING Qwen2.5-coder) ---
+[20:49:29] Result D: Model=qwen2.5-coder-7b-instruct, Time=0.8s, Res=Exit code: 1
+Output:
+_phase5_live_validation.py:1:1: I001 [*] Import block is un-sorted or un-formatted
+_phase5_live_validation.py:12:62: F401 [*] `ultron.core.types.TaskStatus` imported but unused
+_phase5_live_validation.py:28:18: ASYNC221 Async functions should not run processes with blocking methods
+_phase5_live_validation.py:46:10: ASYNC230 Async functions should not open files with blocking methods like `open`
+_phase5_live_validation.py:69:16: BLE001 Do not catch blind exception: `Exception`
+_phase5_live_validation.py:84:16: BLE001 Do not catch blind exception: `Exception`
+_phase5_live_validation.py:96:16: BLE001 Do not catch blind exception: `Exception`
+_phase5_live_validation.py:108:16: BLE001 Do not catch blind exception: `Exception`
+_phase5_live_validation.py:122:16: BLE001 Do not catch blind exception: `Exception`
+_phase5_live_validation.py:129:12: BLE001 Do not catch blind exception: `Exception`
+tests/test_dynamic_routing.py:1:1: I001 [*] Import block is un-sorted or un-formatted
+tests/test_dynamic_routing.py:10:38: F401 [*] `ultron.security.boundary.SecurityBoundary` imported but unused
+tests/test_dynamic_routing.py:18:1: I001 [*] Import block is un-sorted or un-formatted
+tests/test_dynamic_routing.py:102:72: F401 [*] `ultron.core.intelligence.model_router.RoutingRequest` imported but unused
+tests/test_dynamic_routing.py:128:5: I001 [*] Import block is un-sorted or un-formatted
+tests/test_dynamic_routing.py:149:5: I001 [*] Import block is un-sorted or un-formatted
+tests/test_production_caller.py:1:1: I001 [*] Import block is un-sorted or un-formatted
+tests/test_production_caller.py:10:5: I001 [*] Import block is un-sorted or un-formatted
+tests/test_production_caller.py:19:85: F841 Local variable `mock_lifecycle` is assigned to but never used
+tests/test_production_caller.py:20:72: F841 Local variable `mock_router` is assigned to but never used
+tests/test_real_continuation.py:1:1: I001 [*] Import block is un-sorted or un-formatted
+tests/test_real_continuation.py:2:27: F401 [*] `unittest.mock.AsyncMock` imported but unused
+tests/test_real_continuation.py:6:64: F401 [*] `ultron.core.intelligence.model_router.RoutingRequest` imported but unused
+tests/test_real_continuation.py:6:80: F401 [*] `ultron.core.intelligence.model_router.RoutingDecision` imported but unused
+tests/test_real_continuation.py:40:14: RUF059 Unpacked variable `catalog` is never used
+tests/test_real_continuation.py:82:14: RUF059 Unpacked variable `catalog` is never used
+tests/test_real_continuation.py:100:9: F841 Local variable `result_msg` is assigned to but never used
+Found 27 errors.
+[*] 14 fixable with the `--fix` option (5 hidden fixes can be enabled with the `--unsafe-fixes` option).
+[resources] finished in 0.07 s · CPU 0.05 s · peak ~1 MB
+[20:49:29] --- TEST E: Escalation (Expect PRIMARY Qwen3) ---
+[20:51:47] Result E: Model=qwen3-8b, Time=138.5s, Res=To assist with fixing the error, I need more details. Could you please provide:
+1. The **error message** you're encountering
+2. **Context** (what you were trying to do when it failed)
+3. **Previous steps** you've taken to resolve it
+
+This will help me determine if we need to:
+- Check file contents (`read_file`)
+- Analyze code patterns (`code_search`)
+- Verify dependencies (`check_dependency`)
+- Or investigate system state (`check_resources`)
+[20:51:47] --- LONG RUN VALIDATION ---
+[20:51:47] OBSERVATION: Ultron: RUNNING, Active model: qwen3-8b, llama-server PID: 19253
