@@ -1,12 +1,27 @@
-import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import MagicMock, patch
 
-from ultron.main import continue_task_after_confirmation
+import pytest
+
+from ultron.core.intelligence.model_catalog import ModelRole, get_default_catalog
+from ultron.core.intelligence.model_lifecycle import (
+    LifecycleState,
+    ModelHandle,
+    ModelLifecycleManager,
+)
+from ultron.core.intelligence.model_router import (
+    ModelRouter,
+)
 from ultron.core.runtime.runtime import AgentRuntime
-from ultron.core.intelligence.model_router import ModelRouter, RoutingRequest, RoutingDecision
-from ultron.core.intelligence.model_catalog import get_default_catalog, ModelRole
-from ultron.core.intelligence.model_lifecycle import ModelLifecycleManager, ModelHandle, LifecycleState
-from ultron.core.types import TaskState, TaskType, TaskError, TaskStatus, ChatMessage, Role
+from ultron.core.types import (
+    ChatMessage,
+    Role,
+    TaskError,
+    TaskState,
+    TaskStatus,
+    TaskType,
+)
+from ultron.main import continue_task_after_confirmation
+
 
 class DummyEngine:
     def __init__(self):
@@ -37,7 +52,7 @@ def test_setup():
 
 @pytest.mark.anyio
 async def test_real_repair_continuation_re_enters_routing(test_setup):
-    runtime, catalog = test_setup
+    runtime, _catalog = test_setup
     
     # Spy on runtime.execute and router.route
     with patch.object(runtime, 'execute', wraps=runtime.execute) as spy_execute, \
@@ -79,7 +94,7 @@ async def test_real_repair_continuation_re_enters_routing(test_setup):
 
 @pytest.mark.anyio
 async def test_real_escalation_continuation_re_enters_routing(test_setup):
-    runtime, catalog = test_setup
+    runtime, _catalog = test_setup
     
     # Spy on runtime.execute and router.route
     with patch.object(runtime, 'execute', wraps=runtime.execute) as spy_execute, \
@@ -97,7 +112,7 @@ async def test_real_escalation_continuation_re_enters_routing(test_setup):
         task.status = TaskStatus.TASK_RUNNING
         
         # The confirmation is granted, so we call the real continuation function
-        result_msg = await continue_task_after_confirmation(
+        await continue_task_after_confirmation(
             agent=agent,
             task=task,
             result="Tool output: error still not fixed",

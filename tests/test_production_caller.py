@@ -1,5 +1,7 @@
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+
 
 @pytest.mark.anyio
 async def test_production_confirmation_path_passes_runtime():
@@ -7,8 +9,8 @@ async def test_production_confirmation_path_passes_runtime():
     Objective A: Prove that the production caller in async_chat passes the runtime
     to continue_task_after_confirmation.
     """
+    from ultron.core.types import ChatMessage, PendingAction, Role, TaskState, TaskType
     from ultron.main import async_chat
-    from ultron.core.types import ChatMessage, Role, PendingAction, TaskState, TaskType
 
     # Mock all the interactive/CLI parts so async_chat can run headlessly
     with patch("prompt_toolkit.PromptSession") as mock_prompt_session_cls, \
@@ -16,8 +18,8 @@ async def test_production_confirmation_path_passes_runtime():
          patch("ultron.main.execute_pending_action", new_callable=AsyncMock) as mock_execute, \
          patch("ultron.main.continue_task_after_confirmation", new_callable=AsyncMock) as mock_continue, \
          patch("ultron.core.agents.get_agent") as mock_get_agent, \
-         patch("ultron.core.intelligence.model_lifecycle.ModelLifecycleManager") as mock_lifecycle, \
-         patch("ultron.core.intelligence.model_router.ModelRouter") as mock_router:
+         patch("ultron.core.intelligence.model_lifecycle.ModelLifecycleManager"), \
+         patch("ultron.core.intelligence.model_router.ModelRouter"):
 
         # 1. Provide an agent that returns a pending action
         mock_agent = MagicMock()

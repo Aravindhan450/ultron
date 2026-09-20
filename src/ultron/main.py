@@ -990,12 +990,10 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False):
                     # The request lacked information needed for safe planning —
                     # surface the questions instead of executing blindly.
                     questions = " ".join(
-                        prepared_task.clarification_questions or []
+                        (prepared_task.clarification_questions or []) if prepared_task else []
                     )
-                    UI.render_response(
-                        "I need more information before I can plan this safely: "
-                        f"{questions}"
-                    )
+                    msg = f"I need more information before I can plan this safely: {questions}" if questions else "I could not complete that request."
+                    UI.render_response(msg)
                     history.append(ChatMessage(role=Role.USER, content=trimmed_input))
                     continue
 

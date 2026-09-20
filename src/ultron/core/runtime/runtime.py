@@ -16,6 +16,7 @@ Owns:
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from typing import Any
 
@@ -72,14 +73,27 @@ class AgentRuntime:
                 coding = True
                 
             complexity = ComplexityLevel.SIMPLE
-            if classification.task_type == TaskType.MULTI_STEP:
+            _REASONING_PATTERNS = re.compile(
+                r"\b(reason\s+through|tradeoffs?|pros\s+and\s+cons|budget\b|plan\w*|"
+                r"allocat\w*|compar\w*|evaluat\w*|priorit\w*|break\s*down|step[-\s]by[-\s]step|"
+                r"strateg\w*|recommend\w*)\b",
+                re.IGNORECASE,
+            )
+            if (
+                classification.task_type == TaskType.MULTI_STEP
+                or _REASONING_PATTERNS.search(user_input)
+            ):
                 complexity = ComplexityLevel.MODERATE
+
+            context_size = (
+                ContextSize.NORMAL if len(user_input.split()) > 25 else ContextSize.LIGHT
+            )
 
             return RoutingRequest(
                 task_description=user_input,
                 complexity=complexity,
                 coding=coding,
-                context_size=ContextSize.LIGHT,
+                context_size=context_size,
                 task_state=TaskRoutingState.INITIAL,
                 memory_pressure=MemoryPressure.LOW,
             )
@@ -134,6 +148,19 @@ class AgentRuntime:
             # 1. Routing decision
             req = self._build_routing_request(user_input, task)
             decision = self.router.route(req)
+            
+            logger.info(
+                "Task classified: complexity=%s, coding=%s, context=%s",
+                req.complexity.value,
+                req.coding,
+                req.context_size.value,
+            )
+            logger.info(
+                "ModelRouter decision: selected=%s (role=%s), reason=%s",
+                decision.selected_model.model_id,
+                decision.selected_model.role.value,
+                decision.reason,
+            )
             
             # 2. Lifecycle loading
             handle = self.lifecycle_manager.ensure_loaded(decision.selected_model)

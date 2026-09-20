@@ -137,9 +137,8 @@ class ModelRouter:
             score, reasons = self._score_model(model, request)
             scored_candidates.append((score, model, reasons))
 
-        # Sort descending by score. In ties, Python's stable sort preserves original catalog order,
-        # but to be deterministic regardless of order, we sort by score desc, then ID asc.
-        scored_candidates.sort(key=lambda x: (-x[0], x[1].model_id))
+        # Sort descending by score. In ties, prefer PRIMARY over non-PRIMARY, then sort deterministically by model_id.
+        scored_candidates.sort(key=lambda x: (-x[0], 0 if x[1].role == ModelRole.PRIMARY else 1, x[1].model_id))
 
         best_score, best_model, best_reasons = scored_candidates[0]
         
@@ -206,9 +205,13 @@ class ModelRouter:
             if model.role == ModelRole.PRIMARY:
                 score += 10
                 reasons.append("Complex task; PRIMARY model preferred for deep reasoning.")
-        elif request.complexity == ComplexityLevel.MODERATE and model.role in (ModelRole.FAST, ModelRole.PRIMARY):
-            score += 5
-            reasons.append(f"Moderate task; {model.role.value} model is suitable.")
+        elif request.complexity == ComplexityLevel.MODERATE:
+            if model.role == ModelRole.PRIMARY:
+                score += 10
+                reasons.append("Moderate task; PRIMARY model preferred for deeper reasoning.")
+            elif model.role == ModelRole.FAST:
+                score += 5
+                reasons.append("Moderate task; FAST model is suitable.")
 
         # 3. Context Preference
         if request.context_size == ContextSize.HEAVY:

@@ -1,13 +1,15 @@
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
-from unittest.mock import MagicMock, AsyncMock
-from ultron.core.runtime.runtime import AgentRuntime
-from ultron.core.intelligence.model_router import ModelRouter, RoutingDecision
-from ultron.core.intelligence.model_catalog import get_default_catalog, ModelRole
-from ultron.core.intelligence.model_lifecycle import ModelLifecycleManager, ModelHandle
-from ultron.core.types import TaskState, TaskType, TaskPlan
+
 from ultron.core.agents.base import BaseAgent
 from ultron.core.agents.react import ReActAgent
-from ultron.security.boundary import SecurityBoundary
+from ultron.core.intelligence.model_catalog import ModelRole, get_default_catalog
+from ultron.core.intelligence.model_lifecycle import ModelHandle, ModelLifecycleManager
+from ultron.core.intelligence.model_router import ModelRouter, RoutingDecision
+from ultron.core.runtime.runtime import AgentRuntime
+from ultron.core.types import TaskPlan, TaskState, TaskType
+
 
 class DummyEngine:
     def __init__(self):
@@ -16,6 +18,8 @@ class DummyEngine:
         pass
 
 from ultron.core.types import ChatMessage, Role
+
+
 class DummyAgent(BaseAgent):
     def __init__(self):
         super().__init__(engine=DummyEngine())
@@ -99,7 +103,7 @@ async def test_e_model_switch(runtime):
 
 @pytest.mark.anyio
 async def test_f_routing_authority(catalog, lifecycle_manager):
-    from ultron.core.intelligence.model_router import ConfidenceLevel, RoutingRequest
+    from ultron.core.intelligence.model_router import ConfidenceLevel
     router = ModelRouter(catalog)
     router.route = MagicMock(return_value=RoutingDecision(
         selected_model=catalog.get_coding(),
@@ -127,7 +131,7 @@ async def test_g_react_compatibility(runtime):
 async def test_repair_re_enters_routing(catalog, lifecycle_manager):
     from ultron.core.intelligence.model_router import ModelRouter
     from ultron.core.runtime.runtime import AgentRuntime
-    from ultron.core.types import TaskState, TaskType, TaskError, TaskStatus
+    from ultron.core.types import TaskError, TaskState, TaskStatus, TaskType
     
     router = ModelRouter(catalog)
     runtime = AgentRuntime(router=router, lifecycle_manager=lifecycle_manager)
@@ -148,7 +152,7 @@ async def test_repair_re_enters_routing(catalog, lifecycle_manager):
 async def test_escalation_re_enters_routing(catalog, lifecycle_manager):
     from ultron.core.intelligence.model_router import ModelRouter
     from ultron.core.runtime.runtime import AgentRuntime
-    from ultron.core.types import TaskState, TaskType, TaskError, TaskStatus
+    from ultron.core.types import TaskError, TaskState, TaskStatus, TaskType
     
     router = ModelRouter(catalog)
     runtime = AgentRuntime(router=router, lifecycle_manager=lifecycle_manager)

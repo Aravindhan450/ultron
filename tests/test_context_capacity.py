@@ -1,10 +1,10 @@
-import pytest
-from ultron.core.intelligence.model_catalog import get_default_catalog
 from ultron.core.agents.react import build_system_prompt
+from ultron.core.intelligence.model_catalog import get_default_catalog
+
 
 def test_context_capacity_sufficient_for_react_prompt():
     catalog = get_default_catalog()
-    prompt = build_system_prompt()
+    build_system_prompt()
     
     # A rough upper bound for tokens is len(prompt) / 3 or 4.
     # The prompt is ~25000 characters. 25000 / 3 = ~8300 tokens.
