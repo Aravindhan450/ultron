@@ -242,7 +242,8 @@ def _clean_json_escapes(s: str) -> str:
 def _parse_json_object(text: str) -> Any:
     """
     Parses a JSON object, falling back to the first '{' .. last '}' span
-    and tolerating raw code backslashes (e.g. regex patterns like \\w, \\s).
+    and tolerating raw code backslashes (e.g. regex patterns like \\w, \\s)
+    and extra trailing closing braces or text.
     """
     candidates = [text]
     first = text.find("{")
@@ -251,13 +252,16 @@ def _parse_json_object(text: str) -> Any:
         candidates.append(text[first : last + 1])
 
     for cand in candidates:
-        try:
-            return json.loads(cand, strict=False)
-        except (json.JSONDecodeError, ValueError):
+        for attempt in (cand, _clean_json_escapes(cand)):
             try:
-                cleaned = _clean_json_escapes(cand)
-                return json.loads(cleaned, strict=False)
-            except (json.JSONDecodeError, ValueError):
+                return json.loads(attempt, strict=False)
+            except json.JSONDecodeError as exc:
+                if exc.pos > 0:
+                    try:
+                        return json.loads(attempt[:exc.pos], strict=False)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+            except ValueError:
                 pass
     return None
 
@@ -1076,11 +1080,13 @@ class ReActAgent(BaseAgent):
                 )
 
             response = (await self.engine.generate(history_to_openai_format(messages))) or ""
+            logger.info("ReAct iteration %d model response: %r", active_budget.iterations_used, response[:250])
 
             if cancellation_token is not None:
                 cancellation_token.check()
 
             tool_call = extract_tool_call(response)
+            logger.info("ReAct iteration %d extracted tool_call: %r", active_budget.iterations_used, tool_call)
 
             # No tool call → the model proposes a final answer. If the task is
             # still being verified, do NOT accept the answer on the model's
@@ -1722,8 +1728,9 @@ class ReActAgent(BaseAgent):
         if tool_name == "write_file":
             # handle_file_write runs the same boundary gate: deny → blocked,
             # allow (permissive mode) → direct write, confirm → PendingAction.
+            file_path = str(arguments.get("file_path") or arguments.get("filename") or arguments.get("path") or "")
             return handle_file_write(
-                str(arguments.get("filename", "")),
+                file_path,
                 str(arguments.get("content", "")),
                 user_input=user_input,
             )

@@ -24,6 +24,7 @@ class ContextSourceType(str, Enum):
     SYMBOL_REFERENCE = "symbol_reference"
     SEARCH_RESULT = "search_result"
     GIT_STATE = "git_state"
+    CHANGES_AND_DIFF = "changes_and_diff"
     OBSERVATION = "observation"
     TEST_RESULT = "test_result"
     ARTIFACT = "artifact"

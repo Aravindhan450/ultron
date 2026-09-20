@@ -37,7 +37,7 @@ from ultron.core.runtime.cancellation import CancellationToken
 from ultron.core.runtime.events import EventBus, RuntimeEvent, RuntimeEventType
 from ultron.core.runtime.result import RunResult
 from ultron.core.runtime.state import RunState, RuntimeStatus
-from ultron.core.types import ChatMessage, TaskState, TaskType
+from ultron.core.types import ChatMessage, Role, TaskState, TaskType
 
 logger = get_logger("ultron.runtime")
 
@@ -69,7 +69,11 @@ class AgentRuntime:
             classification = classify_task_deterministic(user_input)
             
             coding = False
-            if classification.task_type == TaskType.SOFTWARE_ENGINEERING:
+            if classification.task_type in (
+                TaskType.SOFTWARE_ENGINEERING,
+                TaskType.DEBUGGING,
+                TaskType.CODE_REVIEW,
+            ):
                 coding = True
                 
             complexity = ComplexityLevel.SIMPLE
@@ -99,7 +103,14 @@ class AgentRuntime:
             )
 
         coding = False
-        if task.task_type == TaskType.SOFTWARE_ENGINEERING or task.code_context is not None:
+        if (
+            task.task_type in (
+                TaskType.SOFTWARE_ENGINEERING,
+                TaskType.DEBUGGING,
+                TaskType.CODE_REVIEW,
+            )
+            or task.code_context is not None
+        ):
             coding = True
 
         complexity = ComplexityLevel.SIMPLE
@@ -322,6 +333,7 @@ class AgentRuntime:
                 task_id=task_id,
                 parent_task_id=parent_task_id,
                 status=RuntimeStatus.BUDGET_EXCEEDED,
+                message=ChatMessage(role=Role.ASSISTANT, content=reason, task_state=task),
                 task_state=task,
                 context_snapshot=context_snapshot,
                 run_state=run_state,
@@ -344,6 +356,7 @@ class AgentRuntime:
                 task_id=task_id,
                 parent_task_id=parent_task_id,
                 status=RuntimeStatus.TIMED_OUT,
+                message=ChatMessage(role=Role.ASSISTANT, content=run_state.error or "Execution timed out", task_state=task),
                 task_state=task,
                 context_snapshot=context_snapshot,
                 run_state=run_state,

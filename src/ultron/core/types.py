@@ -649,6 +649,16 @@ class TaskState(BaseModel):
         self.status = TaskStatus.TASK_RUNNING
         self._touch()
 
+    def transition_to_repair(self) -> None:
+        """
+        Transitions a failed task into REPAIR, returning its status from
+        TASK_FAILED to TASK_RUNNING while preserving all recorded errors
+        and execution history.
+        """
+        if self.status != TaskStatus.TASK_COMPLETED:
+            self.status = TaskStatus.TASK_RUNNING
+            self._touch()
+
     def block(self, message: str | None = None) -> None:
         """
         Hard-stops the task (e.g. a security block) and moves it to

@@ -6,7 +6,7 @@ from ultron import __version__
 from ultron.core.config import settings
 from ultron.core.intelligence.prompt_assembly import build_response_guidance
 from ultron.core.logging import get_logger
-from ultron.core.types import ChatMessage, PendingAction, TaskState
+from ultron.core.types import ChatMessage, PendingAction, Role, TaskState
 from ultron.ui.theme import (
     ACCENT,
     BLUE,
@@ -700,7 +700,13 @@ async def continue_task_after_confirmation(
     task.last_observation = result
     if runtime:
         run_res = await runtime.execute(agent, task.goal, history, task=task, session=session)
-        return run_res.message
+        if run_res.message is not None:
+            return run_res.message
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=run_res.error or "Execution completed.",
+            task_state=task,
+        )
     return await agent.run(task.goal, history, task=task, session=session)
 
 async def async_chat(agent_type: str = "simple", no_server: bool = False):
@@ -998,7 +1004,7 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False):
                     continue
 
                 confirmations = 0
-                while response_msg.pending_action:
+                while response_msg and response_msg.pending_action:
                     task = response_msg.task_state
                     # Adaptive per-turn cap: a known step count gets headroom,
                     # otherwise the constant applies — a degenerate model cannot
@@ -1127,7 +1133,123 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False):
                     else:
                         result = "Action cancelled by user."
 
-                    if task is not None:
+                    from ultron.core.agents.simple import is_step_failure
+
+                    is_action_failure = False
+                    if choice == "Yes, allow":
+                        if action.action_type == "execute_plan":
+                            is_action_failure = "FAILED after" in result or "BLOCKED by security" in result or any(
+                                line.startswith("Step ") and "Error:" in line for line in result.splitlines()
+                            )
+                        else:
+                            is_action_failure = is_step_failure(action.action_type, result)
+
+                    if is_action_failure:
+                        UI.render_tool_execution(action.action_type, result)
+                        UI.render_status(
+                            "Tool execution failed after retries. Transitioning to autonomous REPAIR...",
+                            status="warning",
+                        )
+                        from pathlib import Path
+
+                        from ultron.core.agents import get_agent
+                        from ultron.core.coding.context import CodeContext
+                        from ultron.core.coding.workspace import discover_workspace
+                        from ultron.core.intelligence.task_classification import (
+                            classify_task_deterministic,
+                        )
+                        from ultron.core.types import TaskState, TaskType
+
+                        if task is None:
+                            classification = classify_task_deterministic(trimmed_input)
+                            t_type = classification.task_type
+                            if t_type not in (
+                                TaskType.SOFTWARE_ENGINEERING,
+                                TaskType.DEBUGGING,
+                                TaskType.CODE_REVIEW,
+                            ) and (
+                                any(
+                                    k in trimmed_input.lower()
+                                    for k in (
+                                        "script",
+                                        "code",
+                                        "python",
+                                        ".py",
+                                        ".js",
+                                        ".ts",
+                                        "fix",
+                                        "bug",
+                                        "crash",
+                                        "error",
+                                    )
+                                )
+                                or action.action_type
+                                in (
+                                    "run_command",
+                                    "write_file",
+                                    "replace_file",
+                                    "execute_plan",
+                                )
+                            ):
+                                t_type = TaskType.SOFTWARE_ENGINEERING
+
+                            try:
+                                ws = discover_workspace(str(Path.cwd()))
+                                code_ctx = CodeContext(workspace=ws)
+                            except (OSError, ValueError):
+                                code_ctx = None
+
+                            task = TaskState(
+                                goal=trimmed_input,
+                                task_type=t_type,
+                                code_context=code_ctx,
+                            )
+                            task.context = [
+                                ChatMessage(role=Role.USER, content=trimmed_input),
+                                ChatMessage(
+                                    role=Role.ASSISTANT,
+                                    content=f"Initial action execution:\n{action.content or action.target or action.action_type}",
+                                ),
+                                ChatMessage(
+                                    role=Role.USER,
+                                    content=(
+                                        f"Execution failed with error:\n{result}\n\n"
+                                        f"Please diagnose and repair the issue to complete the goal: {trimmed_input}"
+                                    ),
+                                ),
+                            ]
+
+                        task.record_failure(
+                            f"Tool execution failed for '{action.action_type}':\n{result}"
+                        )
+                        task.transition_to_repair()
+
+                        repair_agent = get_agent("react", engine=agent.engine)
+                        agent = repair_agent
+                        if hasattr(session, "active_agent_type"):
+                            session.active_agent_type = "react"
+
+                        if not task.context:
+                            task.last_observation = result
+                            response_msg = await continue_task_after_confirmation(
+                                agent, task, result, history, session=memory_session, runtime=runtime
+                            )
+                        else:
+                            run_res = await runtime.execute(
+                                agent,
+                                task.goal,
+                                history,
+                                task=task,
+                                session=memory_session,
+                            )
+                            response_msg = run_res.message
+                            if response_msg is None:
+                                response_msg = ChatMessage(
+                                    role=Role.ASSISTANT,
+                                    content=run_res.error or "Execution stopped.",
+                                    task_state=task,
+                                )
+                    elif task is not None:
                         # The original task survives confirmation: the result is fed
                         # back as an observation and the agent continues working
                         # toward the goal until TaskState reports it complete.

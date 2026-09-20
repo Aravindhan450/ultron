@@ -119,9 +119,13 @@ class LlamaCppEngine(BaseEngine):
         formatted_messages = []
         for msg in messages:
             formatted_msg = dict(msg)
+            if formatted_msg.get("role") == "tool":
+                formatted_msg["role"] = "user"
+                tool_name = formatted_msg.pop("name", "tool")
+                formatted_msg["content"] = f"Observation ({tool_name}): {formatted_msg.get('content', '')}"
+
             # Handle images: convert agent image data to OpenAI image_url content parts
             if formatted_msg.get("images"):
-
                 content_parts = [{"type": "text", "text": str(formatted_msg.get("content", ""))}]
                 for img_b64 in formatted_msg["images"]:
                     content_parts.append({
@@ -130,7 +134,18 @@ class LlamaCppEngine(BaseEngine):
                     })
                 formatted_msg["content"] = content_parts
                 formatted_msg.pop("images", None)
-            formatted_messages.append(formatted_msg)
+
+            if formatted_messages and formatted_messages[-1].get("role") == formatted_msg.get("role"):
+                # Merge consecutive same-role messages to ensure clean Jinja template rendering
+                prev = formatted_messages[-1]
+                prev_text = prev.get("content", "")
+                curr_text = formatted_msg.get("content", "")
+                if isinstance(prev_text, str) and isinstance(curr_text, str):
+                    prev["content"] = f"{prev_text}\n\n{curr_text}"
+                else:
+                    formatted_messages.append(formatted_msg)
+            else:
+                formatted_messages.append(formatted_msg)
 
         payload = {
             "model": model,
