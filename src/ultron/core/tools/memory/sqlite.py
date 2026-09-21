@@ -1,6 +1,9 @@
 import sqlite3
 
+from ultron.core.logging import get_logger
 from ultron.core.tools.paths import ALLOWED_BASE_DIR
+
+logger = get_logger(__name__)
 
 # Path to the SQLite database file inside the project root folder
 MEMORY_DB_PATH = ALLOWED_BASE_DIR / ".ultron_memory.db"
@@ -21,8 +24,7 @@ def init_memory_db() -> None:
             """)
             conn.commit()
     except (sqlite3.Error, OSError) as e:
-        # Print warning to console if DB initialization fails
-        print(f"Warning: Failed to initialize memory DB: {e}")
+        logger.warning("Failed to initialize memory DB: %s", e)
 
 def add_memory(fact: str) -> str:
     """

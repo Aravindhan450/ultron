@@ -21,7 +21,6 @@ from ultron.core.logging import get_logger
 from ultron.core.nlp.intent import route_request
 from ultron.core.nlp.normalize import detect_explicit_test_command
 from ultron.core.types import ChatMessage, PendingAction, Role, history_to_openai_format
-from ultron.ui.theme import ACCENT
 
 logger = get_logger("ultron.agents.simple")
 
@@ -2375,7 +2374,9 @@ def detect_retrieval_intent(user_input: str) -> dict | None:
     return None
 
 
-def handle_retrieve(request: str, url: str | None = None) -> ChatMessage:
+async def handle_retrieve(
+    request: str, url: str | None = None, engine=None
+) -> ChatMessage:
     """
     Runs the unified retrieval orchestrator, gated by the security boundary.
 
@@ -2386,8 +2387,15 @@ def handle_retrieve(request: str, url: str | None = None) -> ChatMessage:
     verdict = check_action("retrieve", url or "")
     if is_denied(verdict):
         return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+    from ultron.core.intelligence.synthesis import synthesize_observation
+    from ultron.ui.theme import UI
+
+    UI.render_tool_activity("retrieve", url or request)
     result = execute_tool("retrieve", request=request, url=url)
-    return ChatMessage(role=Role.ASSISTANT, content=str(result))
+    synthesized = await synthesize_observation(
+        request, str(result), engine=engine, tool_name="retrieve"
+    )
+    return ChatMessage(role=Role.ASSISTANT, content=synthesized)
 
 
 def handle_api_schema(action: str, url: str | None = None) -> ChatMessage:
@@ -2698,14 +2706,21 @@ async def handle_llm_fallback(
                 verdict = check_action(tool_name, target, content)
                 if is_denied(verdict):
                     return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+                from ultron.core.intelligence.synthesis import synthesize_observation
+                from ultron.ui.theme import UI
+
+                UI.render_tool_activity(tool_name, target or "")
                 try:
                     tool_result = func(**arguments)
                 except Exception as exc:  # noqa: BLE001 — arbitrary tool surface
                     tool_result = f"Error executing tool '{tool_name}': {exc}"
 
+                synthesized = await synthesize_observation(
+                    user_input, str(tool_result), engine=engine, tool_name=tool_name
+                )
                 return ChatMessage(
                     role=Role.ASSISTANT,
-                    content=f"Executed tool '[bold {ACCENT}]{tool_name}[/bold {ACCENT}]':\n\n{tool_result}"
+                    content=synthesized,
                 )
         except (json.JSONDecodeError, IndexError, TypeError, ValueError) as exc:
             logger.debug(f"Failed to parse tool call JSON from LLM: {exc}")
@@ -2853,7 +2868,7 @@ class SimpleAgent(BaseAgent):
                 from ultron.core.tools.builtin.retrieval import extract_retrieval_url
                 url = extract_retrieval_url(user_input)
                 if url:
-                    return handle_retrieve(user_input, url)
+                    return await handle_retrieve(user_input, url, engine=self.engine)
 
             elif cat == "api_schema":
                 action = pending.get("action", "learn")
@@ -2998,7 +3013,9 @@ class SimpleAgent(BaseAgent):
         retrieval = detect_retrieval_intent(user_input)
         if retrieval:
             if retrieval["url"]:
-                return handle_retrieve(retrieval["request"], retrieval["url"])
+                return await handle_retrieve(
+                    retrieval["request"], retrieval["url"], engine=self.engine
+                )
             self._pending_clarification = {"category": "retrieve"}
             return ChatMessage(
                 role=Role.ASSISTANT,
@@ -3018,9 +3035,17 @@ class SimpleAgent(BaseAgent):
             verdict = check_action("web_search", search_query)
             if is_denied(verdict):
                 return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+            from ultron.core.intelligence.synthesis import synthesize_observation
+            from ultron.ui.theme import UI
+
+            UI.render_tool_activity("search_web", search_query)
+            raw_obs = execute_tool("search_web", query=search_query)
+            synthesized = await synthesize_observation(
+                user_input, str(raw_obs), engine=self.engine, tool_name="search_web"
+            )
             return ChatMessage(
                 role=Role.ASSISTANT,
-                content=execute_tool("search_web", query=search_query),
+                content=synthesized,
             )
 
         # Step 4.9: Fetch web page intent — before generic command detector.
@@ -3031,9 +3056,17 @@ class SimpleAgent(BaseAgent):
             verdict = check_action("fetch_page_text", fetch_url)
             if is_denied(verdict):
                 return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+            from ultron.core.intelligence.synthesis import synthesize_observation
+            from ultron.ui.theme import UI
+
+            UI.render_tool_activity("fetch_page_text", fetch_url)
+            raw_obs = execute_tool("fetch_page_text", url=fetch_url)
+            synthesized = await synthesize_observation(
+                user_input, str(raw_obs), engine=self.engine, tool_name="fetch_page_text"
+            )
             return ChatMessage(
                 role=Role.ASSISTANT,
-                content=execute_tool("fetch_page_text", url=fetch_url),
+                content=synthesized,
             )
 
         # Step 4.95: Database query intent — before generic command detector.
@@ -3143,14 +3176,20 @@ class SimpleAgent(BaseAgent):
             elif category == "web_search":
                 query = detect_web_search_intent(user_input) or user_input.strip()
                 if query:
-                    return ChatMessage(
-                        role=Role.ASSISTANT,
-                        content=f"Web search requested: '{query}'",
-                        pending_action=PendingAction(
-                            action_type="web_search",
-                            target=query
-                        )
+                    verdict = check_action("web_search", query)
+                    if is_denied(verdict):
+                        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+                    from ultron.core.intelligence.synthesis import (
+                        synthesize_observation,
                     )
+                    from ultron.ui.theme import UI
+
+                    UI.render_tool_activity("search_web", query)
+                    raw_obs = execute_tool("search_web", query=query)
+                    synthesized = await synthesize_observation(
+                        user_input, str(raw_obs), engine=self.engine, tool_name="search_web"
+                    )
+                    return ChatMessage(role=Role.ASSISTANT, content=synthesized)
 
             elif category == "fetch_page":
                 url = detect_fetch_page_intent(user_input)
@@ -3161,14 +3200,20 @@ class SimpleAgent(BaseAgent):
                         raw_url = url_match.group(0)
                         url = re.sub(r'[\.,;\)]+$', '', raw_url).strip()
                 if url:
-                    return ChatMessage(
-                        role=Role.ASSISTANT,
-                        content=f"Web page fetch requested: '{url}'",
-                        pending_action=PendingAction(
-                            action_type="fetch_page",
-                            target=url
-                        )
+                    verdict = check_action("fetch_page_text", url)
+                    if is_denied(verdict):
+                        return ChatMessage(role=Role.ASSISTANT, content=blocked_message(verdict))
+                    from ultron.core.intelligence.synthesis import (
+                        synthesize_observation,
                     )
+                    from ultron.ui.theme import UI
+
+                    UI.render_tool_activity("fetch_page_text", url)
+                    raw_obs = execute_tool("fetch_page_text", url=url)
+                    synthesized = await synthesize_observation(
+                        user_input, str(raw_obs), engine=self.engine, tool_name="fetch_page_text"
+                    )
+                    return ChatMessage(role=Role.ASSISTANT, content=synthesized)
                 return ChatMessage(
                     role=Role.ASSISTANT,
                     content="It sounds like you want to fetch a web page — which URL?"

@@ -709,7 +709,7 @@ async def continue_task_after_confirmation(
         )
     return await agent.run(task.goal, history, task=task, session=session)
 
-async def async_chat(agent_type: str = "simple", no_server: bool = False):
+async def async_chat(agent_type: str = "simple", no_server: bool = False, verbose: bool = False):
     """
     Asynchronous runner for the interactive chat session.
 
@@ -718,13 +718,19 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False):
     automatically when the window is resized, and all output rendering is
     width-adaptive.
     """
+    import os
+
     from prompt_toolkit import PromptSession
 
     from ultron.core.agents import get_agent
     from ultron.core.agents.react import ReActAgent
     from ultron.core.intelligence.task_planning import prepare_task_for_execution
+    from ultron.core.logging import set_verbose_logging
     from ultron.core.state import CLIState
     from ultron.ui.session import ChatSession
+
+    is_verbose = verbose or os.environ.get("ULTRON_VERBOSE", "").lower() in ("1", "true", "yes")
+    set_verbose_logging(is_verbose)
 
     state = CLIState(
         active_model=settings.model,
@@ -1253,14 +1259,25 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False):
                         # The original task survives confirmation: the result is fed
                         # back as an observation and the agent continues working
                         # toward the goal until TaskState reports it complete.
-                        UI.render_tool_execution(action.action_type, result)
+                        UI.render_tool_activity(action.action_type, action.target)
                         response_msg = await continue_task_after_confirmation(
                             agent, task, result, history, session=memory_session, runtime=runtime
                         )
                     else:
-                        # No task (e.g. SimpleAgent path) — behave exactly as before:
-                        # one confirmed action per turn, result shown directly.
-                        response_msg = ChatMessage(role=Role.ASSISTANT, content=result)
+                        # No task (e.g. SimpleAgent path) — behave cleanly:
+                        if action.action_type in ("web_search", "search_web", "fetch_page", "fetch_page_text", "retrieve"):
+                            from ultron.core.intelligence.synthesis import (
+                                synthesize_observation,
+                            )
+                            synth_content = await synthesize_observation(
+                                trimmed_input,
+                                result,
+                                engine=getattr(agent, "engine", None),
+                                tool_name=action.action_type,
+                            )
+                            response_msg = ChatMessage(role=Role.ASSISTANT, content=synth_content)
+                        else:
+                            response_msg = ChatMessage(role=Role.ASSISTANT, content=result)
                         break
 
                 state.status = "Ready"
@@ -1281,18 +1298,7 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False):
                         _root = getattr(_ws, "project_root", None) if _ws is not None else None
                         save_task(_task, _root or Path.cwd())
 
-                import re
-                tool_match = re.match(
-                    r"^Executed tool '(?:\[[^']*\])?([^'\]]+)(?:\[/[^']*\])?':\n\n(.*)$",
-                    response_msg.content,
-                    re.DOTALL,
-                )
-                if tool_match:
-                    # Every print is recorded by the resize reflow, so tool
-                    # executions and plain responses reflow automatically.
-                    UI.render_tool_execution(tool_match.group(1), tool_match.group(2))
-                else:
-                    UI.render_response(response_msg.content)
+                UI.render_response(response_msg.content)
 
                 history.append(ChatMessage(role=Role.USER, content=trimmed_input))
                 history.append(ChatMessage(role=Role.ASSISTANT, content=response_msg.content))
@@ -1323,6 +1329,12 @@ def chat(
         "--no-server",
         help="Skip starting local llama-server (e.g. for testing or when using external endpoint).",
     ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Enable verbose console logging.",
+    ),
 ):
 
 
@@ -1333,7 +1345,10 @@ def chat(
     async def _run_chat_session():
         # Dynamic Runtime Integration (Phase 3.5)
         # main.py no longer manages LlamaServerManager directly.
-        await async_chat(agent_type=agent, no_server=effective_no_server)
+        kwargs = {"agent_type": agent, "no_server": effective_no_server}
+        if verbose:
+            kwargs["verbose"] = True
+        await async_chat(**kwargs)
 
     asyncio.run(_run_chat_session())
 

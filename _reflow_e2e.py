@@ -106,6 +106,8 @@ def main() -> int:
 
     src_dir = os.path.join(root_dir, "src")
     env = dict(os.environ)
+    if env.get("TERM") in (None, "dumb"):
+        env["TERM"] = "xterm-256color"
     current_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{src_dir}:{current_pp}" if current_pp else src_dir
     env["ULTRON_NO_SERVER"] = "1"

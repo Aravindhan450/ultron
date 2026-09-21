@@ -56,6 +56,7 @@ from ultron.core.intelligence.prompt_assembly import (
     build_response_guidance,
     polish_response,
 )
+from ultron.core.intelligence.synthesis import strip_internal_thought
 from ultron.core.logging import get_logger
 from ultron.core.memory.session_memory import SessionMemory
 from ultron.core.tools.definitions import (
@@ -77,6 +78,7 @@ from ultron.core.types import (
     TaskState,
     history_to_openai_format,
 )
+from ultron.ui.theme import UI
 
 logger = get_logger("ultron.agents.react")
 
@@ -1108,7 +1110,9 @@ class ReActAgent(BaseAgent):
                 _sync_task_memory(task)
                 return ChatMessage(
                     role=Role.ASSISTANT,
-                    content=polish_response(enforce_reply(user_input, response)),
+                    content=polish_response(
+                        enforce_reply(user_input, strip_internal_thought(response))
+                    ),
                     task_state=task,
                 )
 
@@ -1364,7 +1368,9 @@ class ReActAgent(BaseAgent):
         _sync_task_memory(task)
         return True, ChatMessage(
             role=Role.ASSISTANT,
-            content=polish_response(enforce_reply(user_input, proposed_answer)),
+            content=polish_response(
+                enforce_reply(user_input, strip_internal_thought(proposed_answer))
+            ),
             task_state=task,
         )
 
@@ -1469,7 +1475,9 @@ class ReActAgent(BaseAgent):
             _sync_task_memory(task)
             return True, ChatMessage(
                 role=Role.ASSISTANT,
-                content=polish_response(enforce_reply(user_input, proposed_answer)),
+                content=polish_response(
+                    enforce_reply(user_input, strip_internal_thought(proposed_answer))
+                ),
                 task_state=task,
             )
 
@@ -1569,7 +1577,9 @@ class ReActAgent(BaseAgent):
         _sync_task_memory(task)
         return True, ChatMessage(
             role=Role.ASSISTANT,
-            content=polish_response(enforce_reply(user_input, proposed_answer)),
+            content=polish_response(
+                enforce_reply(user_input, strip_internal_thought(proposed_answer))
+            ),
             task_state=task,
         )
 
@@ -1682,6 +1692,7 @@ class ReActAgent(BaseAgent):
             if is_denied(verdict):
                 return blocked_message(verdict)
             if is_allow(verdict):
+                UI.render_tool_activity("run_command", cmd)
                 return execute_tool("run_command", command=cmd)
             return ChatMessage(
                 role=Role.ASSISTANT,
@@ -1764,6 +1775,7 @@ class ReActAgent(BaseAgent):
             if is_denied(verdict):
                 return blocked_message(verdict)
             if is_allow(verdict):
+                UI.render_tool_activity("run_query", sql)
                 func = get_tool("run_query")
                 return func(sql) if func else "Error: Tool 'run_query' not found in registry."
             return ChatMessage(
@@ -1782,6 +1794,7 @@ class ReActAgent(BaseAgent):
         if is_denied(verdict):
             return blocked_message(verdict)
 
+        UI.render_tool_activity(tool_name, target)
         try:
             return func(**arguments)
         except Exception as exc:  # noqa: BLE001 — arbitrary tool surface
@@ -1850,6 +1863,7 @@ class ReActAgent(BaseAgent):
         if is_denied(verdict):
             return blocked_message(verdict)
         if is_allow(verdict):
+            UI.render_tool_activity(tool_name, target)
             return execute_tool(tool_name, **arguments)
 
         # Encode the tool arguments in the pending action so the CLI can

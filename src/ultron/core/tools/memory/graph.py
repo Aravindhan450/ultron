@@ -26,8 +26,11 @@ zero-hallucination guarantee the flat recall path already provides.
 import re
 import sqlite3
 
+from ultron.core.logging import get_logger
 from ultron.core.tools.memory.sqlite import add_memory as _add_flat_fact
 from ultron.core.tools.paths import ALLOWED_BASE_DIR
+
+logger = get_logger(__name__)
 
 # Same database file as the flat fact store — one memory store, two tables.
 MEMORY_DB_PATH = ALLOWED_BASE_DIR / ".ultron_memory.db"
@@ -62,7 +65,7 @@ def init_graph_db() -> None:
         with sqlite3.connect(MEMORY_DB_PATH) as conn:
             conn.executescript(_INIT_SQL)
     except (sqlite3.Error, OSError) as exc:
-        print(f"Warning: Failed to initialize memory graph DB: {exc}")
+        logger.warning("Failed to initialize memory graph DB: %s", exc)
 
 
 # ---------------------------------------------------------------------------

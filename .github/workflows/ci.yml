@@ -94,3 +94,28 @@ jobs:
         # the terminal-resize reflow that the unit suite cannot exercise
         # (e.g. banner/response boxes stuck at a stale width).
         run: python _reflow_e2e.py
+
+  cli-output-e2e:
+    name: cli-output & log isolation e2e (pty harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Fresh install (proven flow)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run CLI output isolation pty harness
+        # Asserts that real ultron chat produces zero leaked internal logs
+        # and satisfies the permanent CLI Output Contract.
+        run: python _cli_output_e2e.py

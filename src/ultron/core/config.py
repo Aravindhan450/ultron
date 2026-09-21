@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     llama_server_shutdown_timeout: float = 5.0
     wake_word: str = "ultron"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    verbose: bool = False
     data_dir: Path = Field(default_factory=lambda: Path.home() / ".ultron")
     memory_backend: Literal["sqlite", "json", "in-memory"] = "sqlite"
     security_mode: Literal["strict", "permissive", "interactive"] = "interactive"

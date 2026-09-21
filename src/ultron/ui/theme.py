@@ -26,6 +26,18 @@ Palette (GitHub-dark inspired + Ultron molten flame)
   Error           : #f85149
   Warning         : #d29922
   Info            : #58a6ff  soft blue
+
+CLI Output Contract
+-------------------
+1. USER INPUT: Prompted cleanly via prompt_toolkit session (❯ prefix).
+2. INTERNAL LOGGING: Routed exclusively to diagnostics file (~/.ultron/ultron.log)
+   or streamable via `ultron logs` / `--verbose`. NEVER leaked into conversational chat.
+3. TOOL ACTIVITY: Acknowledged via compact chip indicator (`✻ action — target`)
+   without dumping raw payloads into the user transcript.
+4. TOOL OBSERVATION: Kept internal to agent/model context for reasoning.
+5. FINAL ASSISTANT RESPONSE: Delivered exclusively via UI.render_response()
+   as synthesized, human-readable Markdown with no raw payloads, no internal
+   reasoning (Thought: blocks), and no leaked runtime metadata.
 """
 
 from __future__ import annotations
@@ -201,6 +213,21 @@ class UI:
     # ------------------------------------------------------------------
     # Tool calls — compact chip lines
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def render_tool_activity(action: str, target: str = "") -> None:
+        """
+        Render a compact tool activity indicator (Claude Code-style chip line)
+        to acknowledge tool execution without exposing raw internal payloads.
+        """
+        line = f"[{ACCENT}]✻[/{ACCENT}] [bold {TEXT}]{action}[/bold {TEXT}]"
+        if target:
+            target_str = str(target).strip()
+            if len(target_str) > 80:
+                target_str = target_str[:77] + "..."
+            line += f"  [{MUTED}]—[/{MUTED}] {target_str}"
+        console.print(line)
+        console.print()
 
     @staticmethod
     def render_tool_execution(tool_name: str, output: Any) -> None:

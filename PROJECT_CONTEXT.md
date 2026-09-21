@@ -218,13 +218,21 @@ confinement), and dangerous shell patterns. Every verdict is written to
 - `ui/theme.py` — the single UI surface: molten-flame palette
   (`EMBER #E73F1E`, `ORANGE #FB6C00` (primary accent), `AMBER #F9B637`,
   `GOLD #FFDD9C`), adaptive ASCII-logo banner (side/stack/text modes), boxed
-  responses (`╭─ ULTRON ─╮` with `#FB6C00` border), help table, action cards.
+  responses (`╭─ ULTRON ─╮` with `#FB6C00` border), help table, action cards,
+  compact tool activity indicators (`UI.render_tool_activity`).
 - `ui/session.py` — prompt_toolkit `ChatSession`, width-adaptive bottom toolbar
   (status dot / model / agent / cwd / security chip / hints), input-line clearing
   so the transcript echo is never duplicated.
 - `ui/responsive.py` — `ResizeReflow` records every print and, on window resize,
   re-renders the whole conversation at the live width (guarded to only run while
   the chat app is active; ignores the thinking spinner).
+
+#### CLI Output Contract
+1. **User Input**: Prompted cleanly via `prompt_toolkit` session (`❯` prefix).
+2. **Internal Logging**: Observability diagnostics, task routing decisions, model lifecycle logs, and debug traces are isolated to `~/.ultron/ultron.log` (streamable via `ultron logs` or visible in-session with `--verbose` / `ULTRON_VERBOSE=1`). Internal logs are NEVER printed to stdout/stderr in standard chat mode.
+3. **Tool Activity**: Tool executions are acknowledged via a compact chip indicator line (`✻ action — target`) without dumping raw payloads into the user transcript.
+4. **Tool Observation**: Raw payloads, JSON responses, and scrape dumps remain internal to agent context and reasoning loops.
+5. **Assistant Response**: Delivered exclusively via `UI.render_response()` as synthesized, human-readable Markdown with no raw payloads, no unstripped `Thought:` reasoning blocks, and no leaked runtime metadata.
 
 ### 5.6 Configuration
 
