@@ -112,3 +112,6 @@ env/
 .ultron_api_schema.db
 .ultron_connections.db
 .ultron_code_index_*.db
+.ultron_memory.db
+*.sqlite
+*.sqlite3
