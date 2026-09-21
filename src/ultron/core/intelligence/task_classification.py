@@ -86,6 +86,10 @@ _SE_NOUNS_RE = re.compile(
     r"rails|angular|vue\b|graphql|rest\b|dockerfile)\b"
 )
 
+_SE_CREATION_RE = re.compile(
+    r"\b(create|build|implement|develop|scaffold)\b.*?\b(app|application|project|service|cli|tool|script|program)\b"
+)
+
 _ACTION_VERBS = {
     "create", "make", "write", "read", "find", "count", "save", "list", "add",
     "remove", "update", "delete", "copy", "move", "run", "start", "stop",
@@ -151,9 +155,13 @@ def _classify_deterministic(text: str) -> TaskType | None:
         return TaskType.DEBUGGING
     if _CODE_REVIEW_RE.search(text):
         return TaskType.CODE_REVIEW
-    if _RESEARCH_RE.search(text) and _CODE_NOUNS_RE.search(text):
+    if (
+        _RESEARCH_RE.search(text)
+        and _CODE_NOUNS_RE.search(text)
+        and not _SE_CREATION_RE.search(text)
+    ):
         return TaskType.RESEARCH
-    if _INFORMATIONAL_RE.search(text):
+    if _INFORMATIONAL_RE.search(text) and not _SE_CREATION_RE.search(text):
         return TaskType.INFORMATIONAL
     if _SYSTEM_RE.search(text):
         return TaskType.SYSTEM_OPERATION
