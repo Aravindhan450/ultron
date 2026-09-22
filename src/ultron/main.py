@@ -918,7 +918,7 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
                     _history=truncated_history,
                     _runtime=runtime,
                 ):
-                    nonlocal prepared_task
+                    nonlocal prepared_task, agent
                     if isinstance(_agent, ReActAgent):
                         if _input in ("/resume", "/continue"):
                             # Fix #6: restore the last persisted task for this
@@ -964,6 +964,27 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
                             session=memory_session,
                         )
                         return run_res.message
+
+                    # If the user is on the default agent (SimpleAgent) but the task is a
+                    # complex or software engineering task requiring concrete multi-file or
+                    # artifact execution, route to ReAct execution so files are created, run, and verified.
+                    prepared_task = await prepare_task_for_execution(
+                        _input, getattr(_agent, "engine", None)
+                    )
+                    if prepared_task is not None:
+                        if prepared_task.clarification_required:
+                            return None
+                        react_exec_agent = ReActAgent(engine=getattr(_agent, "engine", None))
+                        agent = react_exec_agent
+                        run_res = await _runtime.execute(
+                            react_exec_agent,
+                            _input,
+                            _history,
+                            task=prepared_task,
+                            session=memory_session,
+                        )
+                        return run_res.message
+
                     run_res = await _runtime.execute(_agent, _input, _history)
                     return run_res.message
 

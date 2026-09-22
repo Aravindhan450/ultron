@@ -310,6 +310,55 @@ def fallback_plan(
     )
 
 
+def build_artifact_plan(
+    goal: str,
+    workspace: WorkspaceKind = WorkspaceKind.UNKNOWN,
+) -> TaskPlan:
+    """
+    Structured, outcome-oriented plan for building software artifacts.
+    Enforces the cycle: Scaffold/Write -> Execute/Run -> Verify Evidence.
+    """
+    steps = [
+        PlanStep(
+            id=1,
+            description="Implement application files and scaffold project",
+            purpose="Create required source code, configuration, and data files on disk",
+            expected_outcome="All necessary application files exist on disk",
+            completion_criteria=["Source files created on disk", "Dependencies/entrypoint defined"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=2,
+        ),
+        PlanStep(
+            id=2,
+            description="Execute and test application",
+            purpose="Run the application or test suite and observe runtime output/errors",
+            expected_outcome="Application executes successfully with valid output",
+            dependencies=[1],
+            completion_criteria=["Application executed without unhandled errors"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=2,
+        ),
+        PlanStep(
+            id=3,
+            description="Verify the final user goal",
+            purpose="Ensure the original user request is fully satisfied with verified evidence",
+            expected_outcome="The original user goal is satisfied",
+            dependencies=[1, 2],
+            completion_criteria=[goal],
+            failure_strategy=FailureStrategy.STOP,
+        ),
+    ]
+    return TaskPlan(
+        goal=goal,
+        task_type=TaskType.SOFTWARE_ENGINEERING,
+        workspace=workspace,
+        steps=steps,
+        completion_criteria=[goal, "All application files created and verified through execution"],
+        verification_requirements=[f"The user goal is satisfied: {goal}"],
+        failure_recovery="Retry execution failures up to configured budget; do not report completion without evidence.",
+    )
+
+
 async def generate_task_plan(
     goal: str,
     task_type: TaskType,
@@ -380,18 +429,23 @@ async def prepare_task_for_execution(
         task.require_clarification(classification.clarification_questions)
         return task
 
-    plan = await generate_task_plan(
-        classification.goal,
-        classification.task_type,
-        engine,
-        cwd=cwd,
-    )
-    if plan is None:
-        plan = fallback_plan(
+    ws = detect_workspace_kind(cwd)
+    from ultron.core.intelligence.task_classification import _SE_CREATION_RE
+    if classification.task_type == TaskType.SOFTWARE_ENGINEERING and _SE_CREATION_RE.search(user_input):
+        plan = build_artifact_plan(classification.goal, ws)
+    else:
+        plan = await generate_task_plan(
             classification.goal,
             classification.task_type,
-            detect_workspace_kind(cwd),
+            engine,
+            cwd=cwd,
         )
+        if plan is None:
+            plan = fallback_plan(
+                classification.goal,
+                classification.task_type,
+                ws,
+            )
     task.attach_plan(plan)
     _attach_coding_context(task, cwd)
     return task

@@ -653,10 +653,16 @@ class TaskState(BaseModel):
         """
         Transitions a failed task into REPAIR, returning its status from
         TASK_FAILED to TASK_RUNNING while preserving all recorded errors
-        and execution history.
+        and execution history. Also resets any FAILED step in an attached plan
+        back to RUNNING so the repair agent can execute actions to resolve it.
         """
         if self.status != TaskStatus.TASK_COMPLETED:
             self.status = TaskStatus.TASK_RUNNING
+            if self.plan is not None:
+                for step in self.plan.steps:
+                    if step.status is StepStatus.FAILED:
+                        step.status = StepStatus.RUNNING
+                        self.set_current_step(step.id)
             self._touch()
 
     def block(self, message: str | None = None) -> None:

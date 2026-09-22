@@ -87,7 +87,7 @@ _SE_NOUNS_RE = re.compile(
 )
 
 _SE_CREATION_RE = re.compile(
-    r"\b(create|build|implement|develop|scaffold)\b.*?\b(app|application|project|service|cli|tool|script|program)\b"
+    r"\b(create|build|implement|develop|scaffold)\b.*?\b(app|application|project|service|cli|tool|script|program|tracker\w*|backend\w*|frontend\w*|api\b|module\w*|bot\w*|engine\w*)\b"
 )
 
 _ACTION_VERBS = {
@@ -146,7 +146,6 @@ def _count_action_verbs(text: str) -> int:
     """Counts distinct action verbs in a request (used for multi-step)."""
     return len(set(re.findall(r"[a-z']+", text)) & _ACTION_VERBS)
 
-
 def _classify_deterministic(text: str) -> TaskType | None:
     """Returns the best task type from rules, or None when ambiguous."""
     if _DEBUG_VERBS_RE.search(text) or (
@@ -155,24 +154,30 @@ def _classify_deterministic(text: str) -> TaskType | None:
         return TaskType.DEBUGGING
     if _CODE_REVIEW_RE.search(text):
         return TaskType.CODE_REVIEW
-    if (
-        _RESEARCH_RE.search(text)
-        and _CODE_NOUNS_RE.search(text)
-        and not _SE_CREATION_RE.search(text)
-    ):
-        return TaskType.RESEARCH
-    if _INFORMATIONAL_RE.search(text) and not _SE_CREATION_RE.search(text):
-        return TaskType.INFORMATIONAL
-    if _SYSTEM_RE.search(text):
-        return TaskType.SYSTEM_OPERATION
-    if _DATA_RE.search(text):
-        return TaskType.DATA_OPERATION
     # Multi-step outranks software engineering so filename-style nouns
     # ("app.txt", "TestDir") never masquerade as project terms.
     if _SEQUENCE_MARKERS_RE.search(text) and _count_action_verbs(text) >= 2:
         return TaskType.MULTI_STEP
     if _count_action_verbs(text) >= 3:
         return TaskType.MULTI_STEP
+    # Researching codebase / repository outranks informational
+    if (
+        _RESEARCH_RE.search(text)
+        and _CODE_NOUNS_RE.search(text)
+        and not _SE_CREATION_RE.search(text)
+    ):
+        return TaskType.RESEARCH
+    # Explicit educational/how-to explanation requests are INFORMATIONAL, not SE
+    if re.search(r"\b(how\s+to|how\s+do\s+i|teach\s+me|guide\s+on)\b", text):
+        return TaskType.INFORMATIONAL
+    if _SE_CREATION_RE.search(text):
+        return TaskType.SOFTWARE_ENGINEERING
+    if _INFORMATIONAL_RE.search(text):
+        return TaskType.INFORMATIONAL
+    if _SYSTEM_RE.search(text):
+        return TaskType.SYSTEM_OPERATION
+    if _DATA_RE.search(text):
+        return TaskType.DATA_OPERATION
     if _SE_VERBS_RE.search(text) and _SE_NOUNS_RE.search(text):
         return TaskType.SOFTWARE_ENGINEERING
     if _CONFIG_RE.search(text):

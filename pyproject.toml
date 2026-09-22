@@ -33,6 +33,9 @@ packages = ["src/ultron"]
 
 [tool.ruff]
 target-version = "py311"
+exclude = [
+    "expense_app",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

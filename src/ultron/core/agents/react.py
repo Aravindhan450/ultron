@@ -813,7 +813,7 @@ def _build_plan_verification_prompt(task: TaskState, proposed_answer: str) -> st
             '"step_failed": false, "plan_revision": null}',
             "- step_criteria: the CURRENT step's completion criteria, each marked.",
             "- plan_criteria: the overall task completion criteria above, each marked.",
-            "- step_failed: true only if the current step cannot be completed as planned.",
+            "- step_failed: true ONLY if the step suffered a fatal unrecoverable error or is impossible to complete; false if the step is merely in progress, incomplete, or pending tool execution.",
             "- plan_revision: OPTIONAL replacement steps (same shape as plan steps: ",
             "  id, description, purpose, dependencies, expected_outcome, ",
             "  completion_criteria, failure_strategy, retry_policy) covering the ",
@@ -1817,11 +1817,28 @@ class ReActAgent(BaseAgent):
           than the budget allows is blocked (no blind repetition);
         - any NEW state-changing action is blocked once the repair budget is
           exhausted (no endless repair attempts).
+        - any tool (including read-only tools like read_file) that has failed
+          identically >= 2 times in recent history is circuit-broken with a
+          directive to adjust strategy rather than infinitely repeating.
 
         The returned message is fed back as an observation, so the model sees
         it, learns the constraint, and must change its approach — the gate
         never executes the tool and never bypasses the security boundary.
         """
+        if task is not None and getattr(task, "execution_history", None):
+            # Check for identical repeated failures in execution history (e.g. repeated read_file on missing file or failing command)
+            target = str(arguments.get("file_path", arguments.get("path", arguments.get("filename", arguments.get("command", arguments.get("query", "")))))).strip()
+            recent_fails = [
+                e for e in task.execution_history[-6:]
+                if e.tool_name == tool_name and e.target == target and not e.success
+            ]
+            if len(recent_fails) >= 2:
+                return (
+                    f"Error: Tool '{tool_name}' on '{target}' has already failed {len(recent_fails)} times. "
+                    "Do not retry this exact operation. Check available files with list_directory or search_files, "
+                    "or change your strategy."
+                )
+
         if task is None or task.code_context is None:
             return None
         executor = task.code_context.executor
