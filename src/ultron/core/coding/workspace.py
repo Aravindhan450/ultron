@@ -390,9 +390,12 @@ def discover_workspace(cwd: str | None = None) -> CodingWorkspace:
 
 
 def _resolve_safe_path(path: str) -> Path | None:
-    """Resolves *path* inside ALLOWED_BASE_DIR; returns None when unsafe."""
+    """Resolves *path* inside allowed base directories; returns None when unsafe."""
+    from ultron.core.tools.paths import resolve_project_path
+
     try:
-        ok, resolved = is_path_safe(path)
+        resolved_candidate = resolve_project_path(path)
+        ok, resolved = is_path_safe(resolved_candidate)
     except (OSError, ValueError):
         return None
     return resolved if ok else None

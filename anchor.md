@@ -248,3 +248,21 @@ Project Ultron is undergoing an **Ollama → llama.cpp / llama-server** migratio
   - Pytest suite: **1,779 / 1,779 passed (100%)**.
   - Ruff lint: Clean (0 errors).
 
+### Phase 6: Dedicated External Workspace Confinement (`ULTRON_WORKSPACE`) — [COMPLETED & VERIFIED]
+- **Documentation**: Detailed findings in `ultron_workspace_sandbox_validation_report.md`.
+- **Configuration & Dynamic Resolution**:
+  - `src/ultron/core/config.py`: Added `workspace: str | None = None` to `Settings`, dynamically configurable via `ULTRON_WORKSPACE=~/UltronWorkspace`.
+  - `src/ultron/core/tools/paths.py`: Added `get_configured_workspace()`, `get_allowed_base_dirs()`, `set_active_project_dir()`, `get_active_project_dir()`, and `resolve_project_path()`. Resolves `~` and env vars, normalizes absolute paths.
+- **Security & Path Confinement**:
+  - `src/ultron/security/file_policy.py` & `src/ultron/core/tools/paths.py`: Updated path confinement (`is_path_safe`) to validate against both `ALLOWED_BASE_DIR` and `get_configured_workspace()`. Strict protection against traversal (`../`, `../../`, absolute escapes, symlinks).
+- **Tool Execution Context**:
+  - `src/ultron/core/tools/builtin/command_runner.py`: Updated `_run_one` and `run_command` with `cwd` parameter, defaulting to `get_active_project_dir()`.
+  - `src/ultron/core/tools/builtin/file_writer.py`, `file_reader.py`, `src/ultron/core/coding/edits.py`, and `workspace.py`: Relative paths resolve cleanly against active project directory within the external workspace.
+- **Artifact Integration & Isolation**:
+  - `src/ultron/core/intelligence/task_planning.py`: Updated `build_artifact_plan` and `_attach_coding_context` to derive project directory slugs (`~/UltronWorkspace/<slug>/`), create directory, and set active project directory context. TaskPlan tracks `project_dir`.
+  - `src/ultron/main.py`: Final response reports project location (`Location: ~/UltronWorkspace/<project>`).
+- **Quality Baseline**:
+  - Pytest suite: **1,785 / 1,785 passed (100%)**.
+  - Ruff lint: Clean (0 errors).
+  - Live model validation: Demonstrated project directory creation and execution in `~/UltronWorkspace/python-expense-tracker-application/` outside Ultron repo root.
+

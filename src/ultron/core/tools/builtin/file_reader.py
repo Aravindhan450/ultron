@@ -1,4 +1,4 @@
-from ultron.core.tools.paths import is_path_safe
+from ultron.core.tools.paths import is_path_safe, resolve_project_path
 
 
 def read_file(file_path: str) -> str:
@@ -9,8 +9,10 @@ def read_file(file_path: str) -> str:
     It reads at most 5000 characters to prevent using too much memory.
     """
     try:
+        # Resolve relative paths against active project directory or CWD
+        target_path = resolve_project_path(str(file_path).strip())
         # Check safety using our shared path helper
-        is_safe, resolved_path = is_path_safe(file_path)
+        is_safe, resolved_path = is_path_safe(target_path)
         if not is_safe:
             return "Error: access denied, file is outside the allowed directory"
     except (OSError, ValueError) as e:

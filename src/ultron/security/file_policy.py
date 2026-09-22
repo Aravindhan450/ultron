@@ -242,8 +242,13 @@ class FilePolicy:
         # `from X import NAME` binds the value at import time, which would
         # freeze ALLOWED_BASE_DIR and break the monkeypatch-sensitive tests.
         # Reading it here keeps the call-time semantics of is_path_safe.
-        from ultron.core.tools.paths import ALLOWED_BASE_DIR
+        from ultron.core.tools.paths import ALLOWED_BASE_DIR, get_allowed_base_dirs
 
+        for base in get_allowed_base_dirs():
+            try:
+                return resolved.relative_to(base).as_posix()
+            except (ValueError, OSError):
+                continue
         try:
             return resolved.relative_to(ALLOWED_BASE_DIR).as_posix()
         except (ValueError, OSError):

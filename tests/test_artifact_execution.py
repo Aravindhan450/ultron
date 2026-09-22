@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from ultron.core.agents.react import ReActAgent
 from ultron.core.intelligence.task_classification import (
     classify_task_deterministic,
@@ -13,10 +15,18 @@ from ultron.core.intelligence.task_classification import (
 from ultron.core.intelligence.task_planning import (
     build_artifact_plan,
 )
+from ultron.core.tools.paths import set_active_project_dir
 from ultron.core.types import (
     TaskState,
     TaskType,
 )
+
+
+@pytest.fixture(autouse=True)
+def reset_active_project_dir_fixture():
+    set_active_project_dir(None)
+    yield
+    set_active_project_dir(None)
 
 
 class ScriptedEngine:

@@ -310,20 +310,58 @@ def fallback_plan(
     )
 
 
+def _slugify(goal: str) -> str:
+    """Generates a clean directory slug for an artifact project from a goal."""
+    clean = re.sub(r"[^a-zA-Z0-9]+", "-", (goal or "").lower()).strip("-")
+    prefixes = ("build-a-", "build-an-", "build-", "create-a-", "create-an-", "create-", "make-a-", "make-an-", "make-")
+    for p in prefixes:
+        if clean.startswith(p):
+            clean = clean[len(p):]
+            break
+    clean = clean.strip("-")
+    return (clean or "artifact-project")[:40]
+
+
 def build_artifact_plan(
     goal: str,
     workspace: WorkspaceKind = WorkspaceKind.UNKNOWN,
+    project_dir: str | Path | None = None,
 ) -> TaskPlan:
     """
     Structured, outcome-oriented plan for building software artifacts.
     Enforces the cycle: Scaffold/Write -> Execute/Run -> Verify Evidence.
+    Resolves external workspace when configured via ULTRON_WORKSPACE.
     """
+    from ultron.core.tools.paths import (
+        ALLOWED_BASE_DIR,
+        get_configured_workspace,
+        set_active_project_dir,
+    )
+
+    resolved_project_dir: Path
+    if project_dir is not None:
+        resolved_project_dir = Path(project_dir).expanduser().resolve()
+    else:
+        slug = _slugify(goal)
+        ws = get_configured_workspace()
+        if ws is not None:
+            resolved_project_dir = (ws / slug).resolve()
+        else:
+            resolved_project_dir = (ALLOWED_BASE_DIR / slug).resolve()
+
+    try:
+        resolved_project_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    set_active_project_dir(resolved_project_dir)
+
     steps = [
         PlanStep(
             id=1,
             description="Implement application files and scaffold project",
-            purpose="Create required source code, configuration, and data files on disk",
-            expected_outcome="All necessary application files exist on disk",
+            purpose=f"Create required source code, configuration, and data files in {resolved_project_dir}",
+            expected_outcome=f"All necessary application files exist in {resolved_project_dir}",
             completion_criteria=["Source files created on disk", "Dependencies/entrypoint defined"],
             failure_strategy=FailureStrategy.RETRY,
             retry_policy=2,
@@ -356,6 +394,7 @@ def build_artifact_plan(
         completion_criteria=[goal, "All application files created and verified through execution"],
         verification_requirements=[f"The user goal is satisfied: {goal}"],
         failure_recovery="Retry execution failures up to configured budget; do not report completion without evidence.",
+        project_dir=str(resolved_project_dir),
     )
 
 
@@ -462,8 +501,11 @@ def _attach_coding_context(task: TaskState, cwd: str | None) -> None:
     from ultron.core.coding.context import CodeContext
     from ultron.core.coding.workspace import discover_workspace
 
+    target_dir = cwd
+    if task.plan and getattr(task.plan, "project_dir", None):
+        target_dir = task.plan.project_dir
     try:
-        workspace = discover_workspace(cwd)
+        workspace = discover_workspace(target_dir)
     except (OSError, ValueError):
         workspace = None
     task.code_context = CodeContext(workspace=workspace)

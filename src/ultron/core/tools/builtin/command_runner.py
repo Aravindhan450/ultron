@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from ultron.core.tools import resource_monitor as rm
 
 
-def _run_one(command: str, timeout: int) -> str:
+def _run_one(command: str, timeout: int, cwd: str | None = None) -> str:
     """
     Executes a single shell command and returns its formatted result.
 
@@ -25,6 +25,8 @@ def _run_one(command: str, timeout: int) -> str:
     import sys
     from pathlib import Path
 
+    from ultron.core.tools.paths import get_active_project_dir
+
     env = dict(os.environ)
     venv_bin = str(Path(sys.executable).parent)
     if venv_bin and venv_bin not in env.get("PATH", "").split(os.pathsep):
@@ -32,6 +34,12 @@ def _run_one(command: str, timeout: int) -> str:
 
     start = time.monotonic()
     cpu_before, rss_before = rm.child_usage()
+
+    run_cwd = str(cwd) if cwd else None
+    if not run_cwd:
+        active_dir = get_active_project_dir()
+        if active_dir is not None:
+            run_cwd = str(active_dir)
 
     try:
         proc = subprocess.Popen(
@@ -41,6 +49,7 @@ def _run_one(command: str, timeout: int) -> str:
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            cwd=run_cwd,
         )
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return f"Error: {exc!s}"
@@ -90,17 +99,18 @@ def _run_one(command: str, timeout: int) -> str:
         return f"Error: {exc!s}"
 
 
-def run_command(command: str) -> str:
+def run_command(command: str, cwd: str | None = None) -> str:
     """
     Executes a shell command using Python's subprocess module.
     
     - Times out after 15 seconds to prevent hanging processes.
     - Captures stdout and stderr.
+    - Runs in the specified cwd or defaults to the active project directory / CWD.
     - Reports measured resources ([resources] line) and records them for
       future forecasts.
     - Safety and user confirmation are handled at the agent level before calling this tool.
     """
-    return _run_one(command, timeout=15)
+    return _run_one(command, timeout=15, cwd=cwd)
 
 
 def run_parallel(commands: list[str], timeout: int = 15) -> str:

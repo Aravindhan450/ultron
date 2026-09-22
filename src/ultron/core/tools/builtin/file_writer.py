@@ -18,11 +18,11 @@ def write_file(file_path: str, content: str, overwrite: bool = False) -> str:
     if not file_path or not str(file_path).strip():
         return "Error: Missing or invalid file path. Cannot write to a directory."
 
-    # Resolve relative paths against CWD so bare filenames like
+    from ultron.core.tools.paths import resolve_project_path
+
+    # Resolve relative paths against active project directory (or CWD) so bare filenames like
     # "overwrite_test.txt" land in the project root, not some unknown dir.
-    file_path = str(file_path).strip()
-    if not os.path.isabs(file_path):
-        file_path = os.path.join(os.getcwd(), file_path)
+    file_path = str(resolve_project_path(str(file_path).strip()))
 
     # Guard 2: path must not be an existing directory
     if os.path.isdir(file_path):

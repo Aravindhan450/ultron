@@ -87,7 +87,8 @@ _SE_NOUNS_RE = re.compile(
 )
 
 _SE_CREATION_RE = re.compile(
-    r"\b(create|build|implement|develop|scaffold)\b.*?\b(app|application|project|service|cli|tool|script|program|tracker\w*|backend\w*|frontend\w*|api\b|module\w*|bot\w*|engine\w*)\b"
+    r"\b(create|build|implement|develop|scaffold)\b.*?\b(app|application|project|service|cli|tool|script|program|tracker\w*|backend\w*|frontend\w*|api\b|module\w*|bot\w*|engine\w*)\b",
+    re.IGNORECASE,
 )
 
 _ACTION_VERBS = {

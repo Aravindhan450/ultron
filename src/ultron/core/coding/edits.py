@@ -19,7 +19,6 @@ changes only the matched region and reports how many occurrences changed.
 
 from __future__ import annotations
 
-import os
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -121,14 +120,15 @@ class ModificationTracker(BaseModel):
 
 
 def _resolve(path: str) -> Path | None:
-    """Resolves *path* inside ALLOWED_BASE_DIR; None when unsafe/blank."""
+    """Resolves *path* inside allowed base directories; None when unsafe/blank."""
     raw = str(path or "").strip()
     if not raw:
         return None
-    if not os.path.isabs(raw):
-        raw = os.path.join(os.getcwd(), raw)
+    from ultron.core.tools.paths import resolve_project_path
+
+    resolved_candidate = resolve_project_path(raw)
     try:
-        ok, resolved = is_path_safe(raw)
+        ok, resolved = is_path_safe(resolved_candidate)
     except (OSError, ValueError):
         return None
     return resolved if ok else None

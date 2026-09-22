@@ -1319,10 +1319,20 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
                         _root = getattr(_ws, "project_root", None) if _ws is not None else None
                         save_task(_task, _root or Path.cwd())
 
-                UI.render_response(response_msg.content)
+                final_content = response_msg.content
+                if (
+                    response_msg.task_state is not None
+                    and response_msg.task_state.plan is not None
+                    and getattr(response_msg.task_state.plan, "project_dir", None)
+                ):
+                    p_dir = response_msg.task_state.plan.project_dir
+                    if str(p_dir) not in final_content:
+                        final_content = f"{final_content}\n\nLocation: {p_dir}"
+
+                UI.render_response(final_content)
 
                 history.append(ChatMessage(role=Role.USER, content=trimmed_input))
-                history.append(ChatMessage(role=Role.ASSISTANT, content=response_msg.content))
+                history.append(ChatMessage(role=Role.ASSISTANT, content=final_content))
 
             except KeyboardInterrupt:
                 reflow.stop()

@@ -663,6 +663,9 @@ def _build_plan_context_block(task: TaskState) -> str:
         f"Task type: {task.task_type.value if task.task_type else 'unknown'}",
         f"Workspace: {plan.workspace.value}",
     ]
+    if getattr(plan, "project_dir", None):
+        lines.append(f"Project location: {plan.project_dir}")
+
     if step is not None:
         lines.append(f"Current step {step.id}/{len(plan.steps)}: {step.description}")
         if step.purpose:

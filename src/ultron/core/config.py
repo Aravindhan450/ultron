@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     security_mode: Literal["strict", "permissive", "interactive"] = "interactive"
     database_type: Literal["sqlite", "postgres"] = "sqlite"
     database_url: str | None = None
+    workspace: str | None = None
 
 
 # Global settings singleton

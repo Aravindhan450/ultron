@@ -248,6 +248,7 @@ class TaskPlan(BaseModel):
     completion_criteria: list[str] = Field(default_factory=list)
     verification_requirements: list[str] = Field(default_factory=list)
     failure_recovery: str = ""
+    project_dir: str | None = None
     needs_clarification: bool = False
     clarification_questions: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
