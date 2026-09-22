@@ -33,6 +33,7 @@ class ObservationKind(str, Enum):
     DIFF = "diff"
     REPOSITORY_STATE = "repository_state"
     EDIT_RESULT = "edit_result"
+    APP_LIFECYCLE = "app_lifecycle"
 
 
 class Observation(BaseModel):
@@ -45,6 +46,7 @@ class Observation(BaseModel):
     success: bool | None = None
     exit_code: int | None = None
     duration_ms: float | None = None
+    app_state: str | None = None  # ApplicationLifecycleState value when applicable
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @classmethod

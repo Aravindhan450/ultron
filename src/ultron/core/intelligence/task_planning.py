@@ -31,6 +31,9 @@ from ultron.core.intelligence.plan_validation import (
 )
 from ultron.core.intelligence.task_classification import classify_task
 from ultron.core.types import (
+    AcceptanceCriterion,
+    AcceptanceCriterionStatus,
+    EvidenceLevel,
     FailureStrategy,
     PlanStep,
     TaskPlan,
@@ -368,32 +371,87 @@ def build_artifact_plan(
         ),
         PlanStep(
             id=2,
-            description="Execute and test application",
-            purpose="Run the application or test suite and observe runtime output/errors",
-            expected_outcome="Application executes successfully with valid output",
+            description="Launch application and observe runtime readiness",
+            purpose="Run the application or server and establish that the process/window/service is active and ready",
+            expected_outcome="Application launches and enters active/ready state without crashes",
             dependencies=[1],
-            completion_criteria=["Application executed without unhandled errors"],
+            completion_criteria=["Application process/service started and running"],
             failure_strategy=FailureStrategy.RETRY,
             retry_policy=2,
         ),
         PlanStep(
             id=3,
-            description="Verify the final user goal",
-            purpose="Ensure the original user request is fully satisfied with verified evidence",
-            expected_outcome="The original user goal is satisfied",
+            description="Interact with application and test user behavior",
+            purpose="Exercise actual application functionality (query UI/endpoints/database/CLI)",
+            expected_outcome="Application responds correctly to inputs and workflows",
             dependencies=[1, 2],
+            completion_criteria=["Core user workflows executed and verified"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=2,
+        ),
+        PlanStep(
+            id=4,
+            description="Verify the final user goal with independent evidence",
+            purpose="Ensure the original user request is fully satisfied and backed by verifiable output/reference comparison",
+            expected_outcome="The original user goal is satisfied with collected evidence",
+            dependencies=[1, 2, 3],
             completion_criteria=[goal],
             failure_strategy=FailureStrategy.STOP,
         ),
     ]
+
+    acceptance_criteria = [
+        AcceptanceCriterion(
+            id="workspace_isolation",
+            description=f"Project is isolated under dedicated workspace directory: {resolved_project_dir}",
+            verification_method="file_check",
+            required=True,
+            status=AcceptanceCriterionStatus.PENDING,
+            evidence_level=EvidenceLevel.LEVEL_1_CREATED,
+        ),
+        AcceptanceCriterion(
+            id="dependencies_and_code",
+            description="Application code is implemented and runnable",
+            verification_method="file_check",
+            required=True,
+            status=AcceptanceCriterionStatus.PENDING,
+            evidence_level=EvidenceLevel.LEVEL_1_CREATED,
+        ),
+        AcceptanceCriterion(
+            id="application_execution",
+            description="Application launches and runs without crashing",
+            verification_method="process_check",
+            required=True,
+            status=AcceptanceCriterionStatus.PENDING,
+            evidence_level=EvidenceLevel.LEVEL_3_LAUNCHED,
+        ),
+        AcceptanceCriterion(
+            id="behavior_interaction",
+            description="Application behavior and core features are exercised and interacted with",
+            verification_method="execution",
+            required=True,
+            status=AcceptanceCriterionStatus.PENDING,
+            evidence_level=EvidenceLevel.LEVEL_4_INTERACTED,
+        ),
+        AcceptanceCriterion(
+            id="verified_completion",
+            description=f"Goal '{goal}' is verified with independent evidence",
+            verification_method="reference_comparison",
+            required=True,
+            status=AcceptanceCriterionStatus.PENDING,
+            evidence_level=EvidenceLevel.LEVEL_5_VERIFIED,
+        ),
+    ]
+
     return TaskPlan(
         goal=goal,
         task_type=TaskType.SOFTWARE_ENGINEERING,
         workspace=workspace,
         steps=steps,
-        completion_criteria=[goal, "All application files created and verified through execution"],
+        completion_criteria=[goal, "All application files created, launched, interacted with, and verified"],
         verification_requirements=[f"The user goal is satisfied: {goal}"],
-        failure_recovery="Retry execution failures up to configured budget; do not report completion without evidence.",
+        acceptance_criteria=acceptance_criteria,
+        failure_recovery="Diagnose and classify failures; apply repair and retest; do not report completion without evidence.",
         project_dir=str(resolved_project_dir),
     )
 

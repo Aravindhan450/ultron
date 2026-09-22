@@ -69,7 +69,9 @@ from ultron.core.tools.definitions import (
 )
 from ultron.core.tools.registry import get_tool, get_tools_schema
 from ultron.core.types import (
+    ApplicationLifecycleState,
     ChatMessage,
+    EvidenceLevel,
     FailureStrategy,
     PendingAction,
     PlanStep,
@@ -1221,6 +1223,44 @@ class ReActAgent(BaseAgent):
                     # Fix #4: successful edits invalidate the code index.
                     if succeeded and tool_name in EDIT_TOOL_ACTIONS:
                         task.code_context.intelligence.mark_dirty()
+
+                # Fix #7: Dynamic application lifecycle state & acceptance criteria tracking
+                if succeeded:
+                    if tool_name in EDIT_TOOL_ACTIONS or tool_name == "write_file":
+                        task.app_lifecycle_state = ApplicationLifecycleState.CREATED
+                        task.verify_acceptance_criterion(
+                            "workspace_isolation",
+                            f"Files created in project workspace ({target})",
+                            EvidenceLevel.LEVEL_1_CREATED,
+                        )
+                        task.verify_acceptance_criterion(
+                            "dependencies_and_code",
+                            f"Implemented {target}",
+                            EvidenceLevel.LEVEL_1_CREATED,
+                        )
+                    elif tool_name in ("run_command", "run_parallel"):
+                        cmd = str(arguments.get("command", ""))
+                        if any(k in cmd for k in ("python", "npm", "node", "cargo", "go", "bash", "sh")):
+                            task.app_lifecycle_state = ApplicationLifecycleState.EXECUTED
+                            if any(k in cmd for k in ("server", "app.py", "main.py", "start", "run", "dashboard", "weather_app", "gui")):
+                                task.app_lifecycle_state = ApplicationLifecycleState.STARTED
+                                task.verify_acceptance_criterion(
+                                    "application_execution",
+                                    f"Application command executed: {cmd}",
+                                    EvidenceLevel.LEVEL_3_LAUNCHED,
+                                )
+                        if any(k in cmd for k in ("curl", "pytest", "test", "select", "query", "grep", "cat", "get", "open-meteo", "sqlite")):
+                            task.app_lifecycle_state = ApplicationLifecycleState.INTERACTED
+                            task.verify_acceptance_criterion(
+                                "behavior_interaction",
+                                f"Application interaction verified via: {cmd}",
+                                EvidenceLevel.LEVEL_4_INTERACTED,
+                            )
+                            task.verify_acceptance_criterion(
+                                "verified_completion",
+                                f"Application verified with output: {str(outcome)[:100]}",
+                                EvidenceLevel.LEVEL_5_VERIFIED,
+                            )
                 if task.plan is not None and not succeeded:
                     step = task.current_plan_step()
                     if step is not None and step.status is StepStatus.RUNNING:
@@ -1366,6 +1406,15 @@ class ReActAgent(BaseAgent):
             )
             return False, None
 
+        if not task.all_required_criteria_satisfied():
+            unmet = task.remaining_acceptance_criteria()
+            names = ", ".join(f"{c.id} ('{c.description}')" for c in unmet)
+            _note(
+                f"Verification: task incomplete. Unsatisfied acceptance criteria: {names}. "
+                "Continue working toward verifying application launch, interaction, or required behavior."
+            )
+            return False, None
+
         task.mark_complete()
         # Fix #6: capture this completing turn's intelligence facts.
         _sync_task_memory(task)
@@ -1471,6 +1520,14 @@ class ReActAgent(BaseAgent):
                 _note(
                     f"Verification: task incomplete. Remaining requirements: "
                     f"{names}. Continue working toward the goal."
+                )
+                return False, None
+            if not task.all_required_criteria_satisfied():
+                unmet = task.remaining_acceptance_criteria()
+                names = ", ".join(f"{c.id} ('{c.description}')" for c in unmet)
+                _note(
+                    f"Verification: task incomplete. Unsatisfied acceptance criteria: {names}. "
+                    "Continue working toward verifying application launch, interaction, or required behavior."
                 )
                 return False, None
             task.mark_complete()

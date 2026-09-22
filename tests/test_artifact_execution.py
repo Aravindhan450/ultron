@@ -59,12 +59,15 @@ def test_artifact_classification_distinguishes_explanation_vs_building():
 
 def test_build_artifact_plan_structure():
     plan = build_artifact_plan("Build an expense tracker")
-    assert len(plan.steps) == 3
+    assert len(plan.steps) == 4
     assert "implement" in plan.steps[0].description.lower()
-    assert "execute" in plan.steps[1].description.lower()
-    assert "verify" in plan.steps[2].description.lower()
+    assert "launch" in plan.steps[1].description.lower()
+    assert "interact" in plan.steps[2].description.lower()
+    assert "verify" in plan.steps[3].description.lower()
     assert plan.steps[1].dependencies == [1]
     assert plan.steps[2].dependencies == [1, 2]
+    assert plan.steps[3].dependencies == [1, 2, 3]
+    assert len(plan.acceptance_criteria) >= 4
 
 
 def test_react_coding_gate_circuit_breaks_repeated_failures():

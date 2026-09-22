@@ -278,4 +278,22 @@ Project Ultron is undergoing an **Ollama → llama.cpp / llama-server** migratio
 - **Security & Confinement**:
   - 100% strict confinement inside `~/UltronWorkspace/`; zero escapes; zero source repository pollution.
 
+### Phase 8: Autonomous Coding Agent v1 (Reliability, Real Application Launch, Verification & Repair) — [COMPLETED & VERIFIED]
+- **Explicit Acceptance Criteria & Evidence Levels**:
+  - Implemented `AcceptanceCriterion`, `AcceptanceCriterionStatus`, and `EvidenceLevel` (Level 0: Generated, Level 1: Created, Level 2: Executed, Level 3: Launched, Level 4: Interacted, Level 5: Verified, Level 6: Repaired) in `src/ultron/core/types.py`.
+  - `TaskState` and `TaskPlan` now track structured acceptance criteria and enforce `all_required_criteria_satisfied()` before `mark_complete()` allows task completion.
+- **Application Lifecycle Tracking**:
+  - Added `ApplicationLifecycleState` (`CREATED`, `EXECUTED`, `STARTED`, `READY`, `INTERACTED`, `VERIFIED`) across `TaskState` and `Observation`.
+- **Failure Classification & Loop Circuit Breaking**:
+  - Expanded `FailureCategory` (`SYNTAX`, `COMPILATION`, `TEST_ASSERTION`, `DEPENDENCY`, `CONFIGURATION`, `ENVIRONMENT`, `RUNTIME`, `PERMISSION`, `TIMEOUT`, `NETWORK_API`, `DATA`, `UI`, `UNKNOWN`) in `src/ultron/core/coding/executor.py`.
+  - Added macOS Tkinter virtualenv diagnosis: automatically identifies `_tkinter` omission and provides actionable strategy repair guidance (`/usr/bin/python3 <app.py>`).
+  - Gated repetition detection: blocks identical repeated failures and injects root cause diagnosis and strategy-shift guidance directly into agent observations.
+- **Autonomous Multi-Step Plan Architecture**:
+  - Upgraded `build_artifact_plan` in `src/ultron/core/intelligence/task_planning.py` to the full 4-step autonomous lifecycle (Scaffold -> Launch -> Interact -> Verify with independent evidence).
+- **Quality Baseline**:
+  - Pytest suite: **1,792 / 1,792 passed (100%)**.
+  - Ruff lint: Clean (0 errors).
+  - Real macOS application launch verified: Tamil Nadu Weather Desktop GUI running live on macOS screen via native Aqua bindings.
+
+
 

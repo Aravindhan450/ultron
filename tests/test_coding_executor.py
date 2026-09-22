@@ -173,7 +173,7 @@ def test_classify_failure_all_categories():
         ("npm ERR! code ERESOLVE", FailureCategory.DEPENDENCY),
         ("Invalid configuration: missing auth", FailureCategory.CONFIGURATION),
         ("command not found: cargo", FailureCategory.ENVIRONMENT),
-        ("connection refused", FailureCategory.ENVIRONMENT),
+        ("connection refused", FailureCategory.NETWORK_API),
         ("Traceback (most recent call last):\nValueError: boom", FailureCategory.RUNTIME),
         ("panic: index out of range", FailureCategory.RUNTIME),
         ("Permission denied: /root", FailureCategory.PERMISSION),

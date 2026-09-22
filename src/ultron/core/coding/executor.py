@@ -67,6 +67,9 @@ class FailureCategory(str, Enum):
     RUNTIME = "runtime"
     PERMISSION = "permission"
     TIMEOUT = "timeout"
+    NETWORK_API = "network_api"
+    DATA = "data"
+    UI = "ui"
     UNKNOWN = "unknown"
 
 
@@ -205,6 +208,53 @@ _RE_CATEGORY: list[tuple[FailureCategory, list[str]]] = [
         ],
     ),
     (
+        FailureCategory.UI,
+        [
+            r"tclerror",
+            r"cannot\s+connect\s+to\s+x\s*server",
+            r"could\s+not\s+connect\s+to\s+display",
+            r"qt\s+platform\s+plugin",
+            r"xcb",
+            r"nsapplication",
+        ],
+    ),
+    (
+        FailureCategory.NETWORK_API,
+        [
+            r"connection\s+refused",
+            r"connection\s+reset",
+            r"failed\s+to\s+establish\s+a\s+new\s+connection",
+            r"max\s+retries\s+exceeded",
+            r"urllib\.error",
+            r"requests\.exceptions",
+            r"socket\.gaierror",
+            r"httperror",
+            r"errno\s+61",
+        ],
+    ),
+    (
+        FailureCategory.DATA,
+        [
+            r"sqlite3\.(?:operational|integrity|database)error",
+            r"no\s+such\s+table",
+            r"database\s+is\s+locked",
+            r"jsondecodeerror",
+            r"failed\s+to\s+parse\s+(?:json|csv)",
+        ],
+    ),
+    (
+        FailureCategory.ENVIRONMENT,
+        [
+            r"no\s+module\s+named\s+['_|\"]?tkinter",
+            r"no\s+module\s+named\s+['_|\"]?_tkinter",
+            r"command\s+not\s+found",
+            r"not\s+recognized\s+as",
+            r"certificate",
+            r"\bssl\b",
+            r"no\s+such\s+host",
+        ],
+    ),
+    (
         FailureCategory.DEPENDENCY,
         [
             r"no\s+module\s+named",
@@ -259,19 +309,6 @@ _RE_CATEGORY: list[tuple[FailureCategory, list[str]]] = [
         ],
     ),
     (
-        FailureCategory.ENVIRONMENT,
-        [
-            r"command\s+not\s+found",
-            r"not\s+recognized\s+as",
-            r"connection\s+refused",
-            r"cannot\s+connect",
-            r"could\s+not\s+connect",
-            r"certificate",
-            r"\bssl\b",
-            r"no\s+such\s+host",
-        ],
-    ),
-    (
         FailureCategory.TEST_ASSERTION,
         [
             r"assertionerror",
@@ -307,12 +344,15 @@ _REPAIR_HINTS: dict[FailureCategory, str] = {
     FailureCategory.SYNTAX: "Fix the syntax error at the flagged location, then rerun.",
     FailureCategory.COMPILATION: "Resolve the compilation/build error (missing symbol, bad reference), then rebuild.",
     FailureCategory.TEST_ASSERTION: "Read the failing test, trace the implementation, fix the behavior, then rerun the affected test.",
-    FailureCategory.DEPENDENCY: "Inspect the dependency configuration, ensure the package is declared/installable, then rerun.",
+    FailureCategory.DEPENDENCY: "Inspect the dependency configuration, ensure the package is declared/installable (or use stdlib), then rerun.",
     FailureCategory.CONFIGURATION: "Inspect the referenced configuration and correct the invalid setting.",
-    FailureCategory.ENVIRONMENT: "Verify the required tool/service is available in this environment, or adapt the approach.",
+    FailureCategory.ENVIRONMENT: "Environment issue detected. If Tkinter failed on macOS, run with system python '/usr/bin/python3 <app.py>'.",
     FailureCategory.RUNTIME: "Inspect the traceback, locate the faulty code path, and fix the runtime error.",
     FailureCategory.PERMISSION: "The action was blocked by permissions — choose an allowed alternative or ask for approval.",
     FailureCategory.TIMEOUT: "The command exceeded the time budget — narrow its scope or investigate why it hangs.",
+    FailureCategory.NETWORK_API: "Network/API request failed. Verify endpoint availability, parameters, or handle fallback.",
+    FailureCategory.DATA: "Database/data format error. Verify schema initialization, table creation, or JSON/CSV formatting.",
+    FailureCategory.UI: "UI/Display error. Verify window initialization, event loop, or run headless mode where appropriate.",
     FailureCategory.UNKNOWN: "Inspect the full error output to identify the cause before acting.",
 }
 
@@ -775,10 +815,13 @@ class CodingExecutor(BaseModel):
         if not self.budget.repeat_blocked(tool_name, arguments):
             return None
         count = self.budget.identical_failures(tool_name, arguments)
+        hint = ""
+        if self.failures:
+            last = self.failures[-1]
+            hint = f" [Diagnosis: {last.category.value}] {last.repair_hint}"
         return (
-            "Error: This exact action has already failed "
-            f"{count} time(s). Do not repeat it identically — inspect the "
-            "failure, adjust your approach, and only then retry."
+            f"Error: This exact action has already failed {count} time(s). "
+            f"Do not repeat it identically — inspect the failure, change your strategy, and adapt.{hint}"
         )
 
     def gate_new_action_with_exhausted_budget(self, tool_name: str) -> str | None:

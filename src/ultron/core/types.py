@@ -148,6 +148,66 @@ class FailureStrategy(str, Enum):
     SKIP = "skip"  # mark SKIPPED and continue with independent steps
     CONTINUE = "continue"  # record the failure but keep going
 
+class EvidenceLevel(str, Enum):
+    """
+    Evidence level backing task acceptance and verification.
+
+    LEVEL 0 — Generated: Code/files exist.
+    LEVEL 1 — Created: Project structure exists in workspace.
+    LEVEL 2 — Executed: Program actually ran (exit code 0 / invocation started).
+    LEVEL 3 — Launched: Application became available (process running, port listening, GUI initialized).
+    LEVEL 4 — Interacted: Real application behavior exercised with inputs/events.
+    LEVEL 5 — Verified: Checked against an independent or deterministic source.
+    LEVEL 6 — Repaired: Failure diagnosed, repair applied, and verification re-tested and passed.
+    """
+
+    LEVEL_0_GENERATED = "level_0_generated"
+    LEVEL_1_CREATED = "level_1_created"
+    LEVEL_2_EXECUTED = "level_2_executed"
+    LEVEL_3_LAUNCHED = "level_3_launched"
+    LEVEL_4_INTERACTED = "level_4_interacted"
+    LEVEL_5_VERIFIED = "level_5_verified"
+    LEVEL_6_REPAIRED = "level_6_repaired"
+
+
+class AcceptanceCriterionStatus(str, Enum):
+    """Lifecycle status of an individual acceptance criterion."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    VERIFIED = "verified"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class AcceptanceCriterion(BaseModel):
+    """
+    Explicit, evidence-backed acceptance criterion for autonomous task execution.
+    """
+
+    id: str
+    description: str
+    verification_method: str = "execution"
+    required: bool = True
+    status: AcceptanceCriterionStatus = AcceptanceCriterionStatus.PENDING
+    evidence: str = ""
+    evidence_level: EvidenceLevel = EvidenceLevel.LEVEL_0_GENERATED
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class ApplicationLifecycleState(str, Enum):
+    """
+    Observable lifecycle state of an application created or managed by Ultron.
+    """
+
+    CREATED = "created"
+    EXECUTED = "executed"
+    STARTED = "started"
+    READY = "ready"
+    INTERACTED = "interacted"
+    VERIFIED = "verified"
+
+
 class TaskRequirement(BaseModel):
     """
     One explicit completion criterion for a task.
@@ -247,6 +307,7 @@ class TaskPlan(BaseModel):
     steps: list[PlanStep] = Field(default_factory=list)
     completion_criteria: list[str] = Field(default_factory=list)
     verification_requirements: list[str] = Field(default_factory=list)
+    acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
     failure_recovery: str = ""
     project_dir: str | None = None
     needs_clarification: bool = False
@@ -490,6 +551,9 @@ class TaskState(BaseModel):
     clarification_required: bool = False  # planner could not proceed safely
     clarification_questions: list[str] = Field(default_factory=list)
     plan_revisions: list[str] = Field(default_factory=list)  # adaptive-plan audit trail
+    # --- Autonomous Execution & Acceptance (Fix #7) ---
+    acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
+    app_lifecycle_state: ApplicationLifecycleState | None = None
     # --- Coding workspace / execution context (Fix #3 stage 1) ---
     # Structured, coding-specific context (workspace, relevant files,
     # observations, modifications) — separate from the raw transcript.
@@ -548,6 +612,99 @@ class TaskState(BaseModel):
     def remaining_requirements(self) -> list[TaskRequirement]:
         """Completion criteria not yet satisfied."""
         return [r for r in self.requirements if not r.completed]
+
+    # ------------------------------------------------------------------
+    # Acceptance criteria (evidence-backed completion)
+    # ------------------------------------------------------------------
+
+    def add_acceptance_criterion(
+        self,
+        id: str,
+        description: str,
+        verification_method: str = "execution",
+        required: bool = True,
+    ) -> AcceptanceCriterion:
+        """Adds or updates an explicit acceptance criterion."""
+        for crit in self.acceptance_criteria:
+            if crit.id == id:
+                crit.description = description
+                crit.verification_method = verification_method
+                crit.required = required
+                self._touch()
+                return crit
+        criterion = AcceptanceCriterion(
+            id=id,
+            description=description,
+            verification_method=verification_method,
+            required=required,
+        )
+        self.acceptance_criteria.append(criterion)
+        self._touch()
+        return criterion
+
+    def verify_acceptance_criterion(
+        self,
+        id: str,
+        evidence: str,
+        level: EvidenceLevel = EvidenceLevel.LEVEL_4_INTERACTED,
+    ) -> AcceptanceCriterion:
+        """Marks an acceptance criterion as verified with concrete evidence."""
+        for crit in self.acceptance_criteria:
+            if crit.id == id:
+                crit.status = AcceptanceCriterionStatus.VERIFIED
+                crit.evidence = evidence
+                crit.evidence_level = level
+                crit.timestamp = datetime.now(UTC)
+                self._touch()
+                return crit
+        crit = AcceptanceCriterion(
+            id=id,
+            description=id,
+            status=AcceptanceCriterionStatus.VERIFIED,
+            evidence=evidence,
+            evidence_level=level,
+        )
+        self.acceptance_criteria.append(crit)
+        self._touch()
+        return crit
+
+    def fail_acceptance_criterion(
+        self,
+        id: str,
+        error: str,
+    ) -> AcceptanceCriterion:
+        """Marks an acceptance criterion as failed."""
+        for crit in self.acceptance_criteria:
+            if crit.id == id:
+                crit.status = AcceptanceCriterionStatus.FAILED
+                crit.evidence = error
+                self._touch()
+                return crit
+        crit = AcceptanceCriterion(
+            id=id,
+            description=id,
+            status=AcceptanceCriterionStatus.FAILED,
+            evidence=error,
+        )
+        self.acceptance_criteria.append(crit)
+        self._touch()
+        return crit
+
+    def all_required_criteria_satisfied(self) -> bool:
+        """True if all required acceptance criteria are verified."""
+        return all(
+            crit.status == AcceptanceCriterionStatus.VERIFIED
+            for crit in self.acceptance_criteria
+            if crit.required
+        )
+
+    def remaining_acceptance_criteria(self) -> list[AcceptanceCriterion]:
+        """List of required criteria that are not yet verified."""
+        return [
+            crit
+            for crit in self.acceptance_criteria
+            if crit.required and crit.status != AcceptanceCriterionStatus.VERIFIED
+        ]
 
     # ------------------------------------------------------------------
     # Step tracking
@@ -682,10 +839,10 @@ class TaskState(BaseModel):
         """
         Explicitly completes the task — the only path to TASK_COMPLETED.
 
-        Refuses when requirements are still incomplete, the task has failed /
-        been blocked, or (with a structured plan attached) any plan step is
-        still pending / running / failed — a task whose plan is not fully
-        satisfied must never report success.
+        Refuses when requirements or acceptance criteria are still incomplete,
+        the task has failed / been blocked, or (with a structured plan attached)
+        any plan step is still pending / running / failed — a task whose plan is
+        not fully satisfied must never report success.
         """
         if self.status in (TaskStatus.TASK_FAILED, TaskStatus.TASK_BLOCKED):
             raise ValueError(f"Cannot complete a task in state '{self.status.value}'")
@@ -701,6 +858,12 @@ class TaskState(BaseModel):
             raise ValueError(
                 f"Cannot complete task with incomplete requirements: {missing}"
             )
+        if not self.all_required_criteria_satisfied():
+            unmet = self.remaining_acceptance_criteria()
+            names = ", ".join(f"{c.id} ('{c.description}')" for c in unmet)
+            raise ValueError(
+                f"Cannot complete task with unsatisfied acceptance criteria: {names}"
+            )
         self.status = TaskStatus.TASK_COMPLETED
         self._touch()
 
@@ -710,11 +873,15 @@ class TaskState(BaseModel):
 
     def is_complete(self) -> bool:
         """
-        True only when the task has been explicitly marked complete and no
-        requirements remain unsatisfied (defense-in-depth for deserialized
-        or corrupt state — the normal path is guarded by mark_complete()).
+        True only when the task has been explicitly marked complete, no
+        requirements remain unsatisfied, and all required acceptance criteria
+        are verified.
         """
-        return self.status == TaskStatus.TASK_COMPLETED and not self.remaining_requirements()
+        return (
+            self.status == TaskStatus.TASK_COMPLETED
+            and not self.remaining_requirements()
+            and self.all_required_criteria_satisfied()
+        )
 
     @property
     def is_blocked(self) -> bool:
@@ -730,9 +897,12 @@ class TaskState(BaseModel):
         """Compact one-line description for logs and debugging."""
         done = len(self.completed_requirements)
         total = len(self.requirements)
+        crit_done = len([c for c in self.acceptance_criteria if c.status == AcceptanceCriterionStatus.VERIFIED])
+        crit_total = len(self.acceptance_criteria)
         return (
             f"TaskState(goal='{self.goal}', status={self.status.value}, "
-            f"requirements={done}/{total}, step={self.current_step}/{self.total_steps}, "
+            f"requirements={done}/{total}, criteria={crit_done}/{crit_total}, "
+            f"step={self.current_step}/{self.total_steps}, "
             f"tools={len(self.execution_history)}, errors={len(self.errors)})"
         )
 
@@ -744,7 +914,7 @@ class TaskState(BaseModel):
         """
         Attaches a structured plan to the task and seeds its completion
         criteria from the plan (plan-level criteria + verification
-        requirements).
+        requirements + explicit acceptance criteria).
 
         TaskState remains the runtime source of truth; the plan is
         persisted with it, so it survives LLM turns, tool calls,
@@ -759,6 +929,14 @@ class TaskState(BaseModel):
             if description and description not in seen:
                 seen.add(description)
                 self.add_requirement(description)
+        if plan.acceptance_criteria:
+            for crit in plan.acceptance_criteria:
+                self.add_acceptance_criterion(
+                    id=crit.id,
+                    description=crit.description,
+                    verification_method=crit.verification_method,
+                    required=crit.required,
+                )
         if plan.needs_clarification:
             self.require_clarification(plan.clarification_questions)
         self._touch()
