@@ -287,6 +287,11 @@ def fallback_plan(
     intact: the task must be verified against the goal before it can ever
     be reported complete.
     """
+    from ultron.core.intelligence.intent_understanding import understand_user_intent
+
+    intent = understand_user_intent(goal)
+    criteria = list(intent.acceptance_criteria) if intent else []
+
     return TaskPlan(
         goal=goal,
         task_type=task_type,
@@ -306,6 +311,8 @@ def fallback_plan(
         ],
         completion_criteria=[goal],
         verification_requirements=[f"The user goal is satisfied: {goal}"],
+        acceptance_criteria=criteria,
+        user_intent=intent,
         failure_recovery=(
             "Stop on the first failure; the task must not report completion "
             "until the goal has been verified."
@@ -335,11 +342,14 @@ def build_artifact_plan(
     Enforces the cycle: Scaffold/Write -> Execute/Run -> Verify Evidence.
     Resolves external workspace when configured via ULTRON_WORKSPACE.
     """
+    from ultron.core.intelligence.intent_understanding import understand_user_intent
     from ultron.core.tools.paths import (
         ALLOWED_BASE_DIR,
         get_configured_workspace,
         set_active_project_dir,
     )
+
+    intent = understand_user_intent(goal)
 
     resolved_project_dir: Path
     if project_dir is not None:
@@ -400,7 +410,7 @@ def build_artifact_plan(
         ),
     ]
 
-    acceptance_criteria = [
+    acceptance_criteria = list(intent.acceptance_criteria) if intent else [
         AcceptanceCriterion(
             id="workspace_isolation",
             description=f"Project is isolated under dedicated workspace directory: {resolved_project_dir}",
@@ -451,6 +461,7 @@ def build_artifact_plan(
         completion_criteria=[goal, "All application files created, launched, interacted with, and verified"],
         verification_requirements=[f"The user goal is satisfied: {goal}"],
         acceptance_criteria=acceptance_criteria,
+        user_intent=intent,
         failure_recovery="Diagnose and classify failures; apply repair and retest; do not report completion without evidence.",
         project_dir=str(resolved_project_dir),
     )
@@ -492,6 +503,14 @@ async def generate_task_plan(
         return None
     if not validate_plan(plan).valid:
         return None
+
+    from ultron.core.intelligence.intent_understanding import understand_user_intent
+
+    if plan.user_intent is None:
+        plan.user_intent = understand_user_intent(goal)
+    if not plan.acceptance_criteria and plan.user_intent:
+        plan.acceptance_criteria = list(plan.user_intent.acceptance_criteria)
+
     return plan
 
 

@@ -187,3 +187,62 @@ def test_build_artifact_plan_has_acceptance_criteria(tmp_path, monkeypatch):
     task.attach_plan(plan)
     assert len(task.acceptance_criteria) == len(plan.acceptance_criteria)
     assert not task.all_required_criteria_satisfied()
+
+
+def test_intent_understanding_product_types():
+    from ultron.core.intelligence.intent_understanding import (
+        detect_product_type,
+        understand_user_intent,
+    )
+    from ultron.core.types import ProductType
+
+    assert detect_product_type("Build a Tamil Nadu weather desktop app") == ProductType.DESKTOP_GUI
+    assert detect_product_type("Create a tkinter weather viewer") == ProductType.DESKTOP_GUI
+    assert detect_product_type("Build a Flask web dashboard for weather") == ProductType.WEB_APP
+    assert detect_product_type("Build a REST API backend with json endpoints") == ProductType.REST_API
+    assert detect_product_type("Build a SQLite expense tracker database app") == ProductType.DATABASE_APP
+    assert detect_product_type("Create a CLI tool with argparse") == ProductType.CLI_TOOL
+    assert detect_product_type("Build a web scraper and downloader script") == ProductType.AUTOMATION_SCRIPT
+    assert detect_product_type("Build a reusable python library package") == ProductType.LIBRARY
+
+    # Full intent derivation for Desktop GUI
+    intent = understand_user_intent("Build a Tamil Nadu weather desktop app in Tkinter")
+    assert intent.product_type == ProductType.DESKTOP_GUI
+    assert len(intent.inferred_necessary_requirements) >= 3
+    assert any("graphical user interface" in r.lower() or "desktop" in r.lower() or "visual" in r.lower() for r in intent.inferred_necessary_requirements)
+    assert "Launch process" in intent.verification_strategy
+    assert len(intent.acceptance_criteria) >= 4
+
+
+def test_intent_understanding_web_and_db():
+    from ultron.core.intelligence.intent_understanding import understand_user_intent
+    from ultron.core.types import ProductType
+
+    web_intent = understand_user_intent("Create a web dashboard for student performance")
+    assert web_intent.product_type == ProductType.WEB_APP
+    assert any("server" in r.lower() or "http" in r.lower() for r in web_intent.inferred_necessary_requirements)
+    assert any(c.id == "http_endpoint_readiness" for c in web_intent.acceptance_criteria)
+
+    db_intent = understand_user_intent("Build an expense tracker with sqlite3 persistence")
+    assert db_intent.product_type == ProductType.DATABASE_APP
+    assert any("schema" in r.lower() or "database" in r.lower() for r in db_intent.inferred_necessary_requirements)
+    assert any(c.id == "behavior_interaction" for c in db_intent.acceptance_criteria)
+
+
+def test_react_plan_context_block_rendering():
+    from ultron.core.agents.react import _build_plan_context_block
+    from ultron.core.intelligence.task_planning import build_artifact_plan
+    from ultron.core.types import TaskState
+
+    plan = build_artifact_plan("Build Tamil Nadu weather desktop app")
+    task = TaskState(goal="Build Tamil Nadu weather desktop app")
+    task.attach_plan(plan)
+
+    context = _build_plan_context_block(task)
+    assert "STRUCTURED PLAN" in context
+    assert "Product type: desktop_gui" in context
+    assert "Inferred necessary requirements:" in context
+    assert "Verification strategy:" in context
+    assert "Acceptance criteria" in context
+    assert "workspace_isolation" in context
+

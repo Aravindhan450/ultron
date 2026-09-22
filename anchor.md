@@ -290,10 +290,18 @@ Project Ultron is undergoing an **Ollama → llama.cpp / llama-server** migratio
   - Gated repetition detection: blocks identical repeated failures and injects root cause diagnosis and strategy-shift guidance directly into agent observations.
 - **Autonomous Multi-Step Plan Architecture**:
   - Upgraded `build_artifact_plan` in `src/ultron/core/intelligence/task_planning.py` to the full 4-step autonomous lifecycle (Scaffold -> Launch -> Interact -> Verify with independent evidence).
-- **Quality Baseline**:
+### Phase 9: Full-Fledged Autonomous Coding Agent (Intent Understanding → Planning → Execution → Interaction → Verification) — [COMPLETED & VERIFIED]
+- **Deep Intent Understanding Layer**:
+  - Implemented `src/ultron/core/intelligence/intent_understanding.py` providing `understand_user_intent()`, `detect_product_type()`, and `derive_acceptance_criteria()`.
+  - Distinguishes 10 concrete `ProductType`s: `DESKTOP_GUI`, `WEB_APP`, `CLI_TOOL`, `REST_API`, `DATABASE_APP`, `LIBRARY`, `AUTOMATION_SCRIPT`, `DATA_PIPELINE`, `DOCUMENTATION`, `GENERAL_SOFTWARE`.
+  - Derives explicit requirements, inferred necessary requirements (e.g. desktop event loop, non-blocking UI, HTTP server bindings, SQLite schemas), assumptions, ambiguities, constraints, product-tailored acceptance criteria, and specific verification strategies.
+- **Task Pipeline Integration**:
+  - Integrated `UserIntent` across `TaskClassification`, `TaskPlan`, and `TaskState`.
+  - Deterministic classification in `task_classification.py` and planning in `task_planning.py` (`build_artifact_plan`, `fallback_plan`, `generate_task_plan`) bind `UserIntent` and outcome-oriented acceptance criteria directly to task state.
+- **ReAct Context & Evidence-Gated Completion Loop**:
+  - `src/ultron/core/agents/react.py`: Injected `UserIntent` (product type, inferred requirements, verification strategy) and live acceptance criteria status directly into the plan context prompt block (`_build_plan_context_block`).
+  - Added strict acceptance criteria verification in `_verify_plan_task` and `_verify_task`: tasks cannot be completed without verifying required acceptance criteria backed by concrete Level 4/5 evidence.
+- **Targeted Test Suite & Quality Baseline**:
+  - Comprehensive unit test suite in `tests/test_autonomous_coding_agent_v1.py` covering product classification, intent extraction, requirement derivation, acceptance criteria gating, lifecycle state transitions, and context rendering.
   - Pytest suite: **1,792 / 1,792 passed (100%)**.
   - Ruff lint: Clean (0 errors).
-  - Real macOS application launch verified: Tamil Nadu Weather Desktop GUI running live on macOS screen via native Aqua bindings.
-
-
-

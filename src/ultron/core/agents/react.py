@@ -69,6 +69,7 @@ from ultron.core.tools.definitions import (
 )
 from ultron.core.tools.registry import get_tool, get_tools_schema
 from ultron.core.types import (
+    AcceptanceCriterionStatus,
     ApplicationLifecycleState,
     ChatMessage,
     EvidenceLevel,
@@ -668,6 +669,16 @@ def _build_plan_context_block(task: TaskState) -> str:
     if getattr(plan, "project_dir", None):
         lines.append(f"Project location: {plan.project_dir}")
 
+    intent = task.user_intent or (plan.user_intent if plan else None)
+    if intent:
+        lines.append(f"Product type: {intent.product_type.value}")
+        if intent.inferred_necessary_requirements:
+            lines.append("Inferred necessary requirements:")
+            for req in intent.inferred_necessary_requirements:
+                lines.append(f"  - {req}")
+        if intent.verification_strategy:
+            lines.append(f"Verification strategy: {intent.verification_strategy}")
+
     if step is not None:
         lines.append(f"Current step {step.id}/{len(plan.steps)}: {step.description}")
         if step.purpose:
@@ -700,6 +711,13 @@ def _build_plan_context_block(task: TaskState) -> str:
                 else ""
             )
             lines.append(f"  [ ] {s.id}. {s.description}{deps}")
+
+    if task.acceptance_criteria:
+        lines.append("Acceptance criteria (must all be verified with evidence to complete):")
+        for crit in task.acceptance_criteria:
+            status_symbol = "x" if crit.status == AcceptanceCriterionStatus.VERIFIED else " "
+            lines.append(f"  [{status_symbol}] {crit.id}: {crit.description} (Level: {crit.evidence_level.name})")
+
     lines.append(
         "INSTRUCTIONS: work ONLY on the current plan step. Do not skip ahead; "
         "a step is complete only when all its completion criteria are verified "
@@ -1630,6 +1648,14 @@ class ReActAgent(BaseAgent):
                 f"Verification: all plan steps are complete but overall "
                 f"requirements remain: {names}. Continue working toward the "
                 "goal."
+            )
+            return False, None
+        if not task.all_required_criteria_satisfied():
+            unmet = task.remaining_acceptance_criteria()
+            names = ", ".join(f"{c.id} ('{c.description}')" for c in unmet)
+            _note(
+                f"Verification: task incomplete. Unsatisfied acceptance criteria: {names}. "
+                "Continue working toward verifying application launch, interaction, or required behavior."
             )
             return False, None
         task.mark_complete()

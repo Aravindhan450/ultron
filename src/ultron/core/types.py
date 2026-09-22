@@ -208,6 +208,41 @@ class ApplicationLifecycleState(str, Enum):
     VERIFIED = "verified"
 
 
+class ProductType(str, Enum):
+    """
+    Type of product / software artifact being engineered.
+    """
+
+    DESKTOP_GUI = "desktop_gui"
+    WEB_APP = "web_app"
+    CLI_TOOL = "cli_tool"
+    REST_API = "rest_api"
+    DATABASE_APP = "database_app"
+    LIBRARY = "library"
+    AUTOMATION_SCRIPT = "automation_script"
+    DATA_PIPELINE = "data_pipeline"
+    DOCUMENTATION = "documentation"
+    GENERAL_SOFTWARE = "general_software"
+
+
+class UserIntent(BaseModel):
+    """
+    Deep intent representation: translating natural language requests into
+    concrete engineering goals, explicit & inferred requirements, and verification strategy.
+    """
+
+    raw_prompt: str = ""
+    goal: str = ""
+    product_type: ProductType = ProductType.GENERAL_SOFTWARE
+    explicit_requirements: list[str] = Field(default_factory=list)
+    inferred_necessary_requirements: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    ambiguities: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
+    verification_strategy: str = ""
+
+
 class TaskRequirement(BaseModel):
     """
     One explicit completion criterion for a task.
@@ -219,6 +254,7 @@ class TaskRequirement(BaseModel):
 
     description: str
     completed: bool = False
+
 
 class ToolExecution(BaseModel):
     """
@@ -234,12 +270,14 @@ class ToolExecution(BaseModel):
     detail: str = ""
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
+
 class TaskError(BaseModel):
     """A failure or blocking error recorded against a task."""
 
     message: str
     step: int | None = None
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
 
 class TaskClassification(BaseModel):
     """
@@ -257,6 +295,7 @@ class TaskClassification(BaseModel):
     summary: str = ""
     clarification_required: bool = False
     clarification_questions: list[str] = Field(default_factory=list)
+    user_intent: UserIntent | None = None
 
     @property
     def requires_actions(self) -> bool:
@@ -308,6 +347,7 @@ class TaskPlan(BaseModel):
     completion_criteria: list[str] = Field(default_factory=list)
     verification_requirements: list[str] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
+    user_intent: UserIntent | None = None
     failure_recovery: str = ""
     project_dir: str | None = None
     needs_clarification: bool = False
@@ -553,6 +593,7 @@ class TaskState(BaseModel):
     plan_revisions: list[str] = Field(default_factory=list)  # adaptive-plan audit trail
     # --- Autonomous Execution & Acceptance (Fix #7) ---
     acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
+    user_intent: UserIntent | None = None
     app_lifecycle_state: ApplicationLifecycleState | None = None
     # --- Coding workspace / execution context (Fix #3 stage 1) ---
     # Structured, coding-specific context (workspace, relevant files,
@@ -922,6 +963,7 @@ class TaskState(BaseModel):
         """
         self.plan = plan
         self.task_type = plan.task_type
+        self.user_intent = plan.user_intent
         self.set_total_steps(len(plan.steps))
         seen: set[str] = set()
         for description in [*plan.completion_criteria, *plan.verification_requirements]:

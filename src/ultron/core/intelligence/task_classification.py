@@ -233,14 +233,18 @@ def classify_task_deterministic(user_input: str) -> TaskClassification:
     Ambiguous requests default to INFORMATIONAL so callers can decide
     whether to consult the LLM classifier (see :func:`classify_task`).
     """
+    from ultron.core.intelligence.intent_understanding import understand_user_intent
+
     text = _normalize(user_input)
     task_type = _classify_deterministic(text) or TaskType.INFORMATIONAL
     signal = _clarification_signal(text, task_type)
+    intent = understand_user_intent(user_input)
     return TaskClassification(
         task_type=task_type,
         goal=extract_goal(user_input, task_type),
         clarification_required=signal is not None,
         clarification_questions=[signal] if signal else [],
+        user_intent=intent,
     )
 
 
