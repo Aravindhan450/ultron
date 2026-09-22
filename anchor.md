@@ -69,9 +69,10 @@ Project Ultron is undergoing an **Ollama → llama.cpp / llama-server** migratio
 
 ## 4. Current Test & Verification Snapshot
 
-- **Pytest**: `1598 passed in 28.40s`
-- **Ruff**: `All checks passed!`
-- **Harness Verification**: `29/29 checks passed`
+- **Pytest**: `1,779 passed, 6 deselected in 35.21s` (100% pass rate)
+- **Ruff**: `All checks passed!` (0 lint errors)
+- **Harness & Security Verification**: 100% checks passed, live model-in-the-loop validated across all active tiers
+- **Active Model Fleet**: Gemma-3-4B (`fast`), Qwen3-8B (`primary`), Qwen2.5-Coder-7B (`coder`) dynamically managed by `ModelLifecycleManager`
 
 ### Phase 2: Make LlamaCpp the Active Ultron Engine — [COMPLETED]
 - **Files Modified**:
@@ -218,3 +219,32 @@ Project Ultron is undergoing an **Ollama → llama.cpp / llama-server** migratio
   - Ruff status: Clean (0 errors).
 - **Model-in-the-Loop Validation**:
   - 4 real live model scenarios executed against Metal GPU `llama-server` (Repository discovery, context retrieval, missing resource `NOT_FOUND` reporting, and automated tool/test execution).
+
+---
+
+## 6. Real-World Capability & Reliability Hardening Tracking
+
+### Phase 4: Real-World Capability Validation & Model Fleet Routing — [COMPLETED & VERIFIED]
+- **Documentation**: Detailed findings in `ultron_phase4_real_world_capability_validation_report.md`.
+- **Fleet Orchestration**: Live transitions between `gemma-3-4b-it` (`fast`), `Qwen3-8B` (`primary`), and `qwen2.5-coder-7b-instruct` (`coder`) orchestrated by `ModelLifecycleManager` without zombie processes or port conflicts.
+- **Task Precedence**: Hardened deterministic classifier in `task_classification.py` (`_SE_CREATION_RE`) to ensure software creation directives take precedence over incidental explanation keywords.
+- **Security & Guardrail Verification**: 100% boundary integrity under adversarial tests; interactive confirmation modals correctly gate state-modifying actions (`write_file`, `run_command`).
+
+### Phase 5: Research Pipeline Hardening & Real Artifact Execution Layer — [COMPLETED & VERIFIED]
+- **Documentation**:
+  - Research Pipeline Report: `ultron_research_pipeline_validation_report.md`
+  - Artifact Execution Report: `ultron_artifact_execution_validation_report.md`
+  - Failure Analysis: `ultron_phase5_failure_analysis.md`
+- **Workstream A — Research Pipeline Hardening**:
+  - Implemented `src/ultron/core/intelligence/research.py`: multi-tier evidence extraction, domain quality classification (Tier 1–4), freshness tagging, and conflict detection.
+  - Integrated into `src/ultron/core/intelligence/synthesis.py`: synthesizes answers strictly grounded in normalized evidence with verified bracketed inline citations (`[1]`, `[2]`).
+  - Unit tests: `tests/test_research_pipeline.py` (7/7 passed).
+- **Workstream B — Real Artifact Creation & Execution Layer**:
+  - Implemented `build_artifact_plan` in `src/ultron/core/intelligence/task_planning.py`: outcome-oriented plan enforcing project scaffolding on disk (`write_file`), runtime execution & testing (`run_command`), and empirical evidence verification.
+  - Interactive continuity in `src/ultron/main.py`: `react_exec_agent` state preserved across user confirmation turns so multi-step build/test cycles resume without context loss.
+  - Unit tests: `tests/test_artifact_execution.py` (4/4 passed).
+  - Empirical verification: Scaffolding and execution of SQLite expense tracker application (`expenses.db`, `expense_app/app.py`) verified live.
+- **Quality Baseline**:
+  - Pytest suite: **1,779 / 1,779 passed (100%)**.
+  - Ruff lint: Clean (0 errors).
+
