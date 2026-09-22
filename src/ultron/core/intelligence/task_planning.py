@@ -469,22 +469,18 @@ async def prepare_task_for_execution(
         return task
 
     ws = detect_workspace_kind(cwd)
-    from ultron.core.intelligence.task_classification import _SE_CREATION_RE
-    if classification.task_type == TaskType.SOFTWARE_ENGINEERING and _SE_CREATION_RE.search(user_input):
-        plan = build_artifact_plan(classification.goal, ws)
-    else:
-        plan = await generate_task_plan(
+    plan = await generate_task_plan(
+        classification.goal,
+        classification.task_type,
+        engine,
+        cwd=cwd,
+    )
+    if plan is None:
+        plan = fallback_plan(
             classification.goal,
             classification.task_type,
-            engine,
-            cwd=cwd,
+            ws,
         )
-        if plan is None:
-            plan = fallback_plan(
-                classification.goal,
-                classification.task_type,
-                ws,
-            )
     task.attach_plan(plan)
     _attach_coding_context(task, cwd)
     return task

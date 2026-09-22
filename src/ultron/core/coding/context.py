@@ -36,11 +36,19 @@ from ultron.core.coding.observations import Observation, ObservationKind
 from ultron.core.coding.workspace import CodingWorkspace, _resolve_safe_path
 from ultron.core.memory.project_memory import ProjectMemoryStore
 
+
 # The Ultron repository root (src/ultron/core/coding/context.py -> parents:
 # [0]=coding, [1]=core, [2]=ultron, [3]=src, [4]=repo). Project memory is
 # never created inside Ultron's own repository — unit tests run from it and
 # must stay side-effect free, exactly like the intelligence bridge.
-_ULTRON_ROOT = Path(__file__).resolve().parents[4]
+def _find_repo_root() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "pyproject.toml").exists() and (parent / "src" / "ultron").exists():
+            return parent
+    return Path(__file__).resolve().parents[4]
+
+
+_ULTRON_ROOT = _find_repo_root()
 
 
 class CodeContext(BaseModel):

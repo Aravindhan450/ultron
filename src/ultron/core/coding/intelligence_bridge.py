@@ -43,10 +43,18 @@ from pydantic import BaseModel, Field, PrivateAttr
 from ultron.core.coding.intelligence.facade import CodeIntelligence
 from ultron.core.coding.workspace import _resolve_safe_path
 
+
 # The Ultron repository root (src/ultron/__init__.py -> parents[0]=ultron,
 # [1]=src, [2]=repo). The bridge refuses to auto-index Ultron's own repo —
 # unit tests run from it and must stay fast and side-effect free.
-_ULTRON_ROOT = Path(__file__).resolve().parents[4]
+def _find_repo_root() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "pyproject.toml").exists() and (parent / "src" / "ultron").exists():
+            return parent
+    return Path(__file__).resolve().parents[4]
+
+
+_ULTRON_ROOT = _find_repo_root()
 
 # Common capitalized words that are not code symbols (filter for the
 # candidate extractor). Bounded; cheap false-positive reduction only.

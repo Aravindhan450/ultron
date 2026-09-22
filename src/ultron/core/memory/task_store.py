@@ -34,9 +34,15 @@ from pathlib import Path
 from ultron.core.types import TaskState
 from ultron.security.scanners.secret import scan_secrets
 
-# The Ultron repository root (src/ultron/core/memory/task_store.py -> parents:
-# [0]=memory, [1]=core, [2]=ultron, [3]=src, [4]=repo).
-_ULTRON_ROOT = Path(__file__).resolve().parents[4]
+
+def _find_repo_root() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "pyproject.toml").exists() and (parent / "src" / "ultron").exists():
+            return parent
+    return Path(__file__).resolve().parents[4]
+
+
+_ULTRON_ROOT = _find_repo_root()
 
 
 def task_store_dir(workspace_root) -> Path:

@@ -1,0 +1,53 @@
+{
+  "test_id": "test-08-ambiguous-app",
+  "prompt": "Build an expense app for a college student living in Chennai. Include common student categories (hostel/rent, mess food, chai/snacks, printouts/books, bus/metro commute, mobile recharge), monthly budget tracking, and spending analytics. Put it under /Users/aravindhan/UltronWorkspace/test-08-ambiguous-app.",
+  "timestamp_utc": "2026-09-22T07:44:34.879862+00:00",
+  "project_path": "/Users/aravindhan/UltronWorkspace/test-08-ambiguous-app",
+  "entry_point": "budget.py",
+  "launch_command": "python budget.py",
+  "model_name": "qwen2.5-coder-7b-instruct-q8_0",
+  "tools_used": [],
+  "expected_behavior": "Student expense tracker tailored to Chennai student lifestyle with budget analytics and categories.",
+  "actual_behavior": "Generated files: ['budget.py', '__init__.py', 'analytics.py', 'main.py', '__pycache__/budget.cpython-312.pyc', '__pycache__/analytics.cpython-312.pyc']. Syntax: PASSED.",
+  "real_world_inputs": {
+    "categories": [
+      "hostel",
+      "mess food",
+      "chai",
+      "printouts",
+      "metro",
+      "mobile"
+    ]
+  },
+  "independent_reference": {
+    "budget_limit": 8000,
+    "currency": "INR"
+  },
+  "observed_application_output": {
+    "syntax_check": "PASSED"
+  },
+  "verification_method": "AST syntax compilation and category model inspection.",
+  "evidence_files": [
+    "budget.py",
+    "__init__.py",
+    "analytics.py",
+    "main.py",
+    "__pycache__/budget.cpython-312.pyc",
+    "__pycache__/analytics.cpython-312.pyc"
+  ],
+  "failures": [],
+  "repair_attempts": [],
+  "iterations_used": 0,
+  "duration_seconds": 169.34,
+  "final_status": "PASS",
+  "claimed_vs_actual": {
+    "files": [
+      "budget.py",
+      "__init__.py",
+      "analytics.py",
+      "main.py",
+      "__pycache__/budget.cpython-312.pyc",
+      "__pycache__/analytics.cpython-312.pyc"
+    ]
+  }
+}

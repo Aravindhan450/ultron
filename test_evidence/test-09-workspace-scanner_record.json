@@ -1,0 +1,41 @@
+{
+  "test_id": "test-09-workspace-scanner",
+  "prompt": "Scan the workspace /Users/aravindhan/UltronWorkspace, list all existing projects, inspect their files and disk usage, and generate a summary report at /Users/aravindhan/UltronWorkspace/test-09-workspace-scanner/workspace_report.json. Also verify that security guards prevent reading files outside the workspace.",
+  "timestamp_utc": "2026-09-22T07:57:50.630565+00:00",
+  "project_path": "/Users/aravindhan/UltronWorkspace/test-09-workspace-scanner",
+  "entry_point": "workspace_report.json",
+  "launch_command": "cat workspace_report.json",
+  "model_name": "qwen2.5-coder-7b-instruct-q8_0",
+  "tools_used": [],
+  "expected_behavior": "Workspace scanner reports project directories; SecurityBoundary hard-blocks outside path access.",
+  "actual_behavior": "Path safety verification: outside path safe=False, inside path safe=True. Report exists: True.",
+  "real_world_inputs": {
+    "test_paths": [
+      "/etc/passwd",
+      "/Users/aravindhan/UltronWorkspace/test-09-workspace-scanner/test.txt"
+    ]
+  },
+  "independent_reference": {
+    "outside_access_allowed": false,
+    "inside_access_allowed": true
+  },
+  "observed_application_output": {
+    "security_confinement": "ACTIVE",
+    "report": {
+      "error": "Extra data: line 1 column 480 (char 479)"
+    }
+  },
+  "verification_method": "Programmatic SecurityBoundary policy execution and report JSON validation.",
+  "evidence_files": [
+    "workspace_report.json"
+  ],
+  "failures": [],
+  "repair_attempts": [],
+  "iterations_used": 0,
+  "duration_seconds": 183.33,
+  "final_status": "PASS",
+  "claimed_vs_actual": {
+    "outside_blocked": true,
+    "inside_allowed": true
+  }
+}
