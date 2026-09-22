@@ -25,6 +25,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from ultron.core.coding.intelligence.dependencies import sanitize_requirements_txt
 from ultron.core.tools.paths import is_path_safe
 
 
@@ -145,7 +146,10 @@ def _read_text(path: Path) -> str:
 def _write_text(path: Path, content: str) -> None:
     """Writes text (creating parents) — raises OSError on failure."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    if "requirements" in path.name.lower() or path.suffix in (".pip", ".in"):
+        content = sanitize_requirements_txt(content)
     path.write_text(content, encoding="utf-8")
+
 
 
 # ---------------------------------------------------------------------------

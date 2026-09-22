@@ -497,6 +497,134 @@ def _attribution(
     if "command_not_found" in parsed.failure_markers:
         return FailureKind.ENVIRONMENT_FAILURE
     # Part 13: a repository question routed to external web search is a
+from ultron.validation.invariants import validate_all_invariants
+from ultron.validation.validators import (
+    validate_application_launch_criterion,
+    validate_artifact_exists_criterion,
+    validate_dependency_validity_criterion,
+    validate_functional_operation_criterion,
+    validate_verification_evidence_criterion,
+    validate_workspace_confinement_criterion,
+)
+
+
+def _eval_acceptance_criteria(
+    case: CapabilityTestCase,
+    trace: TaskTrace,
+    root: Path,
+) -> tuple[Verdict, list]:
+    """Evaluates case acceptance criteria against real environment and execution trace."""
+    if not case.acceptance_criteria:
+        return Verdict.UNRESOLVED, []
+
+    results = []
+    has_fail = False
+    has_pass = False
+
+    env = trace.environment
+    evidence = trace.verification_evidence
+    transcript = trace.transcript
+
+    for crit in case.acceptance_criteria:
+        # Clone criterion for evaluation
+        c = crit
+        v_type = c.validator_type
+
+        if v_type == "workspace_confinement":
+            c = validate_workspace_confinement_criterion(c, env, root)
+        elif v_type == "artifact_exists":
+            c = validate_artifact_exists_criterion(c, root)
+        elif v_type == "dependency_validity":
+            c = validate_dependency_validity_criterion(c, env)
+        elif v_type == "application_launch":
+            c = validate_application_launch_criterion(c, root)
+        elif v_type == "functional_operation":
+            c = validate_functional_operation_criterion(c, root)
+        elif v_type == "verification_evidence":
+            c = validate_verification_evidence_criterion(c, evidence, transcript)
+        elif v_type == "no_thrashing":
+            # Check invariant result if present
+            inv3 = next((inv for inv in trace.invariants if inv.invariant_id == "INV-003"), None)
+            if inv3 and not inv3.passed:
+                c.status = Verdict.FAIL
+                c.observed_result = False
+                c.error = inv3.failure_reason
+            else:
+                c.status = Verdict.PASS
+                c.observed_result = True
+        else:
+            c.status = Verdict.PASS
+            c.observed_result = True
+
+        results.append(c)
+        if c.status is Verdict.FAIL and c.required:
+            has_fail = True
+        elif c.status is Verdict.PASS:
+            has_pass = True
+
+    if has_fail:
+        return Verdict.FAIL, results
+    if has_pass and all(c.status is Verdict.PASS for c in results if c.required):
+        return Verdict.PASS, results
+    return Verdict.UNRESOLVED, results
+
+
+def _eval_invariants(
+    trace: TaskTrace,
+    root: Path,
+) -> tuple[Verdict, list]:
+    """Evaluates deterministic invariants on the trace."""
+    invs = trace.invariants or validate_all_invariants(
+        environment=trace.environment,
+        command_history=trace.environment.commands_executed if trace.environment else None,
+        workspace_root=root,
+    )
+    has_fail = any(not inv.passed for inv in invs)
+    verdict = Verdict.FAIL if has_fail else Verdict.PASS
+    return verdict, invs
+
+
+def _attribution(
+    case: CapabilityTestCase,
+    parsed: ParsedTrace,
+    dims: dict[str, Verdict],
+    invariants: list | None = None,
+    criteria: list | None = None,
+) -> FailureKind | None:
+    # Check invariant failures first
+    if invariants:
+        for inv in invariants:
+            if not inv.passed:
+                if inv.invariant_id == "INV-001":
+                    return FailureKind.WORKSPACE_CONFINEMENT_FAILURE
+                if inv.invariant_id == "INV-002":
+                    return FailureKind.DEPENDENCY_ORDERING_FAILURE
+                if inv.invariant_id == "INV-003":
+                    return FailureKind.THRASHING_FAILURE
+                if inv.invariant_id == "INV-004":
+                    return FailureKind.INVALID_DEPENDENCY_FAILURE
+
+    # Check acceptance criteria failures
+    if criteria:
+        for crit in criteria:
+            if crit.status is Verdict.FAIL and crit.required:
+                if crit.validator_type == "verification_evidence" or crit.criterion_id == "AC-09":
+                    return FailureKind.INSUFFICIENT_VERIFICATION
+                if crit.validator_type == "workspace_confinement":
+                    return FailureKind.WORKSPACE_CONFINEMENT_FAILURE
+                if crit.validator_type == "dependency_validity":
+                    return FailureKind.INVALID_DEPENDENCY_FAILURE
+                return FailureKind.OBJECTIVE_FAILURE
+
+    if "denied" in (parsed.security_decision or ""):
+        return FailureKind.SECURITY_FAILURE
+    if parsed.empty_response:
+        return FailureKind.MODEL_LIMITATION
+    if "traceback" in parsed.failure_markers or "tool_error" in parsed.failure_markers:
+        return FailureKind.EXECUTION_FAILURE
+    if "command_not_found" in parsed.failure_markers:
+        return FailureKind.ENVIRONMENT_FAILURE
+    # Part 13: a repository question routed to external web search is a
     # routing/capability-selection failure — never an evidence failure.
     if "web_search_routing" in parsed.failure_markers:
         expected = case.expected_capability.value
@@ -506,11 +634,7 @@ def _attribution(
         if case.router_agreement:
             return FailureKind.CAPABILITY_SELECTION_FAILURE  # router was clear, model went external
         return FailureKind.CAPABILITY_SELECTION_FAILURE
-    # Part 13: clarification fallback instead of answering — if the
-    # deterministic router was also confused, routing is responsible; if the
-    # router was clear but the model still punted, it is a model limitation.
-    # (A clarification reply never names the subject, so the argument/evidence
-    # dims read as failed — the punt itself is the root cause.)
+    # Part 13: clarification fallback instead of answering
     if "clarification_prompt" in parsed.failure_markers and dims.get("final_answer") in (Verdict.FAIL, Verdict.PARTIAL):
         if case.router_agreement is False and case.router_capability is not None:
             return FailureKind.ROUTING_FAILURE
@@ -545,7 +669,7 @@ def _attribution(
 
 
 def evaluate_trace(trace: TaskTrace, repo_root: str | Path | None = None) -> Evaluation:
-    """Evaluates one trace on the three layers (deterministic)."""
+    """Evaluates one trace across capability, execution, invariants, criteria, and answer."""
     root = Path(repo_root) if repo_root is not None else _PROJECT_ROOT
     case = trace.case
     parsed = parse_trace(trace.transcript)
@@ -554,7 +678,32 @@ def evaluate_trace(trace: TaskTrace, repo_root: str | Path | None = None) -> Eva
     capability = _layer_capability(case, root)
     execution, exec_dims = _layer_execution(root, parsed, case, transcript)
     answer, answer_dims = _layer_answer(root, parsed, case, transcript)
+
+    # Invariants & Acceptance criteria evaluation
+    invariants_verdict, invariants_list = _eval_invariants(trace, root)
+    trace.invariants = invariants_list
+
+    criteria_verdict, criteria_list = _eval_acceptance_criteria(case, trace, root)
+    trace.criteria_results = criteria_list
+
+    # Separate objective verdict: requires criteria and invariants to pass
+    objective_verdict = Verdict.UNRESOLVED
+    if criteria_list:
+        objective_verdict = criteria_verdict
+    elif execution is Verdict.PASS and invariants_verdict is Verdict.PASS:
+        objective_verdict = Verdict.PASS
+
+    # Verification verdict
+    verification_verdict = Verdict.UNRESOLVED
+    if trace.verification_evidence:
+        verification_verdict = (
+            Verdict.PASS if trace.verification_evidence.independent_evidence_produced else Verdict.FAIL
+        )
+
+    # Aggregated overall verdict
     overall = _aggregate(capability, execution, answer)
+    if invariants_verdict is Verdict.FAIL or objective_verdict is Verdict.FAIL:
+        overall = Verdict.FAIL
 
     dims: dict[str, Verdict] = {}
     dims["intent"] = Verdict.PASS if execution is Verdict.PASS else Verdict.UNRESOLVED
@@ -562,6 +711,8 @@ def evaluate_trace(trace: TaskTrace, repo_root: str | Path | None = None) -> Eva
         Verdict.UNRESOLVED if exec_dims.get("tool_selection") is not Verdict.FAIL else Verdict.FAIL
     )
     dims.update(exec_dims)
+    dims["invariants"] = invariants_verdict
+    dims["objective"] = objective_verdict
     dims["final_answer"] = answer
 
     notes: list[str] = []
@@ -574,14 +725,30 @@ def evaluate_trace(trace: TaskTrace, repo_root: str | Path | None = None) -> Eva
     if case.router_capability:
         agree = "agree" if case.router_agreement else "disagree"
         notes.append(f"router: {case.router_capability} ({agree})")
+    for inv in invariants_list:
+        if not inv.passed:
+            notes.append(f"invariant failed: {inv.invariant_id} ({inv.failure_reason})")
+    for c in criteria_list:
+        if c.status is Verdict.FAIL:
+            notes.append(f"criterion failed: {c.criterion_id} ({c.error})")
 
     model_capability = ",".join(parsed.observed_capabilities) or None
-    failure_kind = _attribution(case, parsed, dims) if overall is Verdict.FAIL else None
+    failure_kind = (
+        _attribution(case, parsed, dims, invariants=invariants_list, criteria=criteria_list)
+        if overall is Verdict.FAIL
+        else None
+    )
 
     return Evaluation(
         capability=capability,
         execution=execution,
         answer=answer,
+        invariants_verdict=invariants_verdict,
+        objective_verdict=objective_verdict,
+        verification_verdict=verification_verdict,
+        criteria_verdict=criteria_verdict,
+        invariants=invariants_list,
+        criteria=criteria_list,
         answer_dimensions=answer_dims,
         overall=overall,
         dimensions=dims,
@@ -593,3 +760,4 @@ def evaluate_trace(trace: TaskTrace, repo_root: str | Path | None = None) -> Eva
 
 def evaluate_many(traces: list[TaskTrace], repo_root: str | Path | None = None) -> list[Evaluation]:
     return [evaluate_trace(t, repo_root=repo_root) for t in traces]
+

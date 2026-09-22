@@ -19,11 +19,142 @@ job (see ``lsp.py``).
 
 from __future__ import annotations
 
+import ast
+import re
+import sys
 from enum import Enum
 
 from pydantic import BaseModel
 
 from ultron.core.coding.intelligence.index import RepositoryIndex
+
+# Standard library module names in Python (using sys.stdlib_module_names with rich fallback)
+STDLIB_MODULE_NAMES: frozenset[str] = getattr(
+    sys,
+    "stdlib_module_names",
+    frozenset(
+        {
+            "tkinter",
+            "sqlite3",
+            "sys",
+            "os",
+            "re",
+            "json",
+            "math",
+            "asyncio",
+            "typing",
+            "pathlib",
+            "subprocess",
+            "time",
+            "datetime",
+            "collections",
+            "itertools",
+            "functools",
+            "shutil",
+            "tempfile",
+            "unittest",
+            "urllib",
+            "http",
+            "logging",
+            "io",
+            "csv",
+            "random",
+            "hashlib",
+            "copy",
+            "dataclasses",
+            "enum",
+            "abc",
+            "inspect",
+            "struct",
+            "fcntl",
+            "termios",
+            "select",
+            "threading",
+            "multiprocessing",
+            "queue",
+            "socket",
+            "ssl",
+            "email",
+            "html",
+            "xml",
+            "xmlrpc",
+            "zipfile",
+            "tarfile",
+            "gzip",
+            "bz2",
+            "lzma",
+            "zlib",
+            "contextlib",
+            "warnings",
+            "traceback",
+            "builtins",
+        }
+    ),
+)
+
+
+def is_stdlib_module(name: str) -> bool:
+    """Returns True if the given module name is part of Python's standard library."""
+    clean = name.strip().lower()
+    root_pkg = clean.split(".")[0]
+    return root_pkg in STDLIB_MODULE_NAMES
+
+
+def filter_python_dependencies(packages: list[str]) -> list[str]:
+    """Filters out standard library modules from a list of package names / specifiers."""
+    valid: list[str] = []
+    for pkg in packages:
+        clean = pkg.strip()
+        if not clean or clean.startswith(("#", "-")):
+            continue
+        pkg_name = re.split(r"[=<>!~@]", clean)[0].strip().lower()
+        if not is_stdlib_module(pkg_name):
+            valid.append(clean)
+    return valid
+
+
+def sanitize_requirements_txt(content: str) -> str:
+    """
+    Sanitizes requirements.txt content by removing standard library modules
+    while preserving comments, options, and valid external dependencies.
+    """
+    lines = content.splitlines()
+    clean_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "-")):
+            clean_lines.append(line)
+            continue
+        # Extract package name before comments or version specifiers
+        pkg_part = stripped.split("#")[0].strip()
+        pkg_name = re.split(r"[=<>!~@]", pkg_part)[0].strip().lower()
+        if not is_stdlib_module(pkg_name):
+            clean_lines.append(line)
+    return "\n".join(clean_lines)
+
+
+def extract_external_imports(source_code: str) -> set[str]:
+    """
+    Parses Python source code AST and returns the set of top-level imported
+    packages that are external (non-stdlib).
+    """
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return set()
+
+    imported_roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                imported_roots.add(root)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            root = node.module.split(".")[0]
+            imported_roots.add(root)
+
+    return {pkg for pkg in imported_roots if not is_stdlib_module(pkg)}
+
 
 
 class EdgeConfidence(str, Enum):

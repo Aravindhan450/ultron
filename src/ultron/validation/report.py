@@ -215,6 +215,116 @@ def _recommendations(evaluations: list[Evaluation], audit: AuditReport) -> str:
     return "\n".join(f"- {r}" for r in recs)
 
 
+def _invariants_section(traces: list[TaskTrace], evaluations: list[Evaluation]) -> str:
+    all_invs = []
+    for t in traces:
+        all_invs.extend(t.invariants)
+    for e in evaluations:
+        all_invs.extend(e.invariants)
+
+    # Unique by id
+    unique_invs = {}
+    for inv in all_invs:
+        unique_invs[inv.invariant_id] = inv
+
+    if not unique_invs:
+        return "_no invariant checks recorded_"
+
+    lines = ["| invariant | status | severity | failure reason / details |", "|---|---|---|---|"]
+    for inv_id in sorted(unique_invs):
+        inv = unique_invs[inv_id]
+        status = "**PASS**" if inv.passed else "<span style='color:red'>**FAIL**</span>"
+        reason = inv.failure_reason or "-"
+        lines.append(f"| {inv.invariant_id} ({inv.name}) | {status} | {inv.severity} | {reason} |")
+    return "\n".join(lines)
+
+
+def _criteria_section(traces: list[TaskTrace], evaluations: list[Evaluation]) -> str:
+    all_crits = []
+    for t in traces:
+        all_crits.extend(t.criteria_results)
+    for e in evaluations:
+        all_crits.extend(e.criteria)
+
+    unique_crits = {}
+    for c in all_crits:
+        unique_crits[c.criterion_id] = c
+
+    if not unique_crits:
+        return "_no acceptance criteria recorded_"
+
+    lines = ["| criterion | status | description | error / details |", "|---|---|---|---|"]
+    for c_id in sorted(unique_crits):
+        c = unique_crits[c_id]
+        status = "**PASS**" if c.status == Verdict.PASS else f"**{c.status.value}**"
+        err = c.error or "-"
+        lines.append(f"| {c.criterion_id} | {status} | {c.description} | {err} |")
+    return "\n".join(lines)
+
+
+def build_real_world_task_report(
+    trace: TaskTrace,
+    evaluation: Evaluation,
+    *,
+    task_title: str = "Real-World Task Validation",
+) -> str:
+    """Builds the standardized real-world task validation report matching the required format."""
+    case = trace.case
+    inv_map = {inv.invariant_id: inv for inv in evaluation.invariants}
+    crit_map = {c.criterion_id: c for c in evaluation.criteria}
+
+
+    def _inv_status(inv_id: str) -> str:
+        inv = inv_map.get(inv_id)
+        if not inv:
+            return "N/A"
+        return "PASS" if inv.passed else "FAIL"
+
+    def _crit_status(crit_id: str) -> str:
+        c = crit_map.get(crit_id)
+        if not c:
+            return "N/A"
+        return c.status.value
+
+    return f"""# ULTRON REAL-WORLD TASK VALIDATION
+
+Task:
+{case.task}
+
+Execution:
+    Classification:       {evaluation.dimensions.get('intent', Verdict.UNRESOLVED).value}
+    Initial model:        {trace.case.router_capability or 'observed'}
+    Planning:             {evaluation.dimensions.get('capability', Verdict.UNRESOLVED).value}
+    Model escalation:     {'PASS' if 'qwen3' in (evaluation.model_capability or '') else 'N/A'}
+    Tool execution:       {evaluation.execution.value}
+    Recovery:             {evaluation.dimensions.get('evidence', Verdict.UNRESOLVED).value}
+
+Invariants:
+    Workspace confinement:      {_inv_status('INV-001')}
+    Dependency ordering:       {_inv_status('INV-002')}
+    Failure thrashing:         {_inv_status('INV-003')}
+    Dependency validity:       {_inv_status('INV-004')}
+
+Outcome:
+    Required artifacts:        {_crit_status('AC-02')}
+    Application launch:        {_crit_status('AC-05')}
+    Functional operation:      {_crit_status('AC-06')}
+    Verification evidence:     {_crit_status('AC-09')}
+
+Final:
+    Objective achieved:        {evaluation.objective_verdict.value}
+    Final answer supported:    {evaluation.answer.value}
+    Overall verdict:           {evaluation.overall.value}
+    Root cause failure kind:   {evaluation.failure_kind.value if evaluation.failure_kind else 'None'}
+
+### Diagnostic Evidence & Invariant Violations
+{_invariants_section([trace], [evaluation])}
+
+### Acceptance Criteria Breakdown
+{_criteria_section([trace], [evaluation])}
+"""
+
+
 def build_report(
     traces: list[TaskTrace],
     evaluations: list[Evaluation],
@@ -264,6 +374,10 @@ def build_report(
 ## Capability matrix
 
 {_capability_matrix(traces, evaluations)}
+
+## Invariants
+
+{_invariants_section(traces, evaluations)}
 
 ## Three-layer verdicts (Part 7-11)
 
@@ -318,3 +432,4 @@ All 44 canonical capabilities classified for automated testing:
 
 {_recommendations(evaluations, audit)}
 """
+

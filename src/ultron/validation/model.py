@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 from ultron.core.capabilities.contracts import CapabilityContract, contract_for
 from ultron.core.tools.definitions import ToolCapability
@@ -97,7 +98,64 @@ class FailureKind(str, Enum):
     MODEL_LIMITATION = "model_limitation"
     ENVIRONMENT_FAILURE = "environment_failure"
     EVALUATION_FAILURE = "evaluation_failure"
+    WORKSPACE_CONFINEMENT_FAILURE = "workspace_confinement_failure"
+    DEPENDENCY_ORDERING_FAILURE = "dependency_ordering_failure"
+    THRASHING_FAILURE = "thrashing_failure"
+    INVALID_DEPENDENCY_FAILURE = "invalid_dependency_failure"
+    OBJECTIVE_FAILURE = "objective_failure"
+    INSUFFICIENT_VERIFICATION = "insufficient_verification"
     UNKNOWN = "unknown"
+
+
+@dataclass
+class AcceptanceCriterion:
+    """One observable acceptance criterion for a capability test scenario."""
+
+    criterion_id: str
+    description: str
+    validator_type: str = "generic"
+    expected_result: Any = True
+    required: bool = True
+    status: Verdict = Verdict.UNRESOLVED
+    observed_result: Any = None
+    error: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EnvironmentSnapshot:
+    """Observed snapshot of the environment and workspace during execution."""
+
+    workspace_root: str = ""
+    files_created: list[str] = field(default_factory=list)
+    files_modified: list[str] = field(default_factory=list)
+    processes_launched: list[str] = field(default_factory=list)
+    commands_executed: list[dict[str, Any]] = field(default_factory=list)
+    filesystem_state: dict[str, bool] = field(default_factory=dict)
+
+
+@dataclass
+class InvariantResult:
+    """Result of evaluating one deterministic invariant."""
+
+    invariant_id: str
+    name: str
+    description: str
+    severity: str = "critical"
+    passed: bool = True
+    failure_reason: str | None = None
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class VerificationEvidence:
+    """Verification evidence generated independently from the model's self-claim."""
+
+    model_claimed_success: bool = False
+    independent_evidence_produced: bool = False
+    verification_actions: list[str] = field(default_factory=list)
+    probe_results: dict[str, bool] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -134,6 +192,9 @@ class CapabilityTestCase:
     test_source: TestSource = TestSource.GENERATED
     split: TestSplit = TestSplit.DEVELOPMENT
     template_id: str | None = None
+    # Acceptance criteria and invariants for complex / outcome validation
+    acceptance_criteria: list[AcceptanceCriterion] = field(default_factory=list)
+    expected_invariants: list[str] = field(default_factory=list)
     # --- deterministic-router DIAGNOSTIC (never a validity gate) -----------
     router_capability: str | None = None  # resolved capability value or state
     router_agreement: bool | None = None  # router resolved to expected?
@@ -156,11 +217,16 @@ class TaskTrace:
     detected_tool_hint: str | None = None
     security_decision: str | None = None
     evaluation: Evaluation | None = None
+    # Observable environment snapshots and invariant evaluations
+    environment: EnvironmentSnapshot | None = None
+    invariants: list[InvariantResult] = field(default_factory=list)
+    criteria_results: list[AcceptanceCriterion] = field(default_factory=list)
+    verification_evidence: VerificationEvidence | None = None
 
 
 @dataclass
 class Evaluation:
-    """Three-layer evaluation of one trace (Part 7-11 of STEP 3.1)."""
+    """Multi-layer evaluation of one trace separating execution from objective success."""
 
     # Layer A — capability truth: what the task actually requires.
     capability: Verdict = Verdict.UNRESOLVED
@@ -168,9 +234,20 @@ class Evaluation:
     execution: Verdict = Verdict.UNRESOLVED
     # Layer C — final-answer truth: relevance, grounding, completeness, calibration.
     answer: Verdict = Verdict.UNRESOLVED
+    # Layer D — invariant truth: all deterministic invariants hold (no thrashing, confinement, etc.).
+    invariants_verdict: Verdict = Verdict.UNRESOLVED
+    # Layer E — objective/outcome truth: user's requested outcome actually achieved.
+    objective_verdict: Verdict = Verdict.UNRESOLVED
+    # Layer F — verification evidence truth: independent evidence produced.
+    verification_verdict: Verdict = Verdict.UNRESOLVED
+    # Acceptance criteria verdict
+    criteria_verdict: Verdict = Verdict.UNRESOLVED
+    # Invariant and criteria details
+    invariants: list[InvariantResult] = field(default_factory=list)
+    criteria: list[AcceptanceCriterion] = field(default_factory=list)
     # Final-answer sub-dimensions (Part 10).
     answer_dimensions: dict[str, Verdict] = field(default_factory=dict)
-    # Overall verdict (explicit aggregation rule, Part 11).
+    # Overall verdict (explicit aggregation rule).
     overall: Verdict = Verdict.UNRESOLVED
     # Fine-grained detail dimensions (kept as evidence, not the verdict).
     dimensions: dict[str, Verdict] = field(default_factory=dict)
@@ -185,5 +262,7 @@ class Evaluation:
         return (
             f"{self.overall.value} "
             f"(capability={self.capability.value} execution={self.execution.value} "
+            f"invariants={self.invariants_verdict.value} objective={self.objective_verdict.value} "
             f"answer={self.answer.value})"
         )
+

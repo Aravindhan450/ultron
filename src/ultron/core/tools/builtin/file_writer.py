@@ -1,5 +1,6 @@
 import os
 
+from ultron.core.coding.intelligence.dependencies import sanitize_requirements_txt
 from ultron.core.tools.paths import is_path_safe
 
 
@@ -45,8 +46,11 @@ def write_file(file_path: str, content: str, overwrite: bool = False) -> str:
 
     try:
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        if "requirements" in resolved_path.name.lower() or resolved_path.suffix in (".pip", ".in"):
+            content = sanitize_requirements_txt(content)
         with open(resolved_path, "w", encoding="utf-8") as f:
             f.write(content)
         return f"Successfully wrote {len(content)} characters to '{resolved_path}'."
     except (OSError, ValueError) as e:
         return f"Error writing to file: {e!s}"
+

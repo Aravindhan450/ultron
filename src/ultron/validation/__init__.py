@@ -36,19 +36,28 @@ failures classified by subsystem (see ``evaluate``).
 """
 
 from ultron.validation.model import (
+    AcceptanceCriterion,
     CapabilityTestCase,
+    EnvironmentSnapshot,
     Evaluation,
     FailureKind,
+    InvariantResult,
     TaskTrace,
     TestSplit,
     Verdict,
+    VerificationEvidence,
 )
 
 __all__ = [
+    "AcceptanceCriterion",
     "CapabilityTestCase",
+    "EnvironmentSnapshot",
     "Evaluation",
     "FailureKind",
+    "InvariantResult",
     "TaskTrace",
     "TestSplit",
     "Verdict",
+    "VerificationEvidence",
 ]
+

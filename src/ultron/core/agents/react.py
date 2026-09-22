@@ -58,6 +58,7 @@ from ultron.core.intelligence.prompt_assembly import (
     polish_response,
 )
 from ultron.core.intelligence.synthesis import strip_internal_thought
+from ultron.core.intelligence.task_classification import TaskType
 from ultron.core.logging import get_logger
 from ultron.core.memory.session_memory import SessionMemory
 from ultron.core.tools.definitions import (
@@ -939,6 +940,65 @@ def _cascade_skipped(task: TaskState) -> None:
                 changed = True
 
 
+_PREFLIGHT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # pip install -r <file>
+    (re.compile(r"pip\d*\s+install\s+.*-r\s+([^\s;&|]+)", re.IGNORECASE), "requirements file"),
+    # python <file.py>
+    (re.compile(r"python\d*\s+([^\s;&|-][^\s;&|]*\.py)", re.IGNORECASE), "Python script"),
+    # pytest <file.py>
+    (re.compile(r"pytest\s+([^\s;&|-][^\s;&|]*\.py)", re.IGNORECASE), "test file"),
+    # node <file.js>
+    (re.compile(r"node\s+([^\s;&|-][^\s;&|]*\.[tj]sx?)", re.IGNORECASE), "JavaScript/TypeScript file"),
+]
+
+
+def _check_action_preflight(
+    tool_name: str,
+    arguments: dict[str, Any],
+    task: TaskState | None = None,
+) -> str | None:
+    """
+    Deterministic preflight inspection for tool actions before execution.
+    Checks that referenced prerequisite files exist on disk before consuming them.
+    """
+    if tool_name not in ("run_command", "run_parallel"):
+        return None
+
+    commands: list[str] = []
+    if tool_name == "run_command":
+        cmd = str(arguments.get("command", "")).strip()
+        if cmd:
+            commands.append(cmd)
+    elif tool_name == "run_parallel":
+        for c in arguments.get("commands", []):
+            if str(c).strip():
+                commands.append(str(c).strip())
+
+    from pathlib import Path
+
+    cwd_str = arguments.get("cwd")
+    if cwd_str:
+        cwd = Path(cwd_str).resolve()
+    elif task and task.code_context and task.code_context.workspace:
+        cwd = Path(task.code_context.workspace.project_root).resolve()
+    else:
+        cwd = Path.cwd().resolve()
+
+    for cmd in commands:
+        for pat, desc in _PREFLIGHT_PATTERNS:
+            m = pat.search(cmd)
+            if m:
+                rel_target = m.group(1).strip("'\"")
+                target_path = (cwd / rel_target).resolve()
+                if not target_path.exists():
+                    return (
+                        f"Preflight Error: Cannot execute '{cmd}' because {desc} '{rel_target}' "
+                        f"does not exist on disk. "
+                        f"You must create '{rel_target}' first (e.g. using 'create_file') before running this command."
+                    )
+    return None
+
+
 class ReActAgent(BaseAgent):
     """
     Reason + Act agent that loops over Thought/Action/Observation until it
@@ -1443,6 +1503,20 @@ class ReActAgent(BaseAgent):
             )
             return False, None
 
+        if task.task_type in (TaskType.SOFTWARE_ENGINEERING, TaskType.DEBUGGING):
+            has_exec = any(
+                e.tool_name in ("run_command", "run_parallel") and e.success
+                for e in task.execution_history
+            )
+            if not has_exec:
+                _note(
+                    "Verification: task incomplete. You must independently run and verify the software "
+                    "(e.g. run test suite, check syntax compilation, or launch and test workflows) "
+                    "before declaring completion."
+                )
+                return False, None
+
+
         task.mark_complete()
         # Fix #6: capture this completing turn's intelligence facts.
         _sync_task_memory(task)
@@ -1565,6 +1639,20 @@ class ReActAgent(BaseAgent):
                     "have been recorded yet for this actionable task. Continue working toward the goal."
                 )
                 return False, None
+
+            if task.task_type in (TaskType.SOFTWARE_ENGINEERING, TaskType.DEBUGGING):
+                has_exec = any(
+                    e.tool_name in ("run_command", "run_parallel") and e.success
+                    for e in task.execution_history
+                )
+                if not has_exec:
+                    _note(
+                        "Verification: task incomplete. You must independently run and verify the software "
+                        "(e.g. run test suite, check syntax compilation, or launch and test workflows) "
+                        "before declaring completion."
+                    )
+                    return False, None
+
 
             task.mark_complete()
             # Fix #6: capture this completing turn's intelligence facts.
@@ -1917,21 +2005,16 @@ class ReActAgent(BaseAgent):
         Returns a blocking observation string when the action must NOT
         execute, or None to proceed normally:
 
-        - a state-changing action that has already failed identically more
-          than the budget allows is blocked (no blind repetition);
-        - any NEW state-changing action is blocked once the repair budget is
-          exhausted (no endless repair attempts).
-        - any tool (including read-only tools like read_file) that has failed
-          identically >= 2 times in recent history is circuit-broken with a
-          directive to adjust strategy rather than infinitely repeating.
-
-        The returned message is fed back as an observation, so the model sees
-        it, learns the constraint, and must change its approach — the gate
-        never executes the tool and never bypasses the security boundary.
+        - a state-changing action that has already failed identically without state progress is blocked;
+        - prerequisite files missing on disk trigger an immediate preflight guidance block;
+        - any NEW state-changing action is blocked once the repair budget is exhausted.
         """
         if task is not None and getattr(task, "execution_history", None):
-            # Check for identical repeated failures in execution history (e.g. repeated read_file on missing file or failing command)
-            target = str(arguments.get("file_path", arguments.get("path", arguments.get("filename", arguments.get("command", arguments.get("query", "")))))).strip()
+            target = str(
+                arguments.get("file_path", arguments.get("path", arguments.get("filename", arguments.get("command", arguments.get("query", "")))))
+            ).strip()
+
+            # Cumulative repeated failure check (circuit breaker)
             recent_fails = [
                 e for e in task.execution_history[-6:]
                 if e.tool_name == tool_name and e.target == target and not e.success
@@ -1943,6 +2026,11 @@ class ReActAgent(BaseAgent):
                     "or change your strategy."
                 )
 
+        # Preflight check for missing prerequisite artifacts
+        preflight_err = _check_action_preflight(tool_name, arguments, task)
+        if preflight_err is not None:
+            return preflight_err
+
         if task is None or task.code_context is None:
             return None
         executor = task.code_context.executor
@@ -1950,6 +2038,7 @@ class ReActAgent(BaseAgent):
         if message is not None:
             return message
         return executor.gate_new_action_with_exhausted_budget(tool_name)
+
 
     def _route_coding_file_op(
         self, tool_name: str, arguments: dict[str, Any]
