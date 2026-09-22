@@ -30,6 +30,7 @@ from ultron.core.intelligence.plan_validation import (
     validate_plan,
 )
 from ultron.core.intelligence.task_classification import classify_task
+from ultron.core.logging import get_logger
 from ultron.core.types import (
     AcceptanceCriterion,
     AcceptanceCriterionStatus,
@@ -41,6 +42,8 @@ from ultron.core.types import (
     TaskType,
     WorkspaceKind,
 )
+
+logger = get_logger("ultron.intelligence.planning")
 
 # Files/dirs that mark a directory as an existing software project.
 MANIFEST_MARKERS = (
@@ -179,7 +182,7 @@ def build_planning_prompt(
     )
     return (
         "You are the structured planner of a local AI coding assistant.\n"
-        "Create a plan to accomplish the user's goal.\n\n"
+        "Create an actionable, step-by-step engineering plan to accomplish the user's goal.\n\n"
         f"GOAL: {goal}\n"
         f"TASK TYPE: {task_type.value}\n"
         f"WORKSPACE: {workspace_label}\n"
@@ -197,6 +200,32 @@ def _strip_fences(raw: str) -> str:
     return raw.strip()
 
 
+def _extract_json_payload(raw: str) -> dict | None:
+    """Extracts a JSON dictionary from model output tolerating markdown, thoughts, and prose."""
+    cleaned = _strip_fences(raw)
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Balanced brace scan for outermost {...}
+    first = raw.find("{")
+    last = raw.rfind("}")
+    if first != -1 and last > first:
+        candidate = raw[first : last + 1]
+        # Clean trailing commas: ,} -> } and ,] -> ]
+        candidate_clean = re.sub(r",\s*([}\]])", r"\1", candidate)
+        try:
+            data = json.loads(candidate_clean)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
 def parse_plan_json(
     raw: str,
     goal: str,
@@ -212,42 +241,71 @@ def parse_plan_json(
     dictates the goal or task type.  Returns None when the payload cannot
     be parsed into a structurally valid plan.
     """
-    try:
-        payload = json.loads(_strip_fences(raw))
-    except json.JSONDecodeError:
+    payload = _extract_json_payload(raw)
+    if payload is None or not isinstance(payload.get("steps"), list):
         return None
-    if not isinstance(payload, dict) or not isinstance(payload.get("steps"), list):
+
+    raw_steps = payload["steps"]
+    if not raw_steps:
         return None
 
     steps: list[PlanStep] = []
-    for item in payload["steps"]:
+
+    for idx, item in enumerate(raw_steps, start=1):
         if not isinstance(item, dict):
-            return None
-        step_id = item.get("id")
-        description = item.get("description")
-        if not isinstance(step_id, int) or not isinstance(description, str) or not description.strip():
-            return None
+            continue
+        raw_id = item.get("id")
+        step_id = raw_id if isinstance(raw_id, int) else idx
+
+        description = str(item.get("description") or "").strip()
+        purpose = str(item.get("purpose") or "").strip()
+        expected_outcome = str(item.get("expected_outcome") or "").strip()
+
+        criteria_list = [
+            str(c).strip() for c in item.get("completion_criteria", []) if str(c).strip()
+        ]
+
         strategy = str(item.get("failure_strategy", "stop")).lower()
         try:
             failure_strategy = FailureStrategy(strategy)
         except ValueError:
             failure_strategy = FailureStrategy.STOP
+
+        deps = [
+            int(d)
+            for d in item.get("dependencies", [])
+            if isinstance(d, int)
+        ]
+
         steps.append(
             PlanStep(
                 id=step_id,
-                description=description.strip(),
-                purpose=str(item.get("purpose", "")).strip(),
-                dependencies=[
-                    int(d) for d in item.get("dependencies", []) if isinstance(d, int)
-                ],
-                expected_outcome=str(item.get("expected_outcome", "")).strip(),
-                completion_criteria=[
-                    str(c).strip() for c in item.get("completion_criteria", []) if str(c).strip()
-                ],
+                description=description,
+                purpose=purpose,
+                dependencies=deps,
+                expected_outcome=expected_outcome,
+                completion_criteria=criteria_list,
                 failure_strategy=failure_strategy,
                 retry_policy=int(item.get("retry_policy", 0) or 0),
             )
         )
+
+    if not steps:
+        return None
+
+    completion_criteria = [
+        str(c).strip() for c in payload.get("completion_criteria", []) if str(c).strip()
+    ]
+    if not completion_criteria:
+        completion_criteria = [goal]
+
+    verification_requirements = [
+        str(v).strip()
+        for v in payload.get("verification_requirements", [])
+        if str(v).strip()
+    ]
+    if not verification_requirements:
+        verification_requirements = [f"The user goal is satisfied: {goal}"]
 
     return TaskPlan(
         goal=goal,
@@ -257,14 +315,8 @@ def parse_plan_json(
         assumptions=[str(a).strip() for a in payload.get("assumptions", []) if str(a).strip()],
         constraints=[str(c).strip() for c in payload.get("constraints", []) if str(c).strip()],
         steps=steps,
-        completion_criteria=[
-            str(c).strip() for c in payload.get("completion_criteria", []) if str(c).strip()
-        ],
-        verification_requirements=[
-            str(v).strip()
-            for v in payload.get("verification_requirements", [])
-            if str(v).strip()
-        ],
+        completion_criteria=completion_criteria,
+        verification_requirements=verification_requirements,
         failure_recovery=str(payload.get("failure_recovery", "")).strip(),
         needs_clarification=bool(payload.get("needs_clarification", False)),
         clarification_questions=[
@@ -275,55 +327,13 @@ def parse_plan_json(
     )
 
 
-def fallback_plan(
-    goal: str,
-    task_type: TaskType,
-    workspace: WorkspaceKind = WorkspaceKind.UNKNOWN,
-) -> TaskPlan:
-    """
-    A minimal, always-valid plan used when the LLM plan cannot be produced.
-
-    It contains a single verification step so the completion policy stays
-    intact: the task must be verified against the goal before it can ever
-    be reported complete.
-    """
-    from ultron.core.intelligence.intent_understanding import understand_user_intent
-
-    intent = understand_user_intent(goal)
-    criteria = list(intent.acceptance_criteria) if intent else []
-
-    return TaskPlan(
-        goal=goal,
-        task_type=task_type,
-        workspace=workspace,
-        steps=[
-            PlanStep(
-                id=1,
-                description="Verify the final user goal",
-                purpose=(
-                    "Ensure the original request is actually satisfied before "
-                    "reporting completion"
-                ),
-                expected_outcome="The original user goal is satisfied",
-                completion_criteria=[goal],
-                failure_strategy=FailureStrategy.STOP,
-            )
-        ],
-        completion_criteria=[goal],
-        verification_requirements=[f"The user goal is satisfied: {goal}"],
-        acceptance_criteria=criteria,
-        user_intent=intent,
-        failure_recovery=(
-            "Stop on the first failure; the task must not report completion "
-            "until the goal has been verified."
-        ),
-    )
-
-
 def _slugify(goal: str) -> str:
     """Generates a clean directory slug for an artifact project from a goal."""
     clean = re.sub(r"[^a-zA-Z0-9]+", "-", (goal or "").lower()).strip("-")
-    prefixes = ("build-a-", "build-an-", "build-", "create-a-", "create-an-", "create-", "make-a-", "make-an-", "make-")
+    prefixes = (
+        "build-a-", "build-an-", "build-", "create-a-", "create-an-", "create-",
+        "make-a-", "make-an-", "make-", "write-a-", "write-an-", "write-",
+    )
     for p in prefixes:
         if clean.startswith(p):
             clean = clean[len(p):]
@@ -332,15 +342,15 @@ def _slugify(goal: str) -> str:
     return (clean or "artifact-project")[:40]
 
 
-def build_artifact_plan(
+def build_software_engineering_plan(
     goal: str,
     workspace: WorkspaceKind = WorkspaceKind.UNKNOWN,
+    cwd: str | None = None,
     project_dir: str | Path | None = None,
 ) -> TaskPlan:
     """
-    Structured, outcome-oriented plan for building software artifacts.
-    Enforces the cycle: Scaffold/Write -> Execute/Run -> Verify Evidence.
-    Resolves external workspace when configured via ULTRON_WORKSPACE.
+    Deterministic, fully executable plan for software engineering and application creation.
+    Enforces: Scaffolding -> Dependencies -> Execution -> Interaction -> Repair -> Verification.
     """
     from ultron.core.intelligence.intent_understanding import understand_user_intent
     from ultron.core.tools.paths import (
@@ -349,7 +359,7 @@ def build_artifact_plan(
         set_active_project_dir,
     )
 
-    intent = understand_user_intent(goal)
+    intent = understand_user_intent(goal, cwd=cwd)
 
     resolved_project_dir: Path
     if project_dir is not None:
@@ -392,7 +402,7 @@ def build_artifact_plan(
         PlanStep(
             id=3,
             description="Interact with application and test user behavior",
-            purpose="Exercise actual application functionality (query UI/endpoints/database/CLI)",
+            purpose="Exercise actual application functionality (query UI/endpoints/database/CLI) and repair any discovered issues",
             expected_outcome="Application responds correctly to inputs and workflows",
             dependencies=[1, 2],
             completion_criteria=["Core user workflows executed and verified"],
@@ -405,7 +415,7 @@ def build_artifact_plan(
             purpose="Ensure the original user request is fully satisfied and backed by verifiable output/reference comparison",
             expected_outcome="The original user goal is satisfied with collected evidence",
             dependencies=[1, 2, 3],
-            completion_criteria=[goal],
+            completion_criteria=[goal, "Verified completion with empirical evidence"],
             failure_strategy=FailureStrategy.STOP,
         ),
     ]
@@ -467,6 +477,244 @@ def build_artifact_plan(
     )
 
 
+# Alias build_artifact_plan for backwards compatibility
+build_artifact_plan = build_software_engineering_plan
+
+
+def build_debugging_plan(
+    goal: str,
+    workspace: WorkspaceKind = WorkspaceKind.UNKNOWN,
+) -> TaskPlan:
+    """Deterministic executable plan for debugging and defect repair."""
+    from ultron.core.intelligence.intent_understanding import understand_user_intent
+
+    intent = understand_user_intent(goal)
+    steps = [
+        PlanStep(
+            id=1,
+            description="Reproduce failure and inspect error state",
+            purpose="Run failing test or command to reproduce the defect and capture stack trace",
+            expected_outcome="Defect is reproduced and error signature is observed",
+            completion_criteria=["Failure reproduced or located"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=2,
+        ),
+        PlanStep(
+            id=2,
+            description="Diagnose root cause in relevant source files",
+            purpose="Inspect code context, trace variable flow, and identify exact root cause",
+            expected_outcome="Root cause of the defect is identified in code",
+            dependencies=[1],
+            completion_criteria=["Root cause identified"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=2,
+        ),
+        PlanStep(
+            id=3,
+            description="Apply targeted bug fix to affected files",
+            purpose="Modify code to resolve the defect without introducing regressions",
+            expected_outcome="Bug fix is implemented in source files",
+            dependencies=[1, 2],
+            completion_criteria=["Code modification applied"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=2,
+        ),
+        PlanStep(
+            id=4,
+            description="Run regression tests and validate fix",
+            purpose="Execute test suite or reproduction command to verify resolution",
+            expected_outcome="Tests pass and original failure is resolved",
+            dependencies=[1, 2, 3],
+            completion_criteria=["Regression tests pass"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=2,
+        ),
+        PlanStep(
+            id=5,
+            description="Verify the final user goal",
+            purpose="Confirm the original problem is resolved and system is in working order",
+            expected_outcome="The user goal is satisfied with verified fix evidence",
+            dependencies=[1, 2, 3, 4],
+            completion_criteria=[goal],
+            failure_strategy=FailureStrategy.STOP,
+        ),
+    ]
+    return TaskPlan(
+        goal=goal,
+        task_type=TaskType.DEBUGGING,
+        workspace=workspace,
+        steps=steps,
+        completion_criteria=[goal, "Bug resolved and regression tests pass"],
+        verification_requirements=[f"The user goal is satisfied: {goal}"],
+        acceptance_criteria=list(intent.acceptance_criteria) if intent else [],
+        user_intent=intent,
+        failure_recovery="Diagnose root cause; apply targeted fix; re-test before completing.",
+    )
+
+
+def build_research_plan(
+    goal: str,
+    workspace: WorkspaceKind = WorkspaceKind.UNKNOWN,
+) -> TaskPlan:
+    """Deterministic executable plan for research and evidence synthesis."""
+    from ultron.core.intelligence.intent_understanding import understand_user_intent
+
+    intent = understand_user_intent(goal)
+    steps = [
+        PlanStep(
+            id=1,
+            description="Identify information requirements and search targets",
+            purpose="Deconstruct research goal into key technical questions and search targets",
+            expected_outcome="Core research questions and query strategy defined",
+            completion_criteria=["Key questions identified"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=1,
+        ),
+        PlanStep(
+            id=2,
+            description="Gather evidence across relevant files and sources",
+            purpose="Search codebase, documentation, or authoritative sources for evidence",
+            expected_outcome="Raw facts and findings collected",
+            dependencies=[1],
+            completion_criteria=["Evidence gathered from authoritative sources"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=2,
+        ),
+        PlanStep(
+            id=3,
+            description="Evaluate and normalize findings",
+            purpose="Assess evidence quality, freshness, and resolve conflicting claims",
+            expected_outcome="Validated, consistent findings organized by topic",
+            dependencies=[1, 2],
+            completion_criteria=["Evidence evaluated and verified"],
+            failure_strategy=FailureStrategy.CONTINUE,
+        ),
+        PlanStep(
+            id=4,
+            description="Synthesize response grounded in verified evidence",
+            purpose="Formulate clear, comprehensive answer with explicit citations",
+            expected_outcome="Cited, authoritative answer prepared for user",
+            dependencies=[1, 2, 3],
+            completion_criteria=["Comprehensive cited answer produced"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=1,
+        ),
+        PlanStep(
+            id=5,
+            description="Verify research goal completeness",
+            purpose="Ensure all aspects of original research question are answered with evidence",
+            expected_outcome="Research goal satisfied completely",
+            dependencies=[1, 2, 3, 4],
+            completion_criteria=[goal],
+            failure_strategy=FailureStrategy.STOP,
+        ),
+    ]
+    return TaskPlan(
+        goal=goal,
+        task_type=TaskType.RESEARCH,
+        workspace=workspace,
+        steps=steps,
+        completion_criteria=[goal, "All research questions answered with verified citations"],
+        verification_requirements=[f"The user goal is satisfied: {goal}"],
+        acceptance_criteria=list(intent.acceptance_criteria) if intent else [],
+        user_intent=intent,
+        failure_recovery="Gather multi-source evidence; cross-reference findings before completing.",
+    )
+
+
+def build_system_operation_plan(
+    goal: str,
+    task_type: TaskType = TaskType.SYSTEM_OPERATION,
+    workspace: WorkspaceKind = WorkspaceKind.UNKNOWN,
+) -> TaskPlan:
+    """Deterministic executable plan for system, configuration, and data operations."""
+    from ultron.core.intelligence.intent_understanding import understand_user_intent
+
+    intent = understand_user_intent(goal)
+    steps = [
+        PlanStep(
+            id=1,
+            description="Inspect current system state and configuration",
+            purpose="Inspect existing system settings, environment, or resources",
+            expected_outcome="Current system state is documented",
+            completion_criteria=["Current configuration observed"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=2,
+        ),
+        PlanStep(
+            id=2,
+            description="Determine required configuration changes",
+            purpose="Formulate safe command sequence and configuration modifications",
+            expected_outcome="Modification plan is ready for execution",
+            dependencies=[1],
+            completion_criteria=["Change sequence defined"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=1,
+        ),
+        PlanStep(
+            id=3,
+            description="Apply changes through authorized system operations",
+            purpose="Execute state-modifying operations through security boundary",
+            expected_outcome="Configuration changes applied successfully",
+            dependencies=[1, 2],
+            completion_criteria=["Operations executed successfully"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=2,
+        ),
+        PlanStep(
+            id=4,
+            description="Verify resulting state against user requirements",
+            purpose="Confirm that the applied changes produced the expected system state",
+            expected_outcome="Target system state is confirmed with evidence",
+            dependencies=[1, 2, 3],
+            completion_criteria=[goal],
+            failure_strategy=FailureStrategy.STOP,
+        ),
+    ]
+    return TaskPlan(
+        goal=goal,
+        task_type=TaskType.SYSTEM_OPERATION,
+        workspace=workspace,
+        steps=steps,
+        completion_criteria=[goal, "System operations applied and verified"],
+        verification_requirements=[f"The user goal is satisfied: {goal}"],
+        acceptance_criteria=list(intent.acceptance_criteria) if intent else [],
+        user_intent=intent,
+        failure_recovery="Inspect current state; apply changes safely; verify outcome.",
+    )
+
+
+def fallback_plan(
+    goal: str,
+    task_type: TaskType,
+    workspace: WorkspaceKind = WorkspaceKind.UNKNOWN,
+    cwd: str | None = None,
+) -> TaskPlan:
+    """
+    Constructs a deterministic, structurally valid, and fully executable fallback plan
+    tailored to the task type when LLM planning is unavailable or fails.
+    """
+    if task_type in (TaskType.SOFTWARE_ENGINEERING, TaskType.MULTI_STEP):
+        return build_software_engineering_plan(goal, workspace, cwd=cwd)
+    if task_type == TaskType.DEBUGGING:
+        return build_debugging_plan(goal, workspace)
+    if task_type in (TaskType.RESEARCH, TaskType.CODE_REVIEW):
+        return build_research_plan(goal, workspace)
+    if task_type in (TaskType.SYSTEM_OPERATION, TaskType.CONFIGURATION, TaskType.DATA_OPERATION):
+        return build_system_operation_plan(goal, task_type, workspace)
+    return build_software_engineering_plan(goal, workspace, cwd=cwd)
+
+
+def _bind_user_intent_to_plan(plan: TaskPlan, goal: str, cwd: str | None = None) -> None:
+    """Attaches UserIntent and acceptance criteria to a plan if not already bound."""
+    from ultron.core.intelligence.intent_understanding import understand_user_intent
+
+    if plan.user_intent is None:
+        plan.user_intent = understand_user_intent(goal, cwd=cwd)
+    if not plan.acceptance_criteria and plan.user_intent:
+        plan.acceptance_criteria = list(plan.user_intent.acceptance_criteria)
+
+
 async def generate_task_plan(
     goal: str,
     task_type: TaskType,
@@ -476,13 +724,13 @@ async def generate_task_plan(
     cwd: str | None = None,
 ) -> TaskPlan | None:
     """
-    Generates a validated, outcome-oriented TaskPlan for a goal.
+    Generates a validated, outcome-oriented TaskPlan for a goal with bounded recovery.
 
     - Informational requests never get a plan (returns None).
-    - The workspace is probed from ``cwd`` (or the process CWD) unless
-      explicitly provided.
-    - The generated plan is validated; invalid plans are rejected (returns
-      None) so callers can fall back to :func:`fallback_plan`.
+    - If the LLM generates a valid plan, it is used directly.
+    - If the LLM returns invalid JSON or fails structural validation, an automated
+      re-plan recovery turn is attempted with validation feedback.
+    - If LLM planning fails completely, a validated deterministic fallback plan is used.
     """
     if task_type is TaskType.INFORMATIONAL:
         return None
@@ -493,25 +741,52 @@ async def generate_task_plan(
     )
     prompt = build_planning_prompt(goal, task_type, ws, context)
 
-    try:
-        raw = await engine.generate([{"role": "user", "content": prompt}])
-    except Exception:  # noqa: BLE001 — planning failures fall back to the fallback plan
-        return None
+    logger.info(
+        "[PLAN_START] task_type=%s, workspace=%s, goal_len=%d",
+        task_type.value,
+        ws.value,
+        len(goal),
+    )
 
-    plan = parse_plan_json(raw, goal, task_type, ws, context)
-    if plan is None:
-        return None
-    if not validate_plan(plan).valid:
-        return None
+    plan: TaskPlan | None = None
+    if engine is not None:
+        try:
+            raw = await engine.generate([{"role": "user", "content": prompt}])
+            logger.info("[PLAN_GENERATION] received %d chars from engine", len(raw or ""))
+            plan = parse_plan_json(raw, goal, task_type, ws, context)
+            if plan is not None:
+                report = validate_plan(plan)
+                if report.valid:
+                    logger.info("[PLAN_VALIDATION] valid=True (%d steps)", len(plan.steps))
+                    logger.info("[PLAN_SELECTED] normal")
+                    _bind_user_intent_to_plan(plan, goal, cwd)
+                    return plan
 
-    from ultron.core.intelligence.intent_understanding import understand_user_intent
+                issue_msgs = [i.message for i in report.issues]
+                logger.warning(
+                    "[PLAN_VALIDATION] valid=False issues: %s",
+                    "; ".join(issue_msgs),
+                )
+                # Attempt 1 bounded re-plan recovery with validation feedback
+                recovery_prompt = (
+                    f"{prompt}\n\n"
+                    f"IMPORTANT CORRECTION: Your previous plan was invalid ({'; '.join(issue_msgs[:3])}). "
+                    "Please correct the issues and output ONLY a valid JSON object matching the plan schema."
+                )
+                retry_raw = await engine.generate([{"role": "user", "content": recovery_prompt}])
+                retry_plan = parse_plan_json(retry_raw, goal, task_type, ws, context)
+                if retry_plan is not None and validate_plan(retry_plan).valid:
+                    logger.info(
+                        "[PLAN_RECOVERY] bounded recovery succeeded (%d steps)",
+                        len(retry_plan.steps),
+                    )
+                    logger.info("[PLAN_SELECTED] recovered")
+                    _bind_user_intent_to_plan(retry_plan, goal, cwd)
+                    return retry_plan
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[PLAN_GENERATION_FAILED] engine call failed: %s", exc)
 
-    if plan.user_intent is None:
-        plan.user_intent = understand_user_intent(goal)
-    if not plan.acceptance_criteria and plan.user_intent:
-        plan.acceptance_criteria = list(plan.user_intent.acceptance_criteria)
-
-    return plan
+    return None
 
 
 async def prepare_task_for_execution(
@@ -522,19 +797,6 @@ async def prepare_task_for_execution(
     """
     GOAL UNDERSTANDING + TASK CLASSIFICATION + PLANNING for one request,
     returning a TaskState ready for plan-aware execution.
-
-    - Informational / simple-action / file-operation requests return None —
-      the fast path stays fast (no plan, no extra LLM call).
-    - Requests that genuinely need clarification return a BLOCKED TaskState
-      whose questions the UI should surface before executing.
-    - Everything else (multi-step, software engineering, debugging, code
-      review, research, system/config/data work) gets a validated structured
-      plan attached to a TaskState — the plan is the source of truth the
-      executor follows.
-
-    The plan is generated by the LLM planner (or the deterministic fallback
-    plan) and validated; a plan that fails validation falls back to the
-    fallback plan so execution never runs unplanned.
     """
     classification = await classify_task(user_input, engine)
     if classification.task_type not in COMPLEX_TASK_TYPES:
@@ -553,11 +815,23 @@ async def prepare_task_for_execution(
         cwd=cwd,
     )
     if plan is None:
+        logger.info("[PLAN_RECOVERY] using deterministic fallback plan for task_type=%s", classification.task_type.value)
         plan = fallback_plan(
             classification.goal,
             classification.task_type,
             ws,
+            cwd=cwd,
         )
+        plan.failure_recovery = (
+            f"Initial LLM planner failed or was unavailable; recovered using deterministic {classification.task_type.value} execution plan."
+        )
+        report = validate_plan(plan)
+        if report.valid:
+            logger.info("[PLAN_SELECTED] deterministic_fallback (valid=True, %d steps)", len(plan.steps))
+            _bind_user_intent_to_plan(plan, classification.goal, cwd)
+        else:
+            logger.error("[PLAN_VALIDATION_ERROR] deterministic fallback plan failed validation: %s", report.issues)
+
     task.attach_plan(plan)
     _attach_coding_context(task, cwd)
     return task
@@ -566,10 +840,6 @@ async def prepare_task_for_execution(
 def _attach_coding_context(task: TaskState, cwd: str | None) -> None:
     """
     Attaches a Fix #3 CodeContext (workspace awareness) to a prepared task.
-
-    Read-only workspace discovery — never executes tools, never modifies
-    files. The context lives on the TaskState, so it survives confirmations
-    and agent continuation.
     """
     from ultron.core.coding.context import CodeContext
     from ultron.core.coding.workspace import discover_workspace

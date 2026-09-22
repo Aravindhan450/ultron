@@ -198,9 +198,9 @@ def test_fallback_plan_is_valid_and_verifies_goal():
         WorkspaceKind.EXISTING_PROJECT,
     )
     assert validate_plan(plan).valid
-    assert len(plan.steps) == 1
-    assert "verify" in plan.steps[0].description.lower()
-    assert plan.completion_criteria == ["Make the tests pass"]
+    assert len(plan.steps) == 5
+    assert "verify" in plan.steps[-1].description.lower()
+    assert "Make the tests pass" in plan.completion_criteria
     assert plan.workspace is WorkspaceKind.EXISTING_PROJECT
 
 

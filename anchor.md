@@ -69,7 +69,7 @@ Project Ultron is undergoing an **Ollama → llama.cpp / llama-server** migratio
 
 ## 4. Current Test & Verification Snapshot
 
-- **Pytest**: `1,779 passed, 6 deselected in 35.21s` (100% pass rate)
+- **Pytest**: `1,810 passed, 6 deselected in 34.82s` (100% pass rate)
 - **Ruff**: `All checks passed!` (0 lint errors)
 - **Harness & Security Verification**: 100% checks passed, live model-in-the-loop validated across all active tiers
 - **Active Model Fleet**: Gemma-3-4B (`fast`), Qwen3-8B (`primary`), Qwen2.5-Coder-7B (`coder`) dynamically managed by `ModelLifecycleManager`
@@ -305,3 +305,19 @@ Project Ultron is undergoing an **Ollama → llama.cpp / llama-server** migratio
   - Comprehensive unit test suite in `tests/test_autonomous_coding_agent_v1.py` covering product classification, intent extraction, requirement derivation, acceptance criteria gating, lifecycle state transitions, and context rendering.
   - Pytest suite: **1,792 / 1,792 passed (100%)**.
   - Ruff lint: Clean (0 errors).
+
+### Phase 10: Planning Robustness, Observable Recovery Pipeline, and Verification Invariants — [COMPLETED & VERIFIED]
+- **Documentation**: Comprehensive report in [`ultron_planning_recovery_validation_report.md`](file:///Users/aravindhan/ultron/ultron_planning_recovery_validation_report.md).
+- **Resilient Extraction & Normalization**:
+  - `src/ultron/core/intelligence/task_planning.py`: Implemented `_extract_json_payload` to parse JSON from reasoning output and normalize steps while preserving structural dependency DAGs for `validate_plan`.
+- **Bounded Planning Recovery Pipeline**:
+  - Implemented 1-retry bounded recovery with validation issue feedback in `generate_task_plan`.
+  - Upgraded `fallback_plan` to dispatch to deterministic, fully executable fallback plans (`build_software_engineering_plan`, `build_debugging_plan`, `build_research_plan`, `build_system_operation_plan`). Solitary verification fallback plans are strictly prohibited.
+- **Verification Invariants & Execution History Enforcement**:
+  - `src/ultron/core/agents/react.py`: In `_verify_task` and `_verify_plan_task`, enforced invariant that actionable complex tasks (`COMPLEX_TASK_TYPES`) cannot complete without recorded `execution_history`.
+- **Targeted Test Suite & Quality Baseline**:
+  - Comprehensive unit test suite in `tests/test_planning_recovery.py` covering `TEST A` through `TEST L` (valid plan generation, malformed JSON recovery, invalid DAG recovery, empty plan recovery, engine failure recovery, structural validation, verification ordering, goal preservation, failure classification separation, genuine verification failure, successful completion, execution history invariant).
+  - Pytest suite: **1,810 / 1,810 passed (100%)**.
+  - Ruff lint: Clean (0 errors).
+  - Live local model validation on `Qwen2.5-Coder-7B`: Verified 4-step executable planning and 5 acceptance criteria binding on desktop expense manager request.
+

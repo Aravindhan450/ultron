@@ -1333,7 +1333,7 @@ def test_bootstrap_falls_back_to_fallback_plan_when_llm_fails():
     task = _run(prepare_task_for_execution("Create a FastAPI backend", engine, cwd="/tmp"))
     assert task is not None
     assert task.plan is not None
-    assert len(task.plan.steps) == 1  # fallback verification step
+    assert len(task.plan.steps) == 4  # deterministic executable fallback plan
     assert task.is_complete() is False
 
 

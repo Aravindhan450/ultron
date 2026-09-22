@@ -958,8 +958,8 @@ def test_t16_invalid_llm_plan_falls_back(sandbox):
         prepare_task_for_execution("Create a FastAPI backend", planner, cwd=str(sandbox))
     )
     assert task is not None
-    assert len(task.plan.steps) == 1  # fallback verification plan, not the invalid one
-    assert task.plan.steps[0].description == "Verify the final user goal"
+    assert len(task.plan.steps) == 4  # deterministic executable fallback plan, not invalid plan
+    assert task.plan.steps[0].description.startswith("Implement")
     assert validate_plan(task.plan).valid
 
 

@@ -52,6 +52,7 @@ from ultron.core.agents.simple import (
 from ultron.core.coding.context import CodeContext
 from ultron.core.coding.edits import EDIT_TOOL_ACTIONS, record_tool_result
 from ultron.core.coding.workspace import discover_workspace
+from ultron.core.intelligence.plan_validation import COMPLEX_TASK_TYPES
 from ultron.core.intelligence.prompt_assembly import (
     build_response_guidance,
     polish_response,
@@ -780,6 +781,8 @@ def _parse_requirements_json(text: str) -> list[dict] | None:
             data = json.loads(text[first : last + 1])
         except json.JSONDecodeError:
             return None
+    if isinstance(data, dict) and isinstance(data.get("requirements"), list):
+        data = data["requirements"]
     if not isinstance(data, list):
         return None
     return [d for d in data if isinstance(d, dict)]
@@ -1433,6 +1436,13 @@ class ReActAgent(BaseAgent):
             )
             return False, None
 
+        if task.task_type in COMPLEX_TASK_TYPES and not task.execution_history:
+            _note(
+                "Verification: task incomplete. No tool executions or project actions "
+                "have been recorded yet for this actionable task. Continue working toward the goal."
+            )
+            return False, None
+
         task.mark_complete()
         # Fix #6: capture this completing turn's intelligence facts.
         _sync_task_memory(task)
@@ -1548,6 +1558,14 @@ class ReActAgent(BaseAgent):
                     "Continue working toward verifying application launch, interaction, or required behavior."
                 )
                 return False, None
+
+            if task.task_type in COMPLEX_TASK_TYPES and not task.execution_history:
+                _note(
+                    "Verification: task incomplete. No tool executions or project actions "
+                    "have been recorded yet for this actionable task. Continue working toward the goal."
+                )
+                return False, None
+
             task.mark_complete()
             # Fix #6: capture this completing turn's intelligence facts.
             _sync_task_memory(task)

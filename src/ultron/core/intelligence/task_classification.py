@@ -83,11 +83,11 @@ _SE_NOUNS_RE = re.compile(
     r"tool\w*|website\w*|dashboard\w*|endpoint\w*|function\w*|class\w*|"
     r"microservice\w*|server\w*|documentation\b|docs\b|dependenc\w*|"
     r"auth\w*|login\w*|oauth|react|fastapi|django|flask|node\b|express|spring\b|"
-    r"rails|angular|vue\b|graphql|rest\b|dockerfile)\b"
+    r"rails|angular|vue\b|graphql|rest\b|dockerfile|manager\w*)\b"
 )
 
 _SE_CREATION_RE = re.compile(
-    r"\b(create|build|implement|develop|scaffold)\b.*?\b(app|application|project|service|cli|tool|script|program|tracker\w*|backend\w*|frontend\w*|api\b|module\w*|bot\w*|engine\w*)\b",
+    r"\b(create|build|implement|develop|scaffold)\b.*?\b(app|application|project|service|cli|tool|script|program|tracker\w*|backend\w*|frontend\w*|api\b|module\w*|bot\w*|engine\w*|manager\w*)\b",
     re.IGNORECASE,
 )
 
