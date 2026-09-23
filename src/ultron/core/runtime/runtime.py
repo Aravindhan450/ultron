@@ -68,7 +68,11 @@ class AgentRuntime:
         router: ModelRouter | None = None,
         lifecycle_manager: ModelLifecycleManager | None = None,
     ) -> None:
-        self.event_bus = event_bus or EventBus()
+        if event_bus is None:
+            from ultron.core.runtime.event_store import get_default_event_store
+
+            event_bus = EventBus(store=get_default_event_store())
+        self.event_bus = event_bus
         self.default_budget = default_budget or RuntimeBudget()
         self.context_manager = context_manager or RepositoryContextManager()
         self.router = router
@@ -215,9 +219,24 @@ class AgentRuntime:
                     )
                 )
 
+        if task is None:
+            from pathlib import Path
+
+            from ultron.core.coding.workspace import discover_workspace
+
+            try:
+                ws_root = discover_workspace(str(Path.cwd())).project_root
+            except (OSError, ValueError):
+                ws_root = str(Path.cwd())
+            task = TaskState(
+                goal=user_input,
+                lifecycle_status=TaskLifecycleStatus.CREATED,
+                workspace_root=ws_root,
+            )
+
         run_id = f"run_{uuid.uuid4().hex[:8]}"
-        task_id = getattr(task, "task_id", None) if task else None
-        parent_task_id = getattr(task, "parent_task_id", None) if task else None
+        task_id = task.task_id
+        parent_task_id = task.parent_task_id
         active_budget = (budget.model_copy(deep=True) if budget else self.default_budget.model_copy(deep=True))
         token = cancellation_token or CancellationToken()
 
@@ -227,6 +246,16 @@ class AgentRuntime:
             parent_task_id=parent_task_id,
             budget=active_budget,
         )
+
+        if task.lifecycle_status == TaskLifecycleStatus.CREATED:
+            await self.event_bus.emit(
+                TaskEvent(
+                    task_id=task.task_id,
+                    event_type=TaskEventType.TASK_CREATED,
+                    payload={"goal": task.goal, "workspace_root": task.workspace_root},
+                    source="runtime",
+                )
+            )
 
         # Transition CREATED -> INITIALIZING -> RUNNING
         run_state.transition_to(RuntimeStatus.INITIALIZING)
@@ -239,12 +268,24 @@ class AgentRuntime:
             )
         )
 
-        if task and task.lifecycle_status == TaskLifecycleStatus.CREATED:
+        if task.lifecycle_status == TaskLifecycleStatus.CREATED:
+            task.transition_to(TaskLifecycleStatus.READY, reason="task ready for execution")
             await self.event_bus.emit(
                 TaskEvent(
                     task_id=task.task_id,
-                    event_type=TaskEventType.TASK_CREATED,
-                    payload={"goal": task.goal, "workspace_root": task.workspace_root},
+                    event_type=TaskEventType.TASK_STATE_CHANGED,
+                    payload={"to_state": TaskLifecycleStatus.READY.value, "reason": "task ready for execution"},
+                    source="runtime",
+                )
+            )
+
+        if task.lifecycle_status == TaskLifecycleStatus.READY:
+            task.transition_to(TaskLifecycleStatus.EXECUTING, reason="starting execution")
+            await self.event_bus.emit(
+                TaskEvent(
+                    task_id=task.task_id,
+                    event_type=TaskEventType.TASK_STATE_CHANGED,
+                    payload={"to_state": TaskLifecycleStatus.EXECUTING.value, "reason": "starting execution"},
                     source="runtime",
                 )
             )
@@ -345,6 +386,61 @@ class AgentRuntime:
                     },
                 )
             )
+
+            if resolved_task is not None:
+                if resolved_task.lifecycle_status == TaskLifecycleStatus.FAILED:
+                    await self.event_bus.emit(
+                        TaskEvent(
+                            task_id=resolved_task.task_id,
+                            event_type=TaskEventType.TASK_FAILED,
+                            payload={
+                                "error": (
+                                    resolved_task.errors[-1].message
+                                    if resolved_task.errors
+                                    else "Task execution failed"
+                                )
+                            },
+                            source="runtime",
+                        )
+                    )
+                elif resolved_task.lifecycle_status == TaskLifecycleStatus.WAITING_CONFIRMATION:
+                    await self.event_bus.emit(
+                        TaskEvent(
+                            task_id=resolved_task.task_id,
+                            event_type=TaskEventType.CONFIRMATION_REQUESTED,
+                            payload={
+                                "action": (
+                                    resolved_task.pending_action.action_type
+                                    if resolved_task.pending_action
+                                    else "unknown"
+                                )
+                            },
+                            source="runtime",
+                        )
+                    )
+                elif resolved_task.lifecycle_status == TaskLifecycleStatus.EXECUTING:
+                    resolved_task.transition_to(
+                        TaskLifecycleStatus.COMPLETED, reason="execution complete"
+                    )
+                    await self.event_bus.emit(
+                        TaskEvent(
+                            task_id=resolved_task.task_id,
+                            event_type=TaskEventType.TASK_STATE_CHANGED,
+                            payload={
+                                "to_state": TaskLifecycleStatus.COMPLETED.value,
+                                "reason": "execution complete",
+                            },
+                            source="runtime",
+                        )
+                    )
+                    await self.event_bus.emit(
+                        TaskEvent(
+                            task_id=resolved_task.task_id,
+                            event_type=TaskEventType.TASK_COMPLETED,
+                            payload={"goal": resolved_task.goal},
+                            source="runtime",
+                        )
+                    )
 
             return RunResult(
                 run_id=run_id,

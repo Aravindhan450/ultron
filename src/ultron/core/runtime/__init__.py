@@ -15,6 +15,9 @@ from ultron.core.runtime.event_store import (
     InMemoryEventStore,
     JsonlEventStore,
     SequenceViolationError,
+    get_default_event_store,
+    reset_default_event_store,
+    set_default_event_store,
 )
 from ultron.core.runtime.events import (
     EventBus,
@@ -71,6 +74,9 @@ __all__ = [
     "TaskState",
     "assert_runtime_transition",
     "assert_task_transition",
+    "get_default_event_store",
     "project_task_state",
+    "reset_default_event_store",
     "sanitize_event_payload",
+    "set_default_event_store",
 ]

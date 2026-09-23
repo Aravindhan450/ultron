@@ -392,3 +392,189 @@ def test_agent_runtime_with_event_store():
             assert any(e.event_type == TaskEventType.TASK_CREATED for e in persisted)
 
     asyncio.run(_test())
+
+
+# ---------------------------------------------------------------------------
+# 12. Regression Tests (Phase 1 Integration Fixes)
+# ---------------------------------------------------------------------------
+
+
+def test_user_prompt_not_equal_task_id():
+    prompt = "I am testing the canonical TaskState and durable EventStore integration."
+
+    # Positional invocation
+    task1 = TaskState(prompt)
+    assert task1.goal == prompt
+    assert task1.task_id != prompt
+    assert task1.task_id.startswith("task_")
+
+    # Keyword invocation
+    task2 = TaskState(goal=prompt)
+    assert task2.goal == prompt
+    assert task2.task_id != prompt
+    assert task2.task_id.startswith("task_")
+
+    # Erroneous attempt to assign task_id == prompt
+    task3 = TaskState(task_id=prompt, goal=prompt)
+    assert task3.task_id != prompt
+    assert task3.task_id.startswith("task_")
+    assert task3.goal == prompt
+
+
+def test_task_id_stability_across_execution():
+    async def _test():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = JsonlEventStore(base_dir=tmpdir)
+            bus = EventBus(store=store)
+            runtime = AgentRuntime(event_bus=bus)
+
+            prompt = "Read project status"
+            task = TaskState(goal=prompt)
+            initial_id = task.task_id
+
+            agent = FakeAgent(ChatMessage(role=Role.ASSISTANT, content="Done", task_state=task))
+            result = await runtime.execute(agent, prompt, task=task)
+
+            assert result.task_state.task_id == initial_id
+            assert task.task_id == initial_id
+
+    asyncio.run(_test())
+
+
+def test_production_event_bus_defaults_to_jsonl_store():
+    bus = EventBus()
+    assert isinstance(bus._store, JsonlEventStore)
+
+
+def test_events_actually_written_to_disk_in_runtime_execution():
+    async def _test():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = JsonlEventStore(base_dir=tmpdir)
+            bus = EventBus(store=store)
+            runtime = AgentRuntime(event_bus=bus)
+
+            prompt = "Inspect repository structure"
+            task = TaskState(goal=prompt)
+            agent = FakeAgent(ChatMessage(role=Role.ASSISTANT, content="Inspected", task_state=task))
+
+            result = await runtime.execute(agent, prompt, task=task)
+            task_id = result.task_state.task_id
+
+            path = Path(tmpdir) / f"{task_id}.jsonl"
+            assert path.exists()
+            lines = path.read_text(encoding="utf-8").strip().split("\n")
+            assert len(lines) >= 3
+
+            persisted = store.get(task_id)
+            assert len(persisted) == len(lines)
+            assert persisted[0].event_type == TaskEventType.TASK_CREATED
+            assert any(e.event_type == TaskEventType.TASK_COMPLETED for e in persisted)
+
+    asyncio.run(_test())
+
+
+def test_prompt_instructing_do_not_create_files_does_not_scaffold():
+    from ultron.core.intelligence.task_classification import classify_task_deterministic
+    from ultron.core.intelligence.task_planning import fallback_plan
+    from ultron.core.types import TaskType, WorkspaceKind
+
+    prompt = (
+        "I am testing the canonical TaskState and durable EventStore integration. "
+        "Do not create files. Do not run commands. After completing read-only inspection, report the state."
+    )
+    classification = classify_task_deterministic(prompt)
+    assert classification.task_type in (TaskType.RESEARCH, TaskType.INFORMATIONAL)
+    assert classification.task_type != TaskType.SOFTWARE_ENGINEERING
+
+    # Fallback plan for MULTI_STEP must not scaffold application files
+    multi_step_plan = fallback_plan("General multi step work", TaskType.MULTI_STEP, WorkspaceKind.UNKNOWN)
+    assert not any("scaffold" in step.description.lower() for step in multi_step_plan.steps)
+    assert not any("implement application files" in step.description.lower() for step in multi_step_plan.steps)
+
+
+def test_prompt_instructing_do_not_plan_bypasses_planning():
+    async def _test():
+        from ultron.core.intelligence.task_planning import prepare_task_for_execution
+
+        prompt = (
+            "I am testing the canonical TaskState and durable EventStore integration. "
+            "Do not create a plan. Do not create files. Report the actual TaskState."
+        )
+        task = await prepare_task_for_execution(prompt, None)
+        assert task is None
+
+    asyncio.run(_test())
+
+
+def test_read_only_prompt_does_not_fail_with_plan_step_failed():
+    async def _test():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = JsonlEventStore(base_dir=tmpdir)
+            bus = EventBus(store=store)
+            runtime = AgentRuntime(event_bus=bus)
+
+            prompt = (
+                "I am testing the canonical TaskState and durable EventStore integration. "
+                "Do not create a plan. Do not create files. Report the actual TaskState."
+            )
+            agent = FakeAgent(ChatMessage(role=Role.ASSISTANT, content="TaskState: ready"))
+            result = await runtime.execute(agent, prompt)
+
+            task = result.task_state
+            assert task.lifecycle_status in (TaskLifecycleStatus.READY, TaskLifecycleStatus.EXECUTING, TaskLifecycleStatus.COMPLETED)
+            assert "plan_step_failed" not in task.lifecycle_history
+            assert not any(err.message == "plan_step_failed" for err in task.errors)
+
+    asyncio.run(_test())
+
+
+def test_process_restart_replay_preserves_task_state_exactly():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Phase 1: Process A writes events
+        store_a = JsonlEventStore(base_dir=tmpdir)
+        tid = "task_restart_test_123"
+        ev1 = TaskEvent(
+            task_id=tid,
+            sequence=1,
+            event_type=TaskEventType.TASK_CREATED,
+            payload={"goal": "Survive process restart", "workspace_root": "/tmp/testws"},
+            source="test",
+        )
+        ev2 = TaskEvent(
+            task_id=tid,
+            sequence=2,
+            event_type=TaskEventType.TASK_STATE_CHANGED,
+            payload={"to_state": TaskLifecycleStatus.READY.value, "reason": "planning complete"},
+            source="test",
+        )
+        ev3 = TaskEvent(
+            task_id=tid,
+            sequence=3,
+            event_type=TaskEventType.TASK_STATE_CHANGED,
+            payload={"to_state": TaskLifecycleStatus.EXECUTING.value, "reason": "starting execution"},
+            source="test",
+        )
+        ev4 = TaskEvent(
+            task_id=tid,
+            sequence=4,
+            event_type=TaskEventType.TASK_COMPLETED,
+            payload={"goal": "Survive process restart"},
+            source="test",
+        )
+        store_a.append_many([ev1, ev2, ev3, ev4])
+
+        # Drop store_a completely to simulate process exit
+        del store_a
+
+        # Phase 2: Process B opens a fresh store instance pointing to same disk dir
+        store_b = JsonlEventStore(base_dir=tmpdir)
+        loaded_events = store_b.get(tid)
+        assert len(loaded_events) == 4
+
+        rebuilt = project_task_state(loaded_events)
+        assert rebuilt.task_id == tid
+        assert rebuilt.goal == "Survive process restart"
+        assert rebuilt.lifecycle_status == TaskLifecycleStatus.COMPLETED
+        assert rebuilt.workspace_root == "/tmp/testws"
+        assert rebuilt.lifecycle_history == ["created", "ready", "executing", "completed"]
+

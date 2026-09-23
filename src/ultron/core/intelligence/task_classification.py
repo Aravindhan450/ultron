@@ -49,14 +49,14 @@ _CODE_REVIEW_RE = re.compile(
 
 _RESEARCH_RE = re.compile(
     r"\b(analy\w*|understand\w*|research\w*|summariz\w*|explain\w*|"
-    r"investigat\w*)\b|"
+    r"investigat\w*|inspect\w*|examin\w*)\b|"
     r"\bhow\s+(do|does|is|are)\b|"
     r"\breferences\s+to\b"
 )
 _CODE_NOUNS_RE = re.compile(
     r"\b(repo\w*|repositor\w*|codebase|project|code|source|architecture|"
     r"service|module|function|component|application|app\b|api\b|"
-    r"implementation|auth\w*|login\w*)\b"
+    r"implementation|auth\w*|login\w*|task\w*|state\w*)\b"
 )
 
 _SYSTEM_RE = re.compile(
@@ -143,9 +143,20 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
+_NEGATED_ACTION_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|never|cannot|can't|cant|no|without|avoid)\s+(?:to\s+)?([a-z]+)",
+    re.IGNORECASE,
+)
+
+
 def _count_action_verbs(text: str) -> int:
-    """Counts distinct action verbs in a request (used for multi-step)."""
-    return len(set(re.findall(r"[a-z']+", text)) & _ACTION_VERBS)
+    """Counts distinct un-negated action verbs in a request (used for multi-step)."""
+    # Replace compound phrases like 'read-only' so 'read' is not treated as an action verb
+    normalized = re.sub(r"\bread[-_\s]only\b", "readonly", text, flags=re.IGNORECASE)
+    negated_verbs = set(_NEGATED_ACTION_RE.findall(normalized.lower()))
+    all_verbs = set(re.findall(r"[a-z']+", normalized.lower())) & _ACTION_VERBS
+    unnegated = all_verbs - negated_verbs
+    return len(unnegated)
 
 def _classify_deterministic(text: str) -> TaskType | None:
     """Returns the best task type from rules, or None when ambiguous."""

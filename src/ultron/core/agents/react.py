@@ -524,7 +524,10 @@ def _build_task_context_block(
         return ""
     lines = [
         "CURRENT TASK (you are working toward this goal; do not stop until it is complete):",
+        f"Task ID: {task.task_id}",
         f"Goal: {task.goal}",
+        f"Lifecycle Status: {task.lifecycle_status.value}",
+        f"Lifecycle Transitions: {task.lifecycle_history}",
         f"Status: {task.status.value}",
         f"Step: {task.current_step}/{task.total_steps or '?'} completed",
         f"Requirements: {len(task.completed_requirements)}/{len(task.requirements)} complete",

@@ -37,6 +37,7 @@ from ultron.core.types import (
     EvidenceLevel,
     FailureStrategy,
     PlanStep,
+    TaskLifecycleStatus,
     TaskPlan,
     TaskState,
     TaskType,
@@ -684,6 +685,57 @@ def build_system_operation_plan(
     )
 
 
+def build_multi_step_plan(
+    goal: str,
+    workspace: WorkspaceKind = WorkspaceKind.UNKNOWN,
+) -> TaskPlan:
+    """Deterministic executable plan for general multi-step tasks without software scaffolding."""
+    from ultron.core.intelligence.intent_understanding import understand_user_intent
+
+    intent = understand_user_intent(goal)
+    steps = [
+        PlanStep(
+            id=1,
+            description="Assess requirements and current environment state",
+            purpose="Determine initial conditions and required sequence of actions",
+            expected_outcome="Starting conditions assessed and plan ready",
+            completion_criteria=["Starting conditions verified"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=1,
+        ),
+        PlanStep(
+            id=2,
+            description="Execute primary task operations",
+            purpose="Perform sequential operations toward achieving goal",
+            expected_outcome="Primary actions executed successfully",
+            dependencies=[1],
+            completion_criteria=["Primary actions executed"],
+            failure_strategy=FailureStrategy.RETRY,
+            retry_policy=2,
+        ),
+        PlanStep(
+            id=3,
+            description="Verify final goal outcome",
+            purpose="Verify that all expected outcomes have been achieved",
+            expected_outcome="Goal verified with evidence",
+            dependencies=[1, 2],
+            completion_criteria=[goal],
+            failure_strategy=FailureStrategy.STOP,
+        ),
+    ]
+    return TaskPlan(
+        goal=goal,
+        task_type=TaskType.MULTI_STEP,
+        workspace=workspace,
+        steps=steps,
+        completion_criteria=[goal],
+        verification_requirements=[f"The user goal is satisfied: {goal}"],
+        acceptance_criteria=list(intent.acceptance_criteria) if intent else [],
+        user_intent=intent,
+        failure_recovery="Inspect state; execute actions safely; verify final outcome.",
+    )
+
+
 def fallback_plan(
     goal: str,
     task_type: TaskType,
@@ -694,15 +746,17 @@ def fallback_plan(
     Constructs a deterministic, structurally valid, and fully executable fallback plan
     tailored to the task type when LLM planning is unavailable or fails.
     """
-    if task_type in (TaskType.SOFTWARE_ENGINEERING, TaskType.MULTI_STEP):
+    if task_type == TaskType.SOFTWARE_ENGINEERING:
         return build_software_engineering_plan(goal, workspace, cwd=cwd)
+    if task_type == TaskType.MULTI_STEP:
+        return build_multi_step_plan(goal, workspace)
     if task_type == TaskType.DEBUGGING:
         return build_debugging_plan(goal, workspace)
     if task_type in (TaskType.RESEARCH, TaskType.CODE_REVIEW):
         return build_research_plan(goal, workspace)
     if task_type in (TaskType.SYSTEM_OPERATION, TaskType.CONFIGURATION, TaskType.DATA_OPERATION):
         return build_system_operation_plan(goal, task_type, workspace)
-    return build_software_engineering_plan(goal, workspace, cwd=cwd)
+    return build_multi_step_plan(goal, workspace)
 
 
 def _bind_user_intent_to_plan(plan: TaskPlan, goal: str, cwd: str | None = None) -> None:
@@ -798,6 +852,11 @@ async def prepare_task_for_execution(
     GOAL UNDERSTANDING + TASK CLASSIFICATION + PLANNING for one request,
     returning a TaskState ready for plan-aware execution.
     """
+    # Explicit user instruction to bypass planning
+    if re.search(r"\b(do not|don't|no)\s+(create\s+a\s+plan|plan|scaffold)\b", user_input, re.IGNORECASE):
+        logger.info("[PLANNING_BYPASS] User explicitly requested no planning")
+        return None
+
     classification = await classify_task(user_input, engine)
     if classification.task_type not in COMPLEX_TASK_TYPES:
         return None
@@ -807,6 +866,7 @@ async def prepare_task_for_execution(
         task.require_clarification(classification.clarification_questions)
         return task
 
+    task.transition_to(TaskLifecycleStatus.PLANNING, reason="planning initiated")
     ws = detect_workspace_kind(cwd)
     plan = await generate_task_plan(
         classification.goal,
@@ -833,6 +893,8 @@ async def prepare_task_for_execution(
             logger.error("[PLAN_VALIDATION_ERROR] deterministic fallback plan failed validation: %s", report.issues)
 
     task.attach_plan(plan)
+    if task.lifecycle_status == TaskLifecycleStatus.PLANNING:
+        task.transition_to(TaskLifecycleStatus.READY, reason="plan ready for execution")
     _attach_coding_context(task, cwd)
     return task
 

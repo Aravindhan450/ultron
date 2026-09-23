@@ -760,10 +760,34 @@ class CanonicalTaskState(BaseModel):
 
     # Lifecycle & status
     lifecycle_status: TaskLifecycleStatus = TaskLifecycleStatus.CREATED
+    lifecycle_history: list[str] = Field(
+        default_factory=lambda: [TaskLifecycleStatus.CREATED.value]
+    )
     status: TaskStatus = TaskStatus.TASK_STARTED  # Backwards compatibility view
     current_phase: str = "init"
     current_step: int = 0
     total_steps: int = 0
+
+    def __init__(
+        self,
+        goal: str = "",
+        task_id: str | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        if goal and "goal" not in kwargs:
+            kwargs["goal"] = goal
+        if task_id is not None:
+            kwargs["task_id"] = task_id
+        tid = kwargs.get("task_id")
+        g = kwargs.get("goal", "")
+        # Enforce stable task_id format and prevent task_id from equaling goal
+        if not tid or tid == g or not str(tid).startswith("task_"):
+            kwargs["task_id"] = f"task_{uuid.uuid4().hex[:8]}"
+
+        super().__init__(**kwargs)
+        if "lifecycle_history" not in kwargs:
+            self.lifecycle_history = [self.lifecycle_status.value]
 
     # Planning
     goal: str
@@ -832,6 +856,8 @@ class CanonicalTaskState(BaseModel):
         """
         assert_task_transition(self.lifecycle_status, target, reason=reason)
         self.lifecycle_status = target
+        if not self.lifecycle_history or self.lifecycle_history[-1] != target.value:
+            self.lifecycle_history.append(target.value)
 
         # Synchronize backward-compatible TaskStatus
         if target in (

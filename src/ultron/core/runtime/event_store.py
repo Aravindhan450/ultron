@@ -150,6 +150,7 @@ class JsonlEventStore(EventStore):
             line = event.model_dump_json() + "\n"
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line)
+                f.flush()
 
     def append_many(self, events: list[TaskEvent]) -> None:
         for event in events:
@@ -210,3 +211,29 @@ class JsonlEventStore(EventStore):
                         f"Skipping corrupt event line {line_no} in {path}: {exc}"
                     )
         return sorted(events, key=lambda e: e.sequence)
+
+
+_default_event_store: EventStore | None = None
+
+
+def get_default_event_store() -> EventStore:
+    """
+    Returns the process-wide default EventStore for production task execution.
+    Defaults to a durable JsonlEventStore located at ~/.ultron/events/.
+    """
+    global _default_event_store
+    if _default_event_store is None:
+        _default_event_store = JsonlEventStore()
+    return _default_event_store
+
+
+def set_default_event_store(store: EventStore | None) -> None:
+    """Overrides the default event store (e.g. for testing with InMemoryEventStore)."""
+    global _default_event_store
+    _default_event_store = store
+
+
+def reset_default_event_store() -> None:
+    """Resets the process-wide default event store to None (will re-instantiate JsonlEventStore)."""
+    global _default_event_store
+    _default_event_store = None

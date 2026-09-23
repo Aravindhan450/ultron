@@ -199,6 +199,10 @@ class EventBus:
     """
 
     def __init__(self, store: EventStore | None = None) -> None:
+        if store is None:
+            from ultron.core.runtime.event_store import get_default_event_store
+
+            store = get_default_event_store()
         self._listeners: dict[TaskEventType, list[EventListener]] = defaultdict(list)
         self._global_listeners: list[EventListener] = []
         self._history: list[RuntimeEvent] = []

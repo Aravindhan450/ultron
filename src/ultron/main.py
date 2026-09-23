@@ -933,10 +933,13 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
                 truncated_history = truncate_history(history, max_messages=10)
 
                 from ultron.core.runtime import AgentRuntime
+                from ultron.core.runtime.event_store import get_default_event_store
+                from ultron.core.runtime.events import EventBus
 
                 runtime = AgentRuntime(
                     router=model_router,
                     lifecycle_manager=lifecycle_manager,
+                    event_bus=EventBus(store=get_default_event_store()),
                 )
                 prepared_task = None
 
