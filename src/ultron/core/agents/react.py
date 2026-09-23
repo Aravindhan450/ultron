@@ -80,6 +80,7 @@ from ultron.core.types import (
     PlanStep,
     Role,
     StepStatus,
+    TaskLifecycleStatus,
     TaskState,
     history_to_openai_format,
 )
@@ -1136,6 +1137,12 @@ class ReActAgent(BaseAgent):
         # RUNNING so the model always has a concrete "current step".
         if task is not None:
             _activate_plan_step(task)
+            if task.lifecycle_status in (
+                TaskLifecycleStatus.CREATED,
+                TaskLifecycleStatus.PLANNING,
+                TaskLifecycleStatus.READY,
+            ):
+                task.transition_to(TaskLifecycleStatus.EXECUTING, reason="starting ReAct execution")
             # Fix #6 session continuity: bind the active workspace + task so a
             # follow-up request can reuse project context instead of
             # rediscovering the repository.
@@ -1456,6 +1463,12 @@ class ReActAgent(BaseAgent):
         raw = (await self.engine.generate([{"role": "user", "content": prompt}])) or ""
         requirements = _parse_requirements_json(raw)
 
+        if task.lifecycle_status in (
+            TaskLifecycleStatus.EXECUTING,
+            TaskLifecycleStatus.REPAIRING,
+        ):
+            task.transition_to(TaskLifecycleStatus.VERIFYING, reason="starting task verification")
+
         # Record the model's proposed answer either way, so a continuation has
         # full context.
         messages.append(ChatMessage(role=Role.ASSISTANT, content=proposed_answer))
@@ -1499,6 +1512,8 @@ class ReActAgent(BaseAgent):
                 f"Verification: task incomplete. Remaining requirements: {names}. "
                 "Continue working toward the goal."
             )
+            if task.lifecycle_status == TaskLifecycleStatus.VERIFYING:
+                task.transition_to(TaskLifecycleStatus.EXECUTING, reason="verification incomplete, returning to execution")
             return False, None
 
         if not task.all_required_criteria_satisfied():
@@ -1508,6 +1523,8 @@ class ReActAgent(BaseAgent):
                 f"Verification: task incomplete. Unsatisfied acceptance criteria: {names}. "
                 "Continue working toward verifying application launch, interaction, or required behavior."
             )
+            if task.lifecycle_status == TaskLifecycleStatus.VERIFYING:
+                task.transition_to(TaskLifecycleStatus.EXECUTING, reason="criteria unsatisfied, returning to execution")
             return False, None
 
         if task.task_type in COMPLEX_TASK_TYPES and not task.execution_history:
@@ -1515,6 +1532,8 @@ class ReActAgent(BaseAgent):
                 "Verification: task incomplete. No tool executions or project actions "
                 "have been recorded yet for this actionable task. Continue working toward the goal."
             )
+            if task.lifecycle_status == TaskLifecycleStatus.VERIFYING:
+                task.transition_to(TaskLifecycleStatus.EXECUTING, reason="no tools executed, returning to execution")
             return False, None
 
         if task.task_type in (TaskType.SOFTWARE_ENGINEERING, TaskType.DEBUGGING):
@@ -1528,6 +1547,8 @@ class ReActAgent(BaseAgent):
                     "(e.g. run test suite, check syntax compilation, or launch and test workflows) "
                     "before declaring completion."
                 )
+                if task.lifecycle_status == TaskLifecycleStatus.VERIFYING:
+                    task.transition_to(TaskLifecycleStatus.EXECUTING, reason="software not executed, returning to execution")
                 return False, None
 
 
@@ -1575,6 +1596,12 @@ class ReActAgent(BaseAgent):
         prompt = _build_plan_verification_prompt(task, proposed_answer)
         raw = (await self.engine.generate([{"role": "user", "content": prompt}])) or ""
         data = _parse_plan_verification(raw)
+
+        if task.lifecycle_status in (
+            TaskLifecycleStatus.EXECUTING,
+            TaskLifecycleStatus.REPAIRING,
+        ):
+            task.transition_to(TaskLifecycleStatus.VERIFYING, reason="starting plan task verification")
 
         # Record the model's proposed answer either way, so a continuation has
         # full context.

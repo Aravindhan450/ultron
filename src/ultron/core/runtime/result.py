@@ -11,7 +11,8 @@ from pydantic import BaseModel, Field
 
 from ultron.core.context.models import ContextSnapshot
 from ultron.core.runtime.state import RunState, RuntimeStatus
-from ultron.core.types import ChatMessage, TaskState
+from ultron.core.runtime.task_state import TaskState
+from ultron.core.types import ChatMessage
 
 
 class RunResult(BaseModel):

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, unique
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Role(str, Enum):
@@ -543,76 +543,328 @@ class PlanValidationReport(BaseModel):
     circular_dependencies: list[list[int]] = Field(default_factory=list)
     unreachable_steps: list[int] = Field(default_factory=list)
 
-class TaskState(BaseModel):
+# ---------------------------------------------------------------------------
+# Authoritative Canonical TaskState & Finite Lifecycle
+# ---------------------------------------------------------------------------
+
+
+@unique
+class TaskLifecycleStatus(str, Enum):
     """
-    Explicit representation of a user's overall task and its completion state.
+    Authoritative finite lifecycle states for an Ultron task.
 
-    This is the structured alternative to letting an intermediate tool action
-    (mkdir, a file write, exit code 0) implicitly end a request. A TaskState
-    owns:
+    Progressive pipeline:
+        CREATED -> UNDERSTANDING -> PLANNING -> READY -> EXECUTING -> VERIFYING -> COMPLETED
+                                                            │             ▲
+                                                            ▼             │
+                                                        REPAIRING ────────┘
 
-    - the original user goal (``goal``),
-    - the lifecycle status (``status``),
-    - explicit completion criteria (``requirements``),
-    - step tracking (``current_step`` / ``total_steps``),
-    - an execution history (``execution_history``),
-    - failures / blocking errors (``errors``).
+    Special non-terminal state:
+        WAITING_CONFIRMATION (paused for interactive user approval)
 
-    Completion is explicit: :meth:`mark_complete` is the only path to
-    ``TASK_COMPLETED``, and it refuses to complete a task that still has
-    incomplete requirements, is blocked, or has failed.
-
-    Instances are pydantic models, so they serialize losslessly via
-    ``model_dump()`` / ``model_dump_json()`` for logging and debugging. A
-    TaskState is created per task — no global mutable state is involved.
+    Terminal states:
+        COMPLETED (successful goal satisfaction)
+        FAILED (unrecoverable execution/planning error)
+        BLOCKED (security or policy hard-stop)
+        CANCELLED (user or cooperative cancellation)
     """
 
+    CREATED = "created"
+    UNDERSTANDING = "understanding"
+    PLANNING = "planning"
+    READY = "ready"
+    EXECUTING = "executing"
+    WAITING_CONFIRMATION = "waiting_confirmation"
+    VERIFYING = "verifying"
+    REPAIRING = "repairing"
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    @property
+    def is_terminal(self) -> bool:
+        """True if the state is terminal (cannot transition out)."""
+        return self in TERMINAL_LIFECYCLE_STATUSES
+
+    @property
+    def is_active(self) -> bool:
+        """True if the task is actively progressing or paused waiting."""
+        return self not in TERMINAL_LIFECYCLE_STATUSES
+
+
+TERMINAL_LIFECYCLE_STATUSES: frozenset[TaskLifecycleStatus] = frozenset(
+    {
+        TaskLifecycleStatus.COMPLETED,
+        TaskLifecycleStatus.CANCELLED,
+    }
+)
+
+
+TASK_TRANSITIONS: dict[TaskLifecycleStatus, frozenset[TaskLifecycleStatus]] = {
+    TaskLifecycleStatus.CREATED: frozenset(
+        {
+            TaskLifecycleStatus.UNDERSTANDING,
+            TaskLifecycleStatus.PLANNING,
+            TaskLifecycleStatus.READY,
+            TaskLifecycleStatus.EXECUTING,
+            TaskLifecycleStatus.WAITING_CONFIRMATION,
+            TaskLifecycleStatus.COMPLETED,
+            TaskLifecycleStatus.FAILED,
+            TaskLifecycleStatus.CANCELLED,
+            TaskLifecycleStatus.BLOCKED,
+        }
+    ),
+    TaskLifecycleStatus.UNDERSTANDING: frozenset(
+        {
+            TaskLifecycleStatus.PLANNING,
+            TaskLifecycleStatus.READY,
+            TaskLifecycleStatus.EXECUTING,
+            TaskLifecycleStatus.WAITING_CONFIRMATION,
+            TaskLifecycleStatus.FAILED,
+            TaskLifecycleStatus.CANCELLED,
+            TaskLifecycleStatus.BLOCKED,
+        }
+    ),
+    TaskLifecycleStatus.PLANNING: frozenset(
+        {
+            TaskLifecycleStatus.READY,
+            TaskLifecycleStatus.EXECUTING,
+            TaskLifecycleStatus.PLANNING,  # adaptive replanning
+            TaskLifecycleStatus.WAITING_CONFIRMATION,
+            TaskLifecycleStatus.COMPLETED,
+            TaskLifecycleStatus.FAILED,
+            TaskLifecycleStatus.CANCELLED,
+            TaskLifecycleStatus.BLOCKED,
+        }
+    ),
+    TaskLifecycleStatus.READY: frozenset(
+        {
+            TaskLifecycleStatus.EXECUTING,
+            TaskLifecycleStatus.PLANNING,
+            TaskLifecycleStatus.WAITING_CONFIRMATION,
+            TaskLifecycleStatus.COMPLETED,
+            TaskLifecycleStatus.FAILED,
+            TaskLifecycleStatus.CANCELLED,
+            TaskLifecycleStatus.BLOCKED,
+        }
+    ),
+    TaskLifecycleStatus.EXECUTING: frozenset(
+        {
+            TaskLifecycleStatus.WAITING_CONFIRMATION,
+            TaskLifecycleStatus.VERIFYING,
+            TaskLifecycleStatus.REPAIRING,
+            TaskLifecycleStatus.COMPLETED,
+            TaskLifecycleStatus.EXECUTING,  # step-to-step loop
+            TaskLifecycleStatus.FAILED,
+            TaskLifecycleStatus.CANCELLED,
+            TaskLifecycleStatus.BLOCKED,
+        }
+    ),
+    TaskLifecycleStatus.WAITING_CONFIRMATION: frozenset(
+        {
+            TaskLifecycleStatus.EXECUTING,
+            TaskLifecycleStatus.FAILED,
+            TaskLifecycleStatus.CANCELLED,
+            TaskLifecycleStatus.BLOCKED,
+        }
+    ),
+    TaskLifecycleStatus.VERIFYING: frozenset(
+        {
+            TaskLifecycleStatus.COMPLETED,
+            TaskLifecycleStatus.REPAIRING,
+            TaskLifecycleStatus.EXECUTING,
+            TaskLifecycleStatus.WAITING_CONFIRMATION,
+            TaskLifecycleStatus.FAILED,
+            TaskLifecycleStatus.CANCELLED,
+            TaskLifecycleStatus.BLOCKED,
+        }
+    ),
+    TaskLifecycleStatus.REPAIRING: frozenset(
+        {
+            TaskLifecycleStatus.EXECUTING,
+            TaskLifecycleStatus.PLANNING,
+            TaskLifecycleStatus.VERIFYING,
+            TaskLifecycleStatus.WAITING_CONFIRMATION,
+            TaskLifecycleStatus.FAILED,
+            TaskLifecycleStatus.CANCELLED,
+            TaskLifecycleStatus.BLOCKED,
+        }
+    ),
+    # Terminal / error states
+    TaskLifecycleStatus.COMPLETED: frozenset(),
+    TaskLifecycleStatus.CANCELLED: frozenset(),
+    # FAILED and BLOCKED can transition to REPAIRING on explicit repair request or CANCELLED
+    TaskLifecycleStatus.FAILED: frozenset(
+        {
+            TaskLifecycleStatus.REPAIRING,
+            TaskLifecycleStatus.CANCELLED,
+        }
+    ),
+    TaskLifecycleStatus.BLOCKED: frozenset(
+        {
+            TaskLifecycleStatus.REPAIRING,
+            TaskLifecycleStatus.CANCELLED,
+        }
+    ),
+}
+
+
+class InvalidStateTransitionError(ValueError):
+    """Raised when an illegal lifecycle transition is attempted."""
+
+    def __init__(
+        self, current: TaskLifecycleStatus, target: TaskLifecycleStatus, reason: str = ""
+    ) -> None:
+        self.current = current
+        self.target = target
+        self.reason = reason
+        allowed = [s.value for s in TASK_TRANSITIONS.get(current, frozenset())]
+        msg = (
+            f"Illegal task state transition from '{current.value}' to '{target.value}'."
+            f" Allowed transitions: {allowed}"
+        )
+        if reason:
+            msg += f" (reason: {reason})"
+        super().__init__(msg)
+
+
+def assert_task_transition(
+    current: TaskLifecycleStatus, target: TaskLifecycleStatus, reason: str = ""
+) -> None:
+    """
+    Validates that a transition from `current` to `target` is legal.
+    Raises InvalidStateTransitionError on invalid transitions.
+    """
+    allowed = TASK_TRANSITIONS.get(current, frozenset())
+    if target not in allowed:
+        raise InvalidStateTransitionError(current, target, reason=reason)
+
+
+class CanonicalTaskState(BaseModel):
+    """
+    The ONE authoritative runtime state model for an Ultron task.
+
+    Unifies identity, lifecycle status, planning decomposition, execution history,
+    verification evidence, repair state, and recovery references.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    # Identity
     task_id: str = Field(default_factory=lambda: f"task_{uuid.uuid4().hex[:8]}")
     parent_task_id: str | None = None
-    goal: str
-    status: TaskStatus = TaskStatus.TASK_STARTED
-    requirements: list[TaskRequirement] = Field(default_factory=list)
-    current_step: int = 0
-    total_steps: int = 0
-    execution_history: list[ToolExecution] = Field(default_factory=list)
-    errors: list[TaskError] = Field(default_factory=list)
-    # --- ReAct task-continuation state (populated by the agent) ---
-    context: list[ChatMessage] = Field(
-        default_factory=list
-    )  # task transcript: goal + assistant/tool pairs
-    pending_action: PendingAction | None = None  # action awaiting confirmation
-    last_observation: str | None = None  # latest confirmed tool result, fed back on resume
-    requires_verification: bool = (
-        False  # set once a state-changing action is gated on this task
-    )
-    # --- Task understanding / structured plan (Fix #2) ---
-    task_type: TaskType | None = None  # what the user wants to accomplish
-    plan: TaskPlan | None = None  # structured, outcome-oriented decomposition
-    clarification_required: bool = False  # planner could not proceed safely
-    clarification_questions: list[str] = Field(default_factory=list)
-    plan_revisions: list[str] = Field(default_factory=list)  # adaptive-plan audit trail
-    # --- Autonomous Execution & Acceptance (Fix #7) ---
-    acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
-    user_intent: UserIntent | None = None
-    app_lifecycle_state: ApplicationLifecycleState | None = None
-    # --- Coding workspace / execution context (Fix #3 stage 1) ---
-    # Structured, coding-specific context (workspace, relevant files,
-    # observations, modifications) — separate from the raw transcript.
-    code_context: CodeContext | None = None
-    started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    session_id: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
+    # Lifecycle & status
+    lifecycle_status: TaskLifecycleStatus = TaskLifecycleStatus.CREATED
+    status: TaskStatus = TaskStatus.TASK_STARTED  # Backwards compatibility view
+    current_phase: str = "init"
+    current_step: int = 0
+    total_steps: int = 0
+
+    # Planning
+    goal: str
+    task_type: TaskType | None = None
+    plan: TaskPlan | None = None
+    current_plan_step_id: int | None = None
+    completed_step_ids: list[int] = Field(default_factory=list)
+    blocked_step_ids: list[int] = Field(default_factory=list)
+    requirements: list[TaskRequirement] = Field(default_factory=list)
+    acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
+    clarification_required: bool = False
+    clarification_questions: list[str] = Field(default_factory=list)
+    plan_revisions: list[str] = Field(default_factory=list)
+    user_intent: UserIntent | None = None
+
+    # Execution tracking
+    active_action_ids: list[str] = Field(default_factory=list)
+    completed_action_ids: list[str] = Field(default_factory=list)
+    failed_action_ids: list[str] = Field(default_factory=list)
+    execution_history: list[ToolExecution] = Field(default_factory=list)
+    context: list[ChatMessage] = Field(default_factory=list)
+    pending_action: PendingAction | None = None
+    last_observation: str | None = None
+    app_lifecycle_state: ApplicationLifecycleState | None = None
+
+    # Verification
+    requires_verification: bool = False
+    verification_status: str | None = None  # None, "started", "passed", "failed"
+    last_verification_result: dict[str, Any] | None = None
+
+    # Repair
+    repair_attempts: int = 0
+    max_repair_attempts: int = 5
+    repair_budget_state: dict[str, Any] = Field(default_factory=dict)
+
+    # Model & Routing
+    selected_model: str | None = None
+    routing_decision: dict[str, Any] | None = None
+
+    # Repository & Environment
+    workspace_root: str | None = None
+    relevant_files: list[str] = Field(default_factory=list)
+    code_context: CodeContext | None = None
+
+    # Error & Failure
+    errors: list[TaskError] = Field(default_factory=list)
+    failure_classification: str | None = None
+
+    # Recovery
+    checkpoint_id: str | None = None
+    recovery_state: dict[str, Any] | None = None
+
+    def _touch(self) -> None:
+        self.updated_at = datetime.now(UTC)
+
     # ------------------------------------------------------------------
-    # Requirements (completion criteria)
+    # Explicit Lifecycle Transitions
+    # ------------------------------------------------------------------
+
+    def transition_to(
+        self, target: TaskLifecycleStatus, reason: str = ""
+    ) -> TaskLifecycleStatus:
+        """
+        Validates and transitions the task into a target lifecycle status.
+        Synchronizes legacy `status` view for backwards compatibility.
+        """
+        assert_task_transition(self.lifecycle_status, target, reason=reason)
+        self.lifecycle_status = target
+
+        # Synchronize backward-compatible TaskStatus
+        if target in (
+            TaskLifecycleStatus.CREATED,
+            TaskLifecycleStatus.UNDERSTANDING,
+            TaskLifecycleStatus.PLANNING,
+            TaskLifecycleStatus.READY,
+        ):
+            self.status = TaskStatus.TASK_STARTED
+        elif target in (
+            TaskLifecycleStatus.EXECUTING,
+            TaskLifecycleStatus.VERIFYING,
+            TaskLifecycleStatus.REPAIRING,
+        ):
+            self.status = TaskStatus.TASK_RUNNING
+        elif target == TaskLifecycleStatus.WAITING_CONFIRMATION:
+            self.status = TaskStatus.WAITING_CONFIRMATION
+        elif target == TaskLifecycleStatus.COMPLETED:
+            self.status = TaskStatus.TASK_COMPLETED
+        elif target in (TaskLifecycleStatus.FAILED, TaskLifecycleStatus.CANCELLED):
+            self.status = TaskStatus.TASK_FAILED
+        elif target == TaskLifecycleStatus.BLOCKED:
+            self.status = TaskStatus.TASK_BLOCKED
+
+        self._touch()
+        return self.lifecycle_status
+
+    # ------------------------------------------------------------------
+    # Requirements
     # ------------------------------------------------------------------
 
     def add_requirement(self, description: str) -> TaskRequirement:
-        """
-        Adds one completion criterion to the task.
-
-        Descriptions must be unique — a duplicate would make
-        mark_requirement_complete() ambiguous, so it is rejected up front.
-        """
+        """Adds one completion criterion to the task."""
         if any(r.description == description for r in self.requirements):
             raise ValueError(f"Requirement already exists: '{description}'")
         requirement = TaskRequirement(description=description)
@@ -647,15 +899,13 @@ class TaskState(BaseModel):
 
     @property
     def completed_requirements(self) -> list[TaskRequirement]:
-        """All completion criteria satisfied so far."""
         return [r for r in self.requirements if r.completed]
 
     def remaining_requirements(self) -> list[TaskRequirement]:
-        """Completion criteria not yet satisfied."""
         return [r for r in self.requirements if not r.completed]
 
     # ------------------------------------------------------------------
-    # Acceptance criteria (evidence-backed completion)
+    # Acceptance Criteria
     # ------------------------------------------------------------------
 
     def add_acceptance_criterion(
@@ -665,7 +915,6 @@ class TaskState(BaseModel):
         verification_method: str = "execution",
         required: bool = True,
     ) -> AcceptanceCriterion:
-        """Adds or updates an explicit acceptance criterion."""
         for crit in self.acceptance_criteria:
             if crit.id == id:
                 crit.description = description
@@ -689,7 +938,6 @@ class TaskState(BaseModel):
         evidence: str,
         level: EvidenceLevel = EvidenceLevel.LEVEL_4_INTERACTED,
     ) -> AcceptanceCriterion:
-        """Marks an acceptance criterion as verified with concrete evidence."""
         for crit in self.acceptance_criteria:
             if crit.id == id:
                 crit.status = AcceptanceCriterionStatus.VERIFIED
@@ -710,11 +958,8 @@ class TaskState(BaseModel):
         return crit
 
     def fail_acceptance_criterion(
-        self,
-        id: str,
-        error: str,
+        self, id: str, error: str
     ) -> AcceptanceCriterion:
-        """Marks an acceptance criterion as failed."""
         for crit in self.acceptance_criteria:
             if crit.id == id:
                 crit.status = AcceptanceCriterionStatus.FAILED
@@ -732,7 +977,6 @@ class TaskState(BaseModel):
         return crit
 
     def all_required_criteria_satisfied(self) -> bool:
-        """True if all required acceptance criteria are verified."""
         return all(
             crit.status == AcceptanceCriterionStatus.VERIFIED
             for crit in self.acceptance_criteria
@@ -740,7 +984,6 @@ class TaskState(BaseModel):
         )
 
     def remaining_acceptance_criteria(self) -> list[AcceptanceCriterion]:
-        """List of required criteria that are not yet verified."""
         return [
             crit
             for crit in self.acceptance_criteria
@@ -748,25 +991,25 @@ class TaskState(BaseModel):
         ]
 
     # ------------------------------------------------------------------
-    # Step tracking
+    # Step & Plan Tracking
     # ------------------------------------------------------------------
 
     def set_current_step(self, step: int) -> None:
-        """Records the step the task is currently working on (1-based; 0 = none)."""
         if step < 0:
             raise ValueError(f"step must be >= 0, got {step}")
         self.current_step = step
+        self.current_plan_step_id = step
         self._touch()
 
     def set_total_steps(self, total: int) -> None:
-        """Records how many steps the task is expected to have in total."""
         if total < 0:
             raise ValueError(f"total must be >= 0, got {total}")
         self.total_steps = total
         self._touch()
 
+
     # ------------------------------------------------------------------
-    # Execution history + failures
+    # Execution History & Actions
     # ------------------------------------------------------------------
 
     def record_tool_execution(
@@ -776,15 +1019,6 @@ class TaskState(BaseModel):
         success: bool = True,
         detail: str = "",
     ) -> ToolExecution:
-        """
-        Appends one tool execution to the task history.
-
-        This never changes the task status: a tool succeeding is an
-        intermediate event, not task completion. Use mark_complete() to
-        finish the task explicitly. A failed tool run should be recorded
-        here with success=False for history, but if the failure should
-        also move the task to TASK_FAILED, call record_failure() explicitly.
-        """
         entry = ToolExecution(
             tool_name=tool_name, target=target, success=success, detail=detail
         )
@@ -793,100 +1027,50 @@ class TaskState(BaseModel):
         return entry
 
     def record_failure(self, message: str, step: int | None = None) -> TaskError:
-        """
-        Records a failure and moves the task to TASK_FAILED.
-
-        A completed task is never downgraded to failed; a blocked task stays
-        blocked (blocking is the stronger condition).
-        """
         error = TaskError(message=message, step=step)
         self.errors.append(error)
-        if self.status not in (
-            TaskStatus.TASK_COMPLETED,
-            TaskStatus.TASK_BLOCKED,
+        if self.lifecycle_status not in (
+            TaskLifecycleStatus.COMPLETED,
+            TaskLifecycleStatus.BLOCKED,
         ):
-            self.status = TaskStatus.TASK_FAILED
+            self.transition_to(TaskLifecycleStatus.FAILED, reason=message)
         self._touch()
         return error
 
-    # ------------------------------------------------------------------
-    # Lifecycle transitions
-    # ------------------------------------------------------------------
-
     def wait_for_confirmation(self) -> None:
-        """
-        Marks the task as waiting on the user to approve an action.
-
-        Raises if the task is already in a terminal state.
-        """
-        if self.status in (
-            TaskStatus.TASK_COMPLETED,
-            TaskStatus.TASK_FAILED,
-            TaskStatus.TASK_BLOCKED,
-        ):
-            raise ValueError(
-                f"Cannot wait for confirmation from terminal state '{self.status.value}'"
-            )
-        self.status = TaskStatus.WAITING_CONFIRMATION
-        self._touch()
+        self.transition_to(
+            TaskLifecycleStatus.WAITING_CONFIRMATION, reason="waiting user confirmation"
+        )
 
     def resume(self) -> None:
-        """
-        Resumes a task after the user confirmed (or a pause).
-
-        Allowed from TASK_STARTED / TASK_RUNNING / WAITING_CONFIRMATION;
-        terminal states (completed, failed, blocked) cannot resume.
-        """
-        if self.status in (
-            TaskStatus.TASK_COMPLETED,
-            TaskStatus.TASK_FAILED,
-            TaskStatus.TASK_BLOCKED,
-        ):
-            raise ValueError(
-                f"Cannot resume a task in terminal state '{self.status.value}'"
-            )
-        self.status = TaskStatus.TASK_RUNNING
-        self._touch()
+        self.transition_to(TaskLifecycleStatus.EXECUTING, reason="resumed from confirmation")
 
     def transition_to_repair(self) -> None:
-        """
-        Transitions a failed task into REPAIR, returning its status from
-        TASK_FAILED to TASK_RUNNING while preserving all recorded errors
-        and execution history. Also resets any FAILED step in an attached plan
-        back to RUNNING so the repair agent can execute actions to resolve it.
-        """
-        if self.status != TaskStatus.TASK_COMPLETED:
-            self.status = TaskStatus.TASK_RUNNING
-            if self.plan is not None:
-                for step in self.plan.steps:
-                    if step.status is StepStatus.FAILED:
-                        step.status = StepStatus.RUNNING
-                        self.set_current_step(step.id)
-            self._touch()
+        self.repair_attempts += 1
+        self.transition_to(TaskLifecycleStatus.REPAIRING, reason="starting repair attempt")
+        if self.plan is not None:
+            for step in self.plan.steps:
+                if step.status is StepStatus.FAILED:
+                    step.status = StepStatus.RUNNING
+                    self.set_current_step(step.id)
 
     def block(self, message: str | None = None) -> None:
-        """
-        Hard-stops the task (e.g. a security block) and moves it to
-        TASK_BLOCKED. A completed task cannot be blocked retroactively.
-        """
-        if self.status == TaskStatus.TASK_COMPLETED:
-            raise ValueError("Cannot block a completed task")
-        self.status = TaskStatus.TASK_BLOCKED
         if message:
             self.errors.append(TaskError(message=message))
-        self._touch()
+        self.transition_to(TaskLifecycleStatus.BLOCKED, reason=message or "blocked by policy")
 
     def mark_complete(self) -> None:
         """
-        Explicitly completes the task — the only path to TASK_COMPLETED.
-
-        Refuses when requirements or acceptance criteria are still incomplete,
-        the task has failed / been blocked, or (with a structured plan attached)
-        any plan step is still pending / running / failed — a task whose plan is
-        not fully satisfied must never report success.
+        Explicitly completes the task — validates completion criteria and transitions to COMPLETED.
         """
-        if self.status in (TaskStatus.TASK_FAILED, TaskStatus.TASK_BLOCKED):
-            raise ValueError(f"Cannot complete a task in state '{self.status.value}'")
+        if self.lifecycle_status in (
+            TaskLifecycleStatus.FAILED,
+            TaskLifecycleStatus.BLOCKED,
+            TaskLifecycleStatus.CANCELLED,
+        ):
+            raise ValueError(
+                f"Cannot complete a task in state '{self.lifecycle_status.value}'"
+            )
         if self.plan is not None and not self.plan.is_satisfied():
             pending = self.plan.remaining_steps()
             names = ", ".join(f"step {s.id}" for s in pending)
@@ -905,43 +1089,43 @@ class TaskState(BaseModel):
             raise ValueError(
                 f"Cannot complete task with unsatisfied acceptance criteria: {names}"
             )
-        self.status = TaskStatus.TASK_COMPLETED
-        self._touch()
 
-    # ------------------------------------------------------------------
-    # Queries
-    # ------------------------------------------------------------------
+        self.transition_to(TaskLifecycleStatus.COMPLETED, reason="all criteria satisfied")
 
     def is_complete(self) -> bool:
-        """
-        True only when the task has been explicitly marked complete, no
-        requirements remain unsatisfied, and all required acceptance criteria
-        are verified.
-        """
         return (
-            self.status == TaskStatus.TASK_COMPLETED
+            (self.lifecycle_status == TaskLifecycleStatus.COMPLETED or self.status == TaskStatus.TASK_COMPLETED)
             and not self.remaining_requirements()
             and self.all_required_criteria_satisfied()
         )
 
     @property
+    def started_at(self) -> datetime:
+        return self.created_at
+
+    @property
     def is_blocked(self) -> bool:
-        """True when the task has been hard-stopped (security block etc.)."""
-        return self.status == TaskStatus.TASK_BLOCKED
+        return self.lifecycle_status == TaskLifecycleStatus.BLOCKED or self.status == TaskStatus.TASK_BLOCKED
 
     @property
     def is_waiting_confirmation(self) -> bool:
         """True when the task is paused for user approval."""
-        return self.status == TaskStatus.WAITING_CONFIRMATION
+        return (
+            self.lifecycle_status == TaskLifecycleStatus.WAITING_CONFIRMATION
+            or self.status == TaskStatus.WAITING_CONFIRMATION
+        )
 
     def summary(self) -> str:
         """Compact one-line description for logs and debugging."""
         done = len(self.completed_requirements)
         total = len(self.requirements)
-        crit_done = len([c for c in self.acceptance_criteria if c.status == AcceptanceCriterionStatus.VERIFIED])
+        crit_done = len(
+            [c for c in self.acceptance_criteria if c.status == AcceptanceCriterionStatus.VERIFIED]
+        )
         crit_total = len(self.acceptance_criteria)
         return (
             f"TaskState(goal='{self.goal}', status={self.status.value}, "
+            f"lifecycle_status={self.lifecycle_status.value}, "
             f"requirements={done}/{total}, criteria={crit_done}/{crit_total}, "
             f"step={self.current_step}/{self.total_steps}, "
             f"tools={len(self.execution_history)}, errors={len(self.errors)})"
@@ -956,10 +1140,6 @@ class TaskState(BaseModel):
         Attaches a structured plan to the task and seeds its completion
         criteria from the plan (plan-level criteria + verification
         requirements + explicit acceptance criteria).
-
-        TaskState remains the runtime source of truth; the plan is
-        persisted with it, so it survives LLM turns, tool calls,
-        confirmations, failures, and agent continuation.
         """
         self.plan = plan
         self.task_type = plan.task_type
@@ -979,34 +1159,32 @@ class TaskState(BaseModel):
                     verification_method=crit.verification_method,
                     required=crit.required,
                 )
+        if self.lifecycle_status in (
+            TaskLifecycleStatus.CREATED,
+            TaskLifecycleStatus.UNDERSTANDING,
+        ):
+            self.transition_to(TaskLifecycleStatus.PLANNING, reason="plan attached")
         if plan.needs_clarification:
             self.require_clarification(plan.clarification_questions)
         self._touch()
 
     def require_clarification(self, questions: list[str] | None = None) -> None:
         """
-        Blocks the task pending user clarification (e.g. a deployment
-        request with no target). Moves the task to TASK_BLOCKED so it can
-        never be reported complete while unanswered.
+        Blocks the task pending user clarification. Moves the task to
+        BLOCKED so it cannot proceed without answers.
         """
         self.clarification_required = True
         if questions:
             self.clarification_questions = list(
                 dict.fromkeys(q for q in questions if q)
             )
-        if self.status != TaskStatus.TASK_BLOCKED:
+        if self.lifecycle_status != TaskLifecycleStatus.BLOCKED:
             self.block("Task requires clarification before it can proceed.")
         self._touch()
 
-    def adapt_plan(self, new_steps: list[PlanStep]) -> bool:
+    def adapt_plan(self, new_steps: list[Any]) -> bool:
         """
-        ADAPTIVE PLANNING: replaces the task's remaining plan steps with
-        ``new_steps``, preserving completed work.
-
-        The revision must be structurally valid (unique ids, sane
-        dependencies, acyclic, reachable) and is recorded explicitly in
-        ``plan_revisions`` so plan changes are auditable and the TaskState
-        stays the consistent source of truth. Returns True when applied.
+        ADAPTIVE PLANNING: replaces remaining steps, preserving completed work.
         """
         if self.plan is None:
             return False
@@ -1021,39 +1199,34 @@ class TaskState(BaseModel):
         )
         return True
 
-    def remaining_steps(self) -> list[PlanStep]:
-        """Plan steps that still need work (empty when no plan is attached)."""
-        return self.plan.remaining_steps() if self.plan else []
-
-    def completed_steps(self) -> list[PlanStep]:
-        """Plan steps that succeeded (empty when no plan is attached)."""
-        return self.plan.completed_steps() if self.plan else []
-
-    def failed_steps(self) -> list[PlanStep]:
-        """Plan steps that failed (empty when no plan is attached)."""
-        return self.plan.failed_steps() if self.plan else []
-
-    def blocked_steps(self) -> list[PlanStep]:
-        """Plan steps blocked pending clarification (empty when no plan)."""
-        return self.plan.blocked_steps() if self.plan else []
-
-    def current_plan_step(self) -> PlanStep | None:
+    def current_plan_step(self) -> Any | None:
         """The step being worked on (RUNNING) or the next step that can run."""
         return self.plan.active_step() if self.plan else None
 
-    def record_plan_revision(self, note: str) -> None:
-        """
-        Explicitly records an adaptive plan revision (audit trail).
+    def remaining_steps(self) -> list[Any]:
+        return self.plan.remaining_steps() if self.plan else []
 
-        The note describes what changed and why; completed steps are never
-        rewritten by a revision — only the remaining work is replaced.
-        """
+    def completed_steps(self) -> list[Any]:
+        return self.plan.completed_steps() if self.plan else []
+
+    def failed_steps(self) -> list[Any]:
+        return self.plan.failed_steps() if self.plan else []
+
+    def blocked_steps(self) -> list[Any]:
+        return self.plan.blocked_steps() if self.plan else []
+
+    plan_completed_steps = completed_steps
+    plan_failed_steps = failed_steps
+    plan_blocked_steps = blocked_steps
+
+    def record_plan_revision(self, note: str) -> None:
         self.plan_revisions.append(note)
         self._touch()
 
-    def _touch(self) -> None:
-        """Bumps the updated_at marker after any mutation."""
-        self.updated_at = datetime.now(UTC)
+
+# Primary Canonical Alias
+TaskState = CanonicalTaskState
+
 
 def truncate_history(history: list[ChatMessage], max_messages: int = 10) -> list[ChatMessage]:
     """

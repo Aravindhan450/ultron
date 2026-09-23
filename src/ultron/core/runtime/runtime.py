@@ -18,9 +18,10 @@ from __future__ import annotations
 import asyncio
 import re
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from ultron.core.agents.base import BaseAgent
+if TYPE_CHECKING:
+    from ultron.core.agents.base import BaseAgent
 from ultron.core.context.manager import RepositoryContextManager
 from ultron.core.intelligence.model_lifecycle import ModelLifecycleManager
 from ultron.core.intelligence.model_router import (
@@ -34,10 +35,22 @@ from ultron.core.intelligence.model_router import (
 from ultron.core.logging import get_logger
 from ultron.core.runtime.budget import BudgetExceededError, RuntimeBudget
 from ultron.core.runtime.cancellation import CancellationToken
-from ultron.core.runtime.events import EventBus, RuntimeEvent, RuntimeEventType
+from ultron.core.runtime.events import (
+    EventBus,
+    RuntimeEvent,
+    RuntimeEventType,
+    TaskEvent,
+    TaskEventType,
+)
 from ultron.core.runtime.result import RunResult
 from ultron.core.runtime.state import RunState, RuntimeStatus
-from ultron.core.types import ChatMessage, Role, TaskState, TaskType
+from ultron.core.types import (
+    ChatMessage,
+    Role,
+    TaskLifecycleStatus,
+    TaskState,
+    TaskType,
+)
 
 logger = get_logger("ultron.runtime")
 
@@ -182,6 +195,26 @@ class AgentRuntime:
             if hasattr(agent.engine, "set_model"):
                 agent.engine.set_model(handle.model_spec.model_id)
 
+            if task:
+                task.selected_model = decision.selected_model.model_id
+                task.routing_decision = {
+                    "model_id": decision.selected_model.model_id,
+                    "role": decision.selected_model.role.value,
+                    "reason": decision.reason,
+                }
+                await self.event_bus.emit(
+                    TaskEvent(
+                        task_id=task.task_id,
+                        event_type=TaskEventType.MODEL_SELECTED,
+                        payload={
+                            "model": decision.selected_model.model_id,
+                            "role": decision.selected_model.role.value,
+                            "reason": decision.reason,
+                        },
+                        source="model_router",
+                    )
+                )
+
         run_id = f"run_{uuid.uuid4().hex[:8]}"
         task_id = getattr(task, "task_id", None) if task else None
         parent_task_id = getattr(task, "parent_task_id", None) if task else None
@@ -205,6 +238,16 @@ class AgentRuntime:
                 payload={"goal": user_input, "budget": active_budget.summary()},
             )
         )
+
+        if task and task.lifecycle_status == TaskLifecycleStatus.CREATED:
+            await self.event_bus.emit(
+                TaskEvent(
+                    task_id=task.task_id,
+                    event_type=TaskEventType.TASK_CREATED,
+                    payload={"goal": task.goal, "workspace_root": task.workspace_root},
+                    source="runtime",
+                )
+            )
 
         run_state.transition_to(RuntimeStatus.RUNNING)
 
