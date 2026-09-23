@@ -16,9 +16,22 @@ from collections.abc import Callable
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML, AnyFormattedText
+from prompt_toolkit.key_binding import KeyBindings
 
 from ultron.core.state import CLIState
 from ultron.ui.theme import BLUE, FAINT, GREEN, MUTED, RED, YELLOW, console
+
+
+def create_chat_key_bindings() -> KeyBindings:
+    """Creates key bindings for the interactive prompt session."""
+    kb = KeyBindings()
+
+    @kb.add("escape")
+    def _on_escape(event):
+        """Erase / reset the input buffer when pressing Escape without quitting the chat."""
+        event.current_buffer.reset()
+
+    return kb
 
 try:  # wcwidth is a runtime dependency of prompt_toolkit
     from wcwidth import wcswidth
@@ -141,7 +154,11 @@ class ChatSession:
         security_mode: Callable[[], str] | None = None,
     ) -> None:
         self.state = state
-        self.session = session if session is not None else PromptSession()
+        self.session = (
+            session
+            if session is not None
+            else PromptSession(key_bindings=create_chat_key_bindings())
+        )
         self._agent_tag = agent_tag
         self._security_mode = security_mode or (lambda: "")
 

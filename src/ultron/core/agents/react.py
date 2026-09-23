@@ -528,6 +528,20 @@ def _build_task_context_block(
         f"Step: {task.current_step}/{task.total_steps or '?'} completed",
         f"Requirements: {len(task.completed_requirements)}/{len(task.requirements)} complete",
     ]
+    from pathlib import Path
+
+    from ultron.core.tools.paths import get_configured_workspace
+
+    cfg_ws = get_configured_workspace()
+    if cfg_ws is None:
+        default_dir = Path.home() / "UltronWorkspace"
+        if default_dir.is_dir():
+            cfg_ws = default_dir.resolve()
+
+    if cfg_ws is not None:
+        lines.append(f"Dedicated Workspace Directory: {cfg_ws}")
+        lines.append(f"  (When creating new standalone projects or apps, create them inside {cfg_ws})")
+
     for requirement in task.requirements:
         mark = "[x]" if requirement.completed else "[ ]"
         lines.append(f"  {mark} {requirement.description}")

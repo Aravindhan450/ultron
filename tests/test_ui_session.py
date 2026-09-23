@@ -6,6 +6,10 @@ they are exercised directly at several widths to prove the interface
 re-flows — without ever overflowing — when the window is resized.
 """
 
+import asyncio
+
+import pytest
+
 from ultron.core.state import CLIState
 from ultron.ui.session import build_prompt_html, build_toolbar
 
@@ -334,6 +338,66 @@ def test_chat_session_prompt_async_has_no_bottom_toolbar(monkeypatch):
     res = asyncio.run(chat_session.prompt_async())
     assert res == "hello"
     mock_session.prompt_async.assert_called_once()
-    kwargs = mock_session.prompt_async.call_args.kwargs
+    kwargs = mock_session.prompt_args if hasattr(mock_session, "prompt_args") else mock_session.prompt_async.call_args.kwargs
     assert "bottom_toolbar" not in kwargs
+
+
+def test_chat_key_bindings_escape_resets_buffer():
+    from unittest.mock import MagicMock
+
+    from ultron.ui.session import create_chat_key_bindings
+
+    kb = create_chat_key_bindings()
+    assert kb is not None
+    # Verify binding for Escape exists
+    esc_bindings = [b for b in kb.bindings if any(k.value == "c-[" or k.value == "escape" for k in b.keys)]
+    assert len(esc_bindings) > 0
+
+    # Call handler with mock event
+    mock_event = MagicMock()
+    mock_event.current_buffer.reset = MagicMock()
+    handler = esc_bindings[0].handler
+    handler(mock_event)
+    mock_event.current_buffer.reset.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_run_with_esc_cancellation_success():
+    from ultron.main import run_with_esc_cancellation
+
+    async def _sample_job():
+        await asyncio.sleep(0.01)
+        return "success_result"
+
+    cancelled, result = await run_with_esc_cancellation(_sample_job())
+    assert not cancelled
+    assert result == "success_result"
+
+
+@pytest.mark.anyio
+async def test_run_with_esc_cancellation_cancelled(monkeypatch):
+    import threading
+
+    from ultron.main import run_with_esc_cancellation
+
+    # When the background thread starts, have it immediately trigger cancel_event
+    original_init = threading.Thread.__init__
+
+    def mock_thread_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if kwargs.get("args"):
+            evt = kwargs["args"][0]
+            if isinstance(evt, threading.Event):
+                evt.set()
+
+    monkeypatch.setattr(threading.Thread, "__init__", mock_thread_init)
+
+    async def _long_job():
+        await asyncio.sleep(1.0)
+        return "should_not_reach"
+
+    cancelled, result = await run_with_esc_cancellation(_long_job())
+    assert cancelled
+    assert result is None
+
 

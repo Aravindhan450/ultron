@@ -1,4 +1,5 @@
 import asyncio
+from typing import Any
 
 import typer
 
@@ -709,6 +710,83 @@ async def continue_task_after_confirmation(
         )
     return await agent.run(task.goal, history, task=task, session=session)
 
+async def run_with_esc_cancellation(
+    coro,
+    status_text: str = "Thinking... (Press Esc to cancel)",
+) -> tuple[bool, Any]:
+    """
+    Executes an async operation while monitoring standard input in raw mode for an ESC keypress.
+    If Esc is pressed, cancels the running task, prints a clean cancellation status,
+    and returns (True, None). Otherwise returns (False, result).
+    """
+    import select
+    import sys
+    import termios
+    import threading
+    import tty
+
+    cancel_event = threading.Event()
+
+    def _listen_for_esc(cancel_evt: threading.Event):
+        if not sys.stdin.isatty():
+            return
+        try:
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+        except (OSError, ValueError):
+            return
+        try:
+            tty.setcbreak(fd)
+            while not cancel_evt.is_set():
+                r, _, _ = select.select([fd], [], [], 0.05)
+                if r:
+                    ch = sys.stdin.read(1)
+                    if ch == "\x1b":
+                        r_next, _, _ = select.select([fd], [], [], 0.05)
+                        if not r_next:
+                            cancel_evt.set()
+                            break
+                        else:
+                            sys.stdin.read(10)
+        except (OSError, ValueError) as exc:
+            logger.debug("ESC listener failed: %s", exc)
+        finally:
+            try:
+                termios.tcflush(fd, termios.TCIFLUSH)
+            except (OSError, ValueError) as exc:
+                logger.debug("termios tcflush failed: %s", exc)
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except (OSError, ValueError) as exc:
+                logger.debug("termios tcsetattr failed: %s", exc)
+
+    esc_thread = threading.Thread(target=_listen_for_esc, args=(cancel_event,), daemon=True)
+    esc_thread.start()
+
+    task_obj = asyncio.create_task(coro)
+
+    with console.status(f"[{FAINT}]{status_text}[/{FAINT}]"):
+        while not task_obj.done():
+            if cancel_event.is_set():
+                task_obj.cancel()
+                break
+            await asyncio.sleep(0.05)
+
+    cancel_event.set()
+    esc_thread.join(timeout=0.2)
+
+    if task_obj.cancelled():
+        UI.render_status("Execution cancelled by Esc key.", status="warning")
+        return True, None
+
+    try:
+        res = await task_obj
+        return False, res
+    except asyncio.CancelledError:
+        UI.render_status("Execution cancelled by Esc key.", status="warning")
+        return True, None
+
+
 async def async_chat(agent_type: str = "simple", no_server: bool = False, verbose: bool = False):
     """
     Asynchronous runner for the interactive chat session.
@@ -727,7 +805,7 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
     from ultron.core.intelligence.task_planning import prepare_task_for_execution
     from ultron.core.logging import set_verbose_logging
     from ultron.core.state import CLIState
-    from ultron.ui.session import ChatSession
+    from ultron.ui.session import ChatSession, create_chat_key_bindings
 
     is_verbose = verbose or os.environ.get("ULTRON_VERBOSE", "").lower() in ("1", "true", "yes")
     set_verbose_logging(is_verbose)
@@ -752,7 +830,7 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
         except (ImportError, AttributeError, OSError, ValueError):
             return settings.security_mode
 
-    session = PromptSession()
+    session = PromptSession(key_bindings=create_chat_key_bindings())
     session.active_model = state.active_model
     session.active_agent_type = agent_type
 
@@ -854,61 +932,11 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
 
                 truncated_history = truncate_history(history, max_messages=10)
 
-                import threading
-
-                def _listen_for_esc(cancel_evt: threading.Event):
-                    import select
-                    import sys
-                    import termios
-                    import tty
-                    if not sys.stdin.isatty():
-                        return
-                    try:
-                        fd = sys.stdin.fileno()
-                        old_settings = termios.tcgetattr(fd)
-                    except (OSError, ValueError):
-                        return
-                    try:
-                        tty.setcbreak(fd)
-                        while not cancel_evt.is_set():
-                            r, _, _ = select.select([fd], [], [], 0.05)
-                            if r:
-                                ch = sys.stdin.read(1)
-                                if ch == "\x1b":
-                                    r_next, _, _ = select.select([fd], [], [], 0.05)
-                                    if not r_next:
-                                        cancel_evt.set()
-                                        break
-                                    else:
-                                        sys.stdin.read(10)
-                    except (OSError, ValueError) as exc:
-                        logger.debug("ESC listener failed: %s", exc)
-                    finally:
-                        try:
-                            termios.tcflush(fd, termios.TCIFLUSH)
-                        except (OSError, ValueError) as exc:
-                            logger.debug("termios tcflush failed: %s", exc)
-                        try:
-                            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                        except (OSError, ValueError) as exc:
-                            logger.debug("termios tcsetattr failed: %s", exc)
-
-                cancel_event = threading.Event()
-                esc_thread = threading.Thread(target=_listen_for_esc, args=(cancel_event,), daemon=True)
-                esc_thread.start()
-
-                # Plan-aware execution (ReAct agent only): understand + classify
-                # the request and, when it is a complex task type, prepare a
-                # TaskState carrying a validated structured plan before the agent
-                # runs. Informational / simple / file-operation requests return
-                # None and stay on the fast path (no plan, no extra LLM call). A
-                # request that genuinely needs clarification is surfaced to the
-                # user instead of executing blindly.
                 from ultron.core.runtime import AgentRuntime
 
                 runtime = AgentRuntime(
                     router=model_router,
-                    lifecycle_manager=lifecycle_manager
+                    lifecycle_manager=lifecycle_manager,
                 )
                 prepared_task = None
 
@@ -921,16 +949,11 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
                     nonlocal prepared_task, agent
                     if isinstance(_agent, ReActAgent):
                         if _input in ("/resume", "/continue"):
-                            # Fix #6: restore the last persisted task for this
-                            # workspace (goal, plan, completed/remaining steps,
-                            # transcript) and continue it — never a fresh start.
                             from pathlib import Path
 
                             from ultron.core.coding.workspace import discover_workspace
                             from ultron.core.memory.task_store import load_task
 
-                            # Tasks are saved under the workspace project root, so
-                            # resolve it the same way (cwd fallback for safety).
                             try:
                                 resume_root = discover_workspace(
                                     str(Path.cwd())
@@ -965,9 +988,6 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
                         )
                         return run_res.message
 
-                    # If the user is on the default agent (SimpleAgent) but the task is a
-                    # complex or software engineering task requiring concrete multi-file or
-                    # artifact execution, route to ReAct execution so files are created, run, and verified.
                     prepared_task = await prepare_task_for_execution(
                         _input, getattr(_agent, "engine", None)
                     )
@@ -989,28 +1009,13 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
                     return run_res.message
 
                 state.status = "Thinking..."
-                agent_task = asyncio.create_task(_plan_and_run())
+                cancelled, response_msg = await run_with_esc_cancellation(
+                    _plan_and_run(),
+                    status_text="Thinking... (Press Esc to cancel)",
+                )
 
-                with console.status(f"[{FAINT}]Thinking... (Press Esc to cancel)[/{FAINT}]"):
-                    while not agent_task.done():
-                        if cancel_event.is_set():
-                            agent_task.cancel()
-                            break
-                        await asyncio.sleep(0.05)
-
-                cancel_event.set()
-                esc_thread.join(timeout=0.2)
-
-                if agent_task.cancelled():
+                if cancelled:
                     state.status = "Ready"
-                    UI.render_status("Task execution cancelled by Esc key.", status="warning")
-                    continue
-
-                try:
-                    response_msg = await agent_task
-                except asyncio.CancelledError:
-                    state.status = "Ready"
-                    UI.render_status("Task execution cancelled by Esc key.", status="warning")
                     continue
 
                 if response_msg is None:
@@ -1258,17 +1263,29 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
 
                         if not task.context:
                             task.last_observation = result
-                            response_msg = await continue_task_after_confirmation(
-                                agent, task, result, history, session=memory_session, runtime=runtime
+                            cancelled, response_msg = await run_with_esc_cancellation(
+                                continue_task_after_confirmation(
+                                    agent, task, result, history, session=memory_session, runtime=runtime
+                                ),
+                                status_text="Executing... (Press Esc to cancel)",
                             )
+                            if cancelled:
+                                state.status = "Ready"
+                                break
                         else:
-                            run_res = await runtime.execute(
-                                agent,
-                                task.goal,
-                                history,
-                                task=task,
-                                session=memory_session,
+                            cancelled, run_res = await run_with_esc_cancellation(
+                                runtime.execute(
+                                    agent,
+                                    task.goal,
+                                    history,
+                                    task=task,
+                                    session=memory_session,
+                                ),
+                                status_text="Repairing... (Press Esc to cancel)",
                             )
+                            if cancelled:
+                                state.status = "Ready"
+                                break
                             response_msg = run_res.message
                             if response_msg is None:
                                 response_msg = ChatMessage(
@@ -1281,9 +1298,15 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
                         # back as an observation and the agent continues working
                         # toward the goal until TaskState reports it complete.
                         UI.render_tool_activity(action.action_type, action.target)
-                        response_msg = await continue_task_after_confirmation(
-                            agent, task, result, history, session=memory_session, runtime=runtime
+                        cancelled, response_msg = await run_with_esc_cancellation(
+                            continue_task_after_confirmation(
+                                agent, task, result, history, session=memory_session, runtime=runtime
+                            ),
+                            status_text="Executing... (Press Esc to cancel)",
                         )
+                        if cancelled:
+                            state.status = "Ready"
+                            break
                     else:
                         # No task (e.g. SimpleAgent path) — behave cleanly:
                         if action.action_type in ("web_search", "search_web", "fetch_page", "fetch_page_text", "retrieve"):
