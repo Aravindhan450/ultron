@@ -152,8 +152,8 @@ class MemoryProvider(BaseModel):
             line = r.to_prompt_line()
             items.append(
                 ContextItem(
-                    source_type=ContextSourceType.PROJECT_MEMORY,
-                    priority=ContextPriority.GENERAL_REPO,
+                    source_type=ContextSourceType.LONG_TERM_MEMORY,
+                    priority=ContextPriority.LONG_TERM_MEMORY,
                     title=f"Long-Term Memory ({r.name})",
                     content=line,
                     target=r.name,

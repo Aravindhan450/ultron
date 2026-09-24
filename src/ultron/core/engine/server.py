@@ -253,3 +253,110 @@ class LlamaServerManager:
             except OSError:
                 pass
             self._log_fh = None
+
+    @classmethod
+    def terminate_running_servers(
+        cls,
+        port: int | None = None,
+        host: str | None = None,
+        timeout: float = 3.0,
+    ) -> list[int]:
+        """
+        Finds and terminates any llama-server processes listening on the target port
+        or matching the configured endpoint. Ensures the port is freed.
+        """
+        target_port = port if port is not None else settings.llama_server_port
+        killed_pids: list[int] = []
+
+        candidate_pids: set[int] = set()
+
+        # 1. Identify candidate PIDs listening on target port via lsof
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-ti", f":{target_port}", "-sTCP:LISTEN"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for p in out.splitlines():
+                p_str = p.strip()
+                if p_str.isdigit():
+                    candidate_pids.add(int(p_str))
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            pass
+
+        # 2. Identify candidate PIDs matching llama-server via pgrep
+        try:
+            out = subprocess.check_output(
+                ["pgrep", "-fl", "llama-server"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                parts = line.strip().split(None, 1)
+                if parts and parts[0].isdigit():
+                    pid = int(parts[0])
+                    cmd = parts[1] if len(parts) > 1 else ""
+                    if (
+                        f"{target_port}" in cmd
+                        or f":{target_port}" in cmd
+                        or (target_port == 8080 and "--port" not in cmd and "-p" not in cmd)
+                    ):
+                        candidate_pids.add(pid)
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            pass
+
+        # 3. Filter candidates to strictly verify they are llama-server processes
+        llama_pids: list[int] = []
+        for pid in candidate_pids:
+            try:
+                cmd = subprocess.check_output(
+                    ["ps", "-p", str(pid), "-o", "command="],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+                if "llama-server" in cmd or "llama_server" in cmd:
+                    llama_pids.append(pid)
+            except (subprocess.SubprocessError, FileNotFoundError, OSError):
+                pass
+
+        # 4. Terminate each identified llama-server process
+        for pid in llama_pids:
+            logger.info("Terminating running llama-server process on port %d (PID %d)...", target_port, pid)
+            try:
+                try:
+                    pgid = os.getpgid(pid)
+                    os.killpg(pgid, signal.SIGTERM)
+                except OSError:
+                    os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except OSError as e:
+                logger.warning("Failed to send SIGTERM to llama-server PID %d: %s", pid, e)
+
+            # Wait up to timeout for clean exit
+            start = time.monotonic()
+            exited = False
+            while time.monotonic() - start < timeout:
+                try:
+                    os.kill(pid, 0)
+                    time.sleep(0.1)
+                except ProcessLookupError:
+                    exited = True
+                    break
+                except OSError:
+                    break
+
+            if not exited:
+                logger.warning("llama-server PID %d did not exit within %ss; sending SIGKILL.", pid, timeout)
+                try:
+                    try:
+                        pgid = os.getpgid(pid)
+                        os.killpg(pgid, signal.SIGKILL)
+                    except OSError:
+                        os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+
+            killed_pids.append(pid)
+
+        return killed_pids

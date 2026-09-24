@@ -124,6 +124,12 @@ Rules:
   completion_criteria and verification_requirements (complex tasks).
 - Use at least one step for a final verification of the user goal."""
 
+_PLANNING_BYPASS_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|never|avoid)\b[^.!?;\n]{0,120}\bplan(?:ning)?\b"
+    r"|\bno\s+plan(?:ning)?\b",
+    re.IGNORECASE,
+)
+
 
 def detect_workspace_kind(cwd: str | None = None) -> WorkspaceKind:
     """
@@ -853,7 +859,7 @@ async def prepare_task_for_execution(
     returning a TaskState ready for plan-aware execution.
     """
     # Explicit user instruction to bypass planning
-    if re.search(r"\b(do not|don't|no)\s+(create\s+a\s+plan|plan|scaffold)\b", user_input, re.IGNORECASE):
+    if _PLANNING_BYPASS_RE.search(user_input):
         logger.info("[PLANNING_BYPASS] User explicitly requested no planning")
         return None
 

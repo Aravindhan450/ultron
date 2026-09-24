@@ -53,6 +53,7 @@ class TaskEventType(str, Enum):
 
     # Context & Planning
     CONTEXT_RESOLVED = "context_resolved"
+    CONTEXT_BUILT = "context_built"
     PLAN_PROPOSED = "plan_proposed"
     PLAN_VALIDATED = "plan_validated"
     PLAN_REVISED = "plan_revised"

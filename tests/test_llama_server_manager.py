@@ -156,3 +156,31 @@ def test_stop_owned_process(monkeypatch):
     assert manager._process is None
     assert manager._owned is False
 
+
+def test_terminate_running_servers(monkeypatch):
+    killed_sigs = []
+
+    def mock_check_output(cmd, **kwargs):
+        if cmd[0] == "lsof":
+            return "54321\n"
+        if cmd[0] == "ps":
+            return "/path/to/llama-server --port 8080"
+        return ""
+
+    def mock_killpg(pgid, sig):
+        killed_sigs.append((pgid, sig))
+
+    def mock_kill(pid, sig):
+        if sig == 0:
+            # Process exited
+            raise ProcessLookupError()
+        killed_sigs.append((pid, sig))
+
+    monkeypatch.setattr("subprocess.check_output", mock_check_output)
+    monkeypatch.setattr("os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("os.killpg", mock_killpg)
+    monkeypatch.setattr("os.kill", mock_kill)
+
+    LlamaServerManager.terminate_running_servers(port=8080)
+    assert (54321, 15) in killed_sigs
+

@@ -496,12 +496,90 @@ def test_prompt_instructing_do_not_plan_bypasses_planning():
     async def _test():
         from ultron.core.intelligence.task_planning import prepare_task_for_execution
 
-        prompt = (
-            "I am testing the canonical TaskState and durable EventStore integration. "
-            "Do not create a plan. Do not create files. Report the actual TaskState."
+        # Case 1 — short explicit bypass
+        p1 = "Do not create a plan. Do not modify files."
+        assert await prepare_task_for_execution(p1, None) is None
+
+        # Case 2 — long-form bypass
+        p2 = (
+            "Perform a final black-box validation. "
+            "Do NOT create a software implementation plan. "
+            "Do NOT modify files. Inspect the repository and report the actual state."
         )
-        task = await prepare_task_for_execution(prompt, None)
-        assert task is None
+        assert await prepare_task_for_execution(p2, None) is None
+
+        # Additional natural-language bypass variants
+        variants = [
+            "Do not create a plan.",
+            "Do not create a software implementation plan.",
+            "Do NOT create a software implementation plan.",
+            "Don't plan this.",
+            "Don't create a plan.",
+            "Never create a plan.",
+            "Avoid planning this.",
+            "No planning.",
+            "No plan.",
+        ]
+        for v in variants:
+            assert await prepare_task_for_execution(v, None) is None, f"Failed bypass for: {v}"
+
+        # Case 3 — legitimate planning
+        p3 = "Build a new feature that requires modifying several files and then test it."
+        task3 = await prepare_task_for_execution(p3, None)
+        assert task3 is not None
+        assert task3.plan is not None
+
+        # Case 4 — unrelated use of "plan"
+        unrelated = [
+            "We plan to release tomorrow. Build the login feature.",
+            "The floor plan is ready. Create the app.",
+            "I plan on deploying this application.",
+            "Do you have a plan for authentication? Build the auth module.",
+        ]
+        for u in unrelated:
+            task_u = await prepare_task_for_execution(u, None)
+            assert task_u is not None, f"Planning should not be bypassed for: {u}"
+            assert task_u.plan is not None
+
+    asyncio.run(_test())
+
+
+def test_production_path_no_plan_regression():
+    """Case 5: Production-path regression testing full orchestration."""
+    async def _test():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = JsonlEventStore(base_dir=tmpdir)
+            bus = EventBus(store=store)
+            runtime = AgentRuntime(event_bus=bus)
+
+            prompt = (
+                "Perform a final black-box validation. "
+                "Do NOT create a software implementation plan. "
+                "Do NOT modify files. Inspect the repository and report the actual state."
+            )
+
+            # Step 1: Production task preparation
+            from ultron.core.intelligence.task_planning import (
+                prepare_task_for_execution,
+            )
+            prepared_task = await prepare_task_for_execution(prompt, None)
+            assert prepared_task is None, "Planning must be bypassed during task preparation"
+
+            # Step 2: Agent execution through AgentRuntime
+            agent = FakeAgent(ChatMessage(role=Role.ASSISTANT, content="Validation complete. All states verified."))
+            run_res = await runtime.execute(agent, prompt, task=prepared_task)
+
+            # Verify no plan_step_failed occurred and task completed cleanly
+            task = run_res.task_state
+            assert task is not None
+            assert task.plan is None
+            assert "plan_step_failed" not in task.lifecycle_history
+            assert not any(err.message == "plan_step_failed" for err in task.errors)
+            assert task.lifecycle_status in (
+                TaskLifecycleStatus.READY,
+                TaskLifecycleStatus.EXECUTING,
+                TaskLifecycleStatus.COMPLETED,
+            )
 
     asyncio.run(_test())
 

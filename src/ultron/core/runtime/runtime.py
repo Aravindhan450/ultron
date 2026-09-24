@@ -199,6 +199,10 @@ class AgentRuntime:
             if hasattr(agent.engine, "set_model"):
                 agent.engine.set_model(handle.model_spec.model_id)
 
+            # Update context manager budget with model's recommended context length
+            if hasattr(self, "context_manager") and self.context_manager:
+                self.context_manager.budget.model_context_limit = handle.model_spec.recommended_context_length
+
             if task:
                 task.selected_model = decision.selected_model.model_id
                 task.routing_decision = {
@@ -301,6 +305,24 @@ class AgentRuntime:
             session=session,
         )
 
+        # Emit CONTEXT_BUILT event with sanitized summary metadata
+        await self.event_bus.emit(
+            TaskEvent(
+                task_id=task.task_id,
+                event_type=TaskEventType.CONTEXT_BUILT,
+                payload={
+                    "total_estimated_tokens": context_snapshot.total_estimated_tokens,
+                    "total_characters": context_snapshot.total_characters,
+                    "items_count": len(context_snapshot.items),
+                    "dropped_items_count": context_snapshot.dropped_items_count,
+                    "compacted": context_snapshot.compacted,
+                    "source_contributions": context_snapshot.source_contributions,
+                    "model_context_limit": self.context_manager.budget.model_context_limit,
+                },
+                source="context_manager",
+            )
+        )
+
         # Check early cancellation
         if token.is_cancelled:
             run_state.request_cancellation(token.reason or "Cancelled before start")
@@ -324,7 +346,7 @@ class AgentRuntime:
             )
 
         # Prepare execution coroutine with agent
-        # We pass task/session/context_snapshot/budget/token/event_bus/run_state if the agent's run() supports it
+        # We pass task/session/context_snapshot/context_manager/budget/token/event_bus/run_state if the agent's run() supports it
         async def _run_agent() -> ChatMessage:
             kwargs: dict[str, Any] = {}
             import inspect
@@ -338,6 +360,8 @@ class AgentRuntime:
                 kwargs["session"] = session
             if has_varkw or "context_snapshot" in sig.parameters:
                 kwargs["context_snapshot"] = context_snapshot
+            if has_varkw or "context_manager" in sig.parameters:
+                kwargs["context_manager"] = self.context_manager
             if has_varkw or "budget" in sig.parameters:
                 kwargs["budget"] = active_budget
             if has_varkw or "cancellation_token" in sig.parameters:
@@ -441,6 +465,9 @@ class AgentRuntime:
                             source="runtime",
                         )
                     )
+
+            if response_msg is not None and getattr(response_msg, "task_state", None) is None:
+                response_msg.task_state = resolved_task
 
             return RunResult(
                 run_id=run_id,

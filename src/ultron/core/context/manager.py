@@ -19,6 +19,7 @@ from ultron.core.context.models import (
     ContextSourceType,
 )
 from ultron.core.context.retrieval import RepositoryRetriever, estimate_tokens
+from ultron.core.types import ChatMessage, Role
 
 if TYPE_CHECKING:
     from ultron.core.coding.context import CodeContext
@@ -30,8 +31,11 @@ if TYPE_CHECKING:
 
 
 class ContextBudgetConfig(BaseModel):
-    """Token budget limits for repository-aware context assembly."""
+    """Token budget limits for repository-aware context assembly and model interaction."""
 
+    model_context_limit: int = 16384
+    reserved_output_tokens: int = 2048
+    max_tool_output_tokens: int = 1000
     max_total_tokens: int = 4000
     max_file_tokens: int = 1500
     max_search_tokens: int = 800
@@ -44,7 +48,7 @@ class ContextBudgetConfig(BaseModel):
 class RepositoryContextManager:
     """
     Assembles evidence-based model context across repository, task, git,
-    files, symbols, and observations.
+    files, symbols, and observations, and enforces model context budgeting.
     """
 
     def __init__(
@@ -127,6 +131,44 @@ class RepositoryContextManager:
                 )
             )
 
+            # 2b. Granular Active Plan Step (Priority 2)
+            if task.plan is not None:
+                active_step = task.current_plan_step()
+                if active_step:
+                    step_desc = f"Step {active_step.id}: {active_step.description} (Status: {active_step.status.value})"
+                    raw_items.append(
+                        ContextItem(
+                            source_type=ContextSourceType.ACTIVE_PLAN_STEP,
+                            priority=ContextPriority.ACTIVE_PLAN_STEP,
+                            title=f"Plan Step {active_step.id}",
+                            content=step_desc,
+                            target=f"plan_step_{active_step.id}",
+                            estimated_tokens=estimate_tokens(step_desc),
+                        )
+                    )
+
+            # 2c. Granular Latest Failure (Priority 3)
+            latest_err = None
+            if hasattr(task, "errors") and task.errors:
+                latest_err = task.errors[-1]
+            elif hasattr(task, "execution_history") and task.execution_history:
+                for exec_entry in reversed(task.execution_history):
+                    if not exec_entry.success:
+                        latest_err = exec_entry
+                        break
+            if latest_err is not None:
+                err_msg = getattr(latest_err, "message", None) or getattr(latest_err, "detail", None) or str(latest_err)
+                raw_items.append(
+                    ContextItem(
+                        source_type=ContextSourceType.FAILURE,
+                        priority=ContextPriority.LATEST_FAILURE,
+                        title="Latest Failure Evidence",
+                        content=f"Failure: {err_msg}",
+                        target="latest_failure",
+                        estimated_tokens=estimate_tokens(f"Failure: {err_msg}"),
+                    )
+                )
+
         # 3. Workspace Summary & Config
         ws = self.retriever.workspace
         ws_summary = ws.summary()
@@ -181,7 +223,7 @@ class RepositoryContextManager:
                 raw_items.append(
                     ContextItem(
                         source_type=ContextSourceType.OBSERVATION,
-                        priority=ContextPriority.TESTS_AND_OBSERVATIONS,
+                        priority=ContextPriority.RECENT_OBSERVATIONS,
                         title="Recent Observations",
                         content=obs_body,
                         target="observations",
@@ -381,3 +423,149 @@ class RepositoryContextManager:
         )
 
         return accepted, snapshot
+
+    def budget_messages(
+        self,
+        messages: list[ChatMessage],
+        model_context_limit: int | None = None,
+        reserved_output_tokens: int | None = None,
+    ) -> tuple[list[ChatMessage], dict[str, Any]]:
+        """
+        Enforces hard token budgeting on conversation messages before sending to model.
+
+        Ensures:
+          estimated_input_tokens + reserved_output_tokens <= model_context_limit
+
+        Strategy:
+        1. Truncate oversized single TOOL observations preserving head and tail.
+        2. Protect critical anchors:
+           - System prompt (messages[0] if Role.SYSTEM)
+           - User original goal / prompt (first Role.USER message)
+        3. If still over budget, condense/drop older intermediate dialogue & tool pairs
+           starting from oldest history toward recent.
+        4. If single system message or user prompt still exceeds available budget,
+           compact system message or user prompt keeping critical instructions/goal.
+
+        Returns:
+            (budgeted_messages, metadata_dict)
+        """
+        limit = model_context_limit or self.budget.model_context_limit
+        reserved = reserved_output_tokens or self.budget.reserved_output_tokens
+        max_input_tokens = max(100, limit - reserved)
+
+        if not messages:
+            return [], {
+                "input_tokens": 0,
+                "model_limit": limit,
+                "reserved_output_tokens": reserved,
+                "dropped_messages": 0,
+                "truncated_tool_messages": 0,
+            }
+
+        # Step 1: Pre-process and truncate oversized TOOL messages
+        max_tool_tokens = self.budget.max_tool_output_tokens
+        processed: list[ChatMessage] = []
+        truncated_tools_count = 0
+
+        for msg in messages:
+            if msg.role == Role.TOOL:
+                tok = estimate_tokens(msg.content)
+                if tok > max_tool_tokens:
+                    # Truncate retaining head & tail
+                    half_chars = max(50, (max_tool_tokens * 4) // 2 - 40)
+                    head = msg.content[:half_chars].rstrip()
+                    tail = msg.content[-half_chars:].lstrip()
+                    clipped = f"{head}\n... [truncated {len(msg.content)} chars, retained head & tail] ...\n{tail}"
+                    processed.append(
+                        ChatMessage(
+                            role=msg.role,
+                            name=msg.name,
+                            content=clipped,
+                            tool_call_id=msg.tool_call_id,
+                        )
+                    )
+                    truncated_tools_count += 1
+                else:
+                    processed.append(msg)
+            else:
+                processed.append(msg)
+
+        # Helper to compute total tokens
+        def calc_total_tokens(msgs: list[ChatMessage]) -> int:
+            return sum(estimate_tokens(m.content) for m in msgs)
+
+        current_tokens = calc_total_tokens(processed)
+        if current_tokens <= max_input_tokens:
+            return processed, {
+                "input_tokens": current_tokens,
+                "model_limit": limit,
+                "reserved_output_tokens": reserved,
+                "dropped_messages": 0,
+                "truncated_tool_messages": truncated_tools_count,
+            }
+
+        # Step 2: Separate anchor messages and intermediate dialogue
+        # Anchor 1: System prompt (if role == SYSTEM at index 0)
+        has_system = len(processed) > 0 and processed[0].role == Role.SYSTEM
+
+        # Anchor 2: User initial task/goal message
+        user_idx = -1
+        for idx in range(1 if has_system else 0, len(processed)):
+            if processed[idx].role == Role.USER:
+                user_idx = idx
+                break
+
+        # Protected indices
+        protected_indices = set()
+        if has_system:
+            protected_indices.add(0)
+        if user_idx != -1:
+            protected_indices.add(user_idx)
+
+        # Intermediate messages that can be pruned (from oldest to newest)
+        # We preserve recent messages by dropping oldest prunable messages first
+        prunable_indices = [i for i in range(len(processed)) if i not in protected_indices]
+        dropped_messages_count = 0
+
+        # Create active copy of messages
+        active_msgs = list(processed)
+        # Drop oldest prunable until within budget or no prunable remain
+        while calc_total_tokens(active_msgs) > max_input_tokens and prunable_indices:
+            idx_to_drop = prunable_indices.pop(0)
+            # Find and remove
+            target_msg = processed[idx_to_drop]
+            if target_msg in active_msgs:
+                active_msgs.remove(target_msg)
+                dropped_messages_count += 1
+
+        # Step 3: If STILL over budget (e.g. huge system message or user prompt or remaining dialogue)
+        current_tokens = calc_total_tokens(active_msgs)
+        if current_tokens > max_input_tokens:
+            for i, msg in reversed(list(enumerate(active_msgs))):
+                if current_tokens <= max_input_tokens:
+                    break
+                excess = current_tokens - max_input_tokens
+                msg_tok = estimate_tokens(msg.content)
+                avail_tok = max(10, msg_tok - excess)
+                avail_chars = max(20, avail_tok * 4)
+                new_content = msg.content[:avail_chars].rstrip() + " ... [truncated]"
+                # Keep shaving if estimation still exceeds
+                while estimate_tokens(new_content) > avail_tok and avail_chars > 20:
+                    avail_chars -= 10
+                    new_content = msg.content[:avail_chars].rstrip() + " ... [truncated]"
+                active_msgs[i] = ChatMessage(
+                    role=msg.role,
+                    name=msg.name,
+                    content=new_content,
+                    tool_call_id=msg.tool_call_id,
+                )
+                current_tokens = calc_total_tokens(active_msgs)
+
+        return active_msgs, {
+            "input_tokens": calc_total_tokens(active_msgs),
+            "model_limit": limit,
+            "reserved_output_tokens": reserved,
+            "dropped_messages": dropped_messages_count,
+            "truncated_tool_messages": truncated_tools_count,
+        }
+

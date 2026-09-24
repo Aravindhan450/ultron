@@ -18,38 +18,81 @@ from pydantic import BaseModel, Field
 class ContextSourceType(str, Enum):
     """Origin category of a context item."""
 
+    # Static instructions
+    SYSTEM = "system"
+
+    # Task & planning
     USER_TASK = "user_task"
+    ACTIVE_PLAN_STEP = "active_plan_step"
+
+    # Failures & verification
+    FAILURE = "failure"
+    VERIFICATION = "verification"
+
+    # Repository & code
     FILE_CONTENT = "file_content"
     SYMBOL_DEFINITION = "symbol_definition"
     SYMBOL_REFERENCE = "symbol_reference"
     SEARCH_RESULT = "search_result"
     GIT_STATE = "git_state"
     CHANGES_AND_DIFF = "changes_and_diff"
+    PROJECT_CONFIG = "project_config"
+
+    # Dialogue & history
+    RECENT_DIALOGUE = "recent_dialogue"
+    OLDER_HISTORY = "older_history"
+
+    # Observations & artifacts
     OBSERVATION = "observation"
+    TOOL_OBSERVATION = "tool_observation"
     TEST_RESULT = "test_result"
     ARTIFACT = "artifact"
-    PROJECT_CONFIG = "project_config"
+
+    # Long-term memory
     PROJECT_MEMORY = "project_memory"
     SESSION_MEMORY = "session_memory"
+    LONG_TERM_MEMORY = "long_term_memory"
 
 
 class ContextPriority(int, Enum):
     """
-    Deterministic priority ordering for context assembly.
+    Deterministic priority ordering for context assembly per Gap Closure Plan:
+    1. CURRENT TASK
+    2. ACTIVE PLAN STEP
+    3. LATEST FAILURE
+    4. RELEVANT REPOSITORY CONTEXT (direct files, symbols, diffs, search)
+    5. RECENT DIALOGUE / OBSERVATIONS
+    6. OLDER HISTORY / ARTIFACTS / ENVIRONMENT CONFIG
+    7. LONG-TERM MEMORY (project memory, session memory)
+
     Lower number = higher priority (retained first under budget constraints).
     """
 
+    SYSTEM = 0
     USER_TASK = 1
-    DIRECT_FILE = 2
-    SYMBOL = 3
-    SEARCH = 4
-    CHANGES_AND_DIFF = 5
-    TESTS_AND_OBSERVATIONS = 6
-    PROJECT_CONFIG = 7
-    ARTIFACTS = 8
-    PROJECT_MEMORY = 9
-    SESSION_MEMORY = 10
-    GENERAL_REPO = 11
+    ACTIVE_PLAN_STEP = 2
+    LATEST_FAILURE = 3
+
+    # Repository context
+    DIRECT_FILE = 4
+    SYMBOL = 5
+    CHANGES_AND_DIFF = 6
+    SEARCH = 7
+
+    # Recent observations & dialogue
+    RECENT_OBSERVATIONS = 8
+    RECENT_DIALOGUE = 9
+
+    # Older history & configuration
+    PROJECT_CONFIG = 10
+    OLDER_HISTORY = 11
+    ARTIFACTS = 12
+    GENERAL_REPO = 13
+
+    # Long-term memory
+    PROJECT_MEMORY = 14
+    SESSION_MEMORY = 15
+    LONG_TERM_MEMORY = 16
 
 
 class ContextItem(BaseModel):

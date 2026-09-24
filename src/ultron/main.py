@@ -1360,7 +1360,7 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
                 history.append(ChatMessage(role=Role.USER, content=trimmed_input))
                 history.append(ChatMessage(role=Role.ASSISTANT, content=final_content))
 
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, EOFError):
                 reflow.stop()
                 UI.render_status("Chat interrupted. Goodbye.", status="warning")
                 break
@@ -1368,10 +1368,16 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
                 logger.error(f"Error during chat execution: {e}")
                 UI.render_error(str(e), title="Runtime Error")
 
-
     finally:
-        # Phase 3.5: Cleanup dynamically loaded models
+        # Phase 3.5: Cleanup dynamically loaded models and terminate running llama-server
         lifecycle_manager.shutdown()
+        if not no_server:
+            from ultron.core.engine.server import LlamaServerManager
+
+            LlamaServerManager.terminate_running_servers(
+                port=settings.llama_server_port,
+                host=settings.llama_server_host,
+            )
 
 @app.command()
 def chat(
@@ -1393,11 +1399,21 @@ def chat(
         help="Enable verbose console logging.",
     ),
 ):
-
-
+    import atexit
     import os
+
+    from ultron.core.engine.server import LlamaServerManager
+
     env_no_server = os.environ.get("ULTRON_NO_SERVER", "").lower() in ("1", "true", "yes")
     effective_no_server = no_server or env_no_server
+
+    if not effective_no_server:
+        atexit.register(
+            lambda: LlamaServerManager.terminate_running_servers(
+                port=settings.llama_server_port,
+                host=settings.llama_server_host,
+            )
+        )
 
     async def _run_chat_session():
         # Dynamic Runtime Integration (Phase 3.5)
@@ -1405,9 +1421,23 @@ def chat(
         kwargs = {"agent_type": agent, "no_server": effective_no_server}
         if verbose:
             kwargs["verbose"] = True
-        await async_chat(**kwargs)
+        try:
+            await async_chat(**kwargs)
+        finally:
+            if not effective_no_server:
+                LlamaServerManager.terminate_running_servers(
+                    port=settings.llama_server_port,
+                    host=settings.llama_server_host,
+                )
 
-    asyncio.run(_run_chat_session())
+    try:
+        asyncio.run(_run_chat_session())
+    finally:
+        if not effective_no_server:
+            LlamaServerManager.terminate_running_servers(
+                port=settings.llama_server_port,
+                host=settings.llama_server_host,
+            )
 
 
 @app.command()

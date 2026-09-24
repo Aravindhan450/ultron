@@ -120,6 +120,14 @@ class ModelLifecycleManager:
                 )
             
             try:
+                # Terminate any lingering server process on target port to prevent port collision
+                from ultron.core.config import settings
+
+                LlamaServerManager.terminate_running_servers(
+                    port=settings.llama_server_port,
+                    host=settings.llama_server_host,
+                )
+
                 # Use LlamaServerManager to manage the subprocess
                 model_path = model_spec.resolve_path(self.models_dir)
                 
@@ -184,3 +192,16 @@ class ModelLifecycleManager:
         with self._lock:
             if self._active_spec:
                 self.release(self._active_spec.model_id)
+            if self._active_server:
+                try:
+                    self._active_server.stop()
+                except (OSError, RuntimeError) as e:
+                    logger.warning("Error stopping active server during shutdown: %s", e)
+                self._active_server = None
+            if not self.no_server:
+                from ultron.core.config import settings
+
+                LlamaServerManager.terminate_running_servers(
+                    port=settings.llama_server_port,
+                    host=settings.llama_server_host,
+                )

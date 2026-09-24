@@ -1038,6 +1038,7 @@ class ReActAgent(BaseAgent):
         task: TaskState | None = None,
         session: SessionMemory | None = None,
         context_snapshot: Any | None = None,
+        context_manager: Any | None = None,
         budget: Any | None = None,
         cancellation_token: Any | None = None,
         event_bus: Any | None = None,
@@ -1181,17 +1182,31 @@ class ReActAgent(BaseAgent):
                     )
                 )
 
+            # Phase 2: Token Budgeting & Compaction before every model call
+            model_messages = messages
+            if context_manager is not None and hasattr(context_manager, "budget_messages"):
+                model_messages, budget_meta = context_manager.budget_messages(messages)
+                if event_bus is not None:
+                    event_bus.emit_sync(
+                        RuntimeEvent(
+                            event_type=RuntimeEventType.CONTEXT_BUILT,
+                            run_id=getattr(run_state, "run_id", "run_unknown"),
+                            task_id=getattr(task, "task_id", None) or getattr(run_state, "task_id", None),
+                            payload=budget_meta,
+                        )
+                    )
+
             if event_bus is not None:
                 event_bus.emit_sync(
                     RuntimeEvent(
                         event_type=RuntimeEventType.MODEL_CALLED,
                         run_id=getattr(run_state, "run_id", "run_unknown"),
                         task_id=getattr(task, "task_id", None) or getattr(run_state, "task_id", None),
-                        payload={"messages_count": len(messages)},
+                        payload={"messages_count": len(model_messages)},
                     )
                 )
 
-            response = (await self.engine.generate(history_to_openai_format(messages))) or ""
+            response = (await self.engine.generate(history_to_openai_format(model_messages))) or ""
             logger.info("ReAct iteration %d model response: %r", active_budget.iterations_used, response[:250])
 
             if cancellation_token is not None:
