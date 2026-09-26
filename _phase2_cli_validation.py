@@ -241,6 +241,12 @@ def run_scenario(name: str) -> int:
     env.pop("ULTRON_NO_SERVER", None)
     env["ULTRON_VERBOSE"] = "0"
 
+    try:
+        from ultron.core.engine.server import LlamaServerManager
+        LlamaServerManager.terminate_running_servers()
+    except Exception:  # noqa: BLE001, S110
+        pass
+
     proc = subprocess.Popen(
         [python_exe, "-m", "ultron.main", "chat"],
         stdin=slave,
@@ -366,6 +372,11 @@ def run_scenario(name: str) -> int:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        try:
+            from ultron.core.engine.server import LlamaServerManager
+            LlamaServerManager.terminate_running_servers()
+        except Exception:  # noqa: BLE001, S110
+            pass
         os.close(master)
         os.close(slave)
 

@@ -160,6 +160,14 @@ def _count_action_verbs(text: str) -> int:
 
 def _classify_deterministic(text: str) -> TaskType | None:
     """Returns the best task type from rules, or None when ambiguous."""
+    if re.match(r"^\s*(?:please\s+)?remember\b", text, re.IGNORECASE):
+        return TaskType.SIMPLE_ACTION
+    if re.search(
+        r"\b(?:without\s+(?:using\s+)?(?:any\s+)?tools?|no\s+tools?|don'?t\s+use\s+(?:any\s+)?tools?)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return TaskType.INFORMATIONAL
     if _DEBUG_VERBS_RE.search(text) or (
         _FIX_VERBS_RE.search(text) and _FAILURE_NOUNS_RE.search(text)
     ) or (_FAILURE_NOUNS_RE.search(text) and _WHY_RE.search(text)):
