@@ -203,6 +203,12 @@ class AgentRuntime:
             if hasattr(self, "context_manager") and self.context_manager:
                 self.context_manager.budget.model_context_limit = handle.model_spec.recommended_context_length
 
+            # Propagate the routed model's context limit to the authoritative
+            # model-call boundary (the engine decorator) so every model call
+            # enforces the correct per-model limit — not a static default.
+            if hasattr(agent.engine, "set_context_limit"):
+                agent.engine.set_context_limit(handle.model_spec.recommended_context_length)
+
             if task:
                 task.selected_model = decision.selected_model.model_id
                 task.routing_decision = {
@@ -311,6 +317,10 @@ class AgentRuntime:
                 task_id=task.task_id,
                 event_type=TaskEventType.CONTEXT_BUILT,
                 payload={
+                    # Distinct purpose from the per-model-call budget event:
+                    # this is the assembled repository-context snapshot.
+                    "kind": "context_snapshot",
+                    "caller": "runtime_snapshot",
                     "total_estimated_tokens": context_snapshot.total_estimated_tokens,
                     "total_characters": context_snapshot.total_characters,
                     "items_count": len(context_snapshot.items),
@@ -376,11 +386,16 @@ class AgentRuntime:
         agent_coro = _run_agent()
         timeout_seconds = active_budget.timeout_seconds
 
+        from ultron.core.context.invocation import model_call_scope
+
         try:
-            if timeout_seconds is not None and timeout_seconds > 0:
-                response_msg = await asyncio.wait_for(agent_coro, timeout=timeout_seconds)
-            else:
-                response_msg = await agent_coro
+            # Bind the observability scope for the whole run so BudgetedEngine
+            # can emit a CONTEXT_BUILT event for every model call made inside it.
+            with model_call_scope(self.event_bus, task_id, run_id):
+                if timeout_seconds is not None and timeout_seconds > 0:
+                    response_msg = await asyncio.wait_for(agent_coro, timeout=timeout_seconds)
+                else:
+                    response_msg = await agent_coro
 
             # If cancellation was requested cooperatively during execution, raise
             if token.is_cancelled:

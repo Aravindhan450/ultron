@@ -8,8 +8,18 @@ Provides evidence-based repository discovery, file/symbol/search retrieval,
 prioritization, deduplication, token budgeting, and compaction.
 """
 
-from ultron.core.context.manager import (
+from ultron.core.context.budget import (
     ContextBudgetConfig,
+    budget_messages,
+    budget_openai_messages,
+)
+from ultron.core.context.invocation import (
+    BudgetedEngine,
+    ModelCallScope,
+    ensure_budgeted_engine,
+    model_call_scope,
+)
+from ultron.core.context.manager import (
     RepositoryContextManager,
 )
 from ultron.core.context.models import (
@@ -26,6 +36,7 @@ from ultron.core.context.retrieval import (
 )
 
 __all__ = [
+    "BudgetedEngine",
     "ContextBudgetConfig",
     "ContextItem",
     "ContextPriority",
@@ -33,7 +44,12 @@ __all__ = [
     "ContextRetrievalStatus",
     "ContextSnapshot",
     "ContextSourceType",
+    "ModelCallScope",
     "RepositoryContextManager",
     "RepositoryRetriever",
+    "budget_messages",
+    "budget_openai_messages",
+    "ensure_budgeted_engine",
     "estimate_tokens",
+    "model_call_scope",
 ]

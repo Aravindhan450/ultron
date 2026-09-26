@@ -106,7 +106,10 @@ async def synthesize_observation(
 
     if engine is not None:
         try:
-            raw = await engine.generate(messages)
+            from ultron.core.context.invocation import model_caller
+
+            with model_caller("synthesis"):
+                raw = await engine.generate(messages)
             if raw and raw.strip():
                 return polish_response(strip_internal_thought(raw))
         except Exception as exc:  # noqa: BLE001 — fallback to unformatted observation on model failure

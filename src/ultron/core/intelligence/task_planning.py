@@ -808,10 +808,13 @@ async def generate_task_plan(
         len(goal),
     )
 
+    from ultron.core.context.invocation import model_caller
+
     plan: TaskPlan | None = None
     if engine is not None:
         try:
-            raw = await engine.generate([{"role": "user", "content": prompt}])
+            with model_caller("plan_generation"):
+                raw = await engine.generate([{"role": "user", "content": prompt}])
             logger.info("[PLAN_GENERATION] received %d chars from engine", len(raw or ""))
             plan = parse_plan_json(raw, goal, task_type, ws, context)
             if plan is not None:
@@ -833,7 +836,8 @@ async def generate_task_plan(
                     f"IMPORTANT CORRECTION: Your previous plan was invalid ({'; '.join(issue_msgs[:3])}). "
                     "Please correct the issues and output ONLY a valid JSON object matching the plan schema."
                 )
-                retry_raw = await engine.generate([{"role": "user", "content": recovery_prompt}])
+                with model_caller("plan_recovery"):
+                    retry_raw = await engine.generate([{"role": "user", "content": recovery_prompt}])
                 retry_plan = parse_plan_json(retry_raw, goal, task_type, ws, context)
                 if retry_plan is not None and validate_plan(retry_plan).valid:
                     logger.info(

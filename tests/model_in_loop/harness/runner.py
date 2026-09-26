@@ -100,7 +100,13 @@ class MITLRunner:
             default_budget=RuntimeBudget(max_iterations=self.max_iterations, timeout_seconds=self.timeout),
         )
 
-        agent = ReActAgent(engine=self.engine, max_iterations=self.max_iterations)
+        from ultron.core.context.invocation import BudgetedEngine
+
+        # Budgeting is owned by the authoritative model-call boundary.
+        agent = ReActAgent(
+            engine=BudgetedEngine(self.engine, cm.budget),
+            max_iterations=self.max_iterations,
+        )
         task = TaskState(goal=scenario.prompt, task_type=TaskType.DEBUGGING)
         code_ctx = CodeContext(workspace=sandbox.workspace)
         code_ctx.attach_task(task)

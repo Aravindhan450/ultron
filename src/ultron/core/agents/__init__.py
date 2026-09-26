@@ -1,6 +1,7 @@
 from ultron.core.agents.base import BaseAgent
 from ultron.core.agents.react import ReActAgent
 from ultron.core.agents.simple import SimpleAgent
+from ultron.core.context.invocation import ensure_budgeted_engine
 from ultron.core.engine import get_engine
 
 # Single source of truth for which agent types exist. The CLI (/agent command)
@@ -21,8 +22,13 @@ def get_agent(agent_type: str = "simple", engine=None) -> BaseAgent:
         engine: Optional engine to reuse — preserves live model/backend state
             (e.g. a model chosen via /model). Defaults to a fresh engine from
             the active settings.
+
+    The engine is wrapped in the authoritative context-budget boundary
+    (:class:`~ultron.core.context.invocation.BudgetedEngine`) so every
+    production agent — and the planning calls that use ``agent.engine`` —
+    enforces the Phase 2 token-budget invariant. Wrapping is idempotent.
     """
-    engine = engine or get_engine()
+    engine = ensure_budgeted_engine(engine or get_engine())
     if agent_type == "simple":
         return SimpleAgent(engine)
     if agent_type == "react":

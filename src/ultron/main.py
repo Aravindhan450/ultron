@@ -950,6 +950,16 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
                     _runtime=runtime,
                 ):
                     nonlocal prepared_task, agent
+
+                    # Planning/classification model calls happen before a task
+                    # exists, so bind a per-request planning correlation id to
+                    # the model-call boundary for CONTEXT_BUILT observability.
+                    import uuid as _uuid
+
+                    from ultron.core.context.invocation import model_call_scope
+
+                    _plan_corr = f"plan_{_uuid.uuid4().hex[:8]}"
+
                     if isinstance(_agent, ReActAgent):
                         if _input in ("/resume", "/continue"):
                             from pathlib import Path
@@ -977,9 +987,10 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
                                 session=memory_session,
                             )
                             return run_res.message
-                        prepared_task = await prepare_task_for_execution(
-                            _input, _agent.engine
-                        )
+                        with model_call_scope(_runtime.event_bus, _plan_corr, _plan_corr):
+                            prepared_task = await prepare_task_for_execution(
+                                _input, _agent.engine
+                            )
                         if prepared_task is not None and prepared_task.clarification_required:
                             return None
                         run_res = await _runtime.execute(
@@ -991,9 +1002,10 @@ async def async_chat(agent_type: str = "simple", no_server: bool = False, verbos
                         )
                         return run_res.message
 
-                    prepared_task = await prepare_task_for_execution(
-                        _input, getattr(_agent, "engine", None)
-                    )
+                    with model_call_scope(_runtime.event_bus, _plan_corr, _plan_corr):
+                        prepared_task = await prepare_task_for_execution(
+                            _input, getattr(_agent, "engine", None)
+                        )
                     if prepared_task is not None:
                         if prepared_task.clarification_required:
                             return None

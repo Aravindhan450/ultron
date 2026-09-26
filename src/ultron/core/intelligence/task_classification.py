@@ -334,9 +334,12 @@ async def classify_task(
     if engine is None or _classify_deterministic(text) is not None:
         return deterministic
 
+    from ultron.core.context.invocation import model_caller
+
     try:
         prompt = _CLASSIFY_PROMPT.replace("{user_input}", user_input)
-        raw = await engine.generate([{"role": "user", "content": prompt}])
+        with model_caller("task_classification"):
+            raw = await engine.generate([{"role": "user", "content": prompt}])
     except Exception:  # noqa: BLE001 — engine failures fall back to deterministic
         return deterministic
 

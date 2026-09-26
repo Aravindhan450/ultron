@@ -292,25 +292,26 @@ def test_context_built_event_emission_and_scrubbing(tmp_path):
 
 
 # ===========================================================================
-# 6. ReActAgent Loop Pre-Model-Call Budgeting Integration
+# 6. ReActAgent Model Calls Are Budgeted By The Authoritative Engine Boundary
 # ===========================================================================
 
 
-def test_react_agent_budgets_messages_before_model_call(tmp_path):
-    async def _test():
-        ws = discover_workspace(str(tmp_path))
-        budget_cfg = ContextBudgetConfig(model_context_limit=300, reserved_output_tokens=50)
-        cm = RepositoryContextManager(workspace=ws, budget=budget_cfg)
+def test_react_agent_model_calls_are_budgeted_by_engine_boundary(tmp_path):
+    """Budgeting is owned by BudgetedEngine (the model-call boundary), not the loop."""
+    from ultron.core.context.invocation import BudgetedEngine, model_call_scope
 
-        # Engine that captures the exact messages passed to generate()
-        captured_calls = []
+    async def _test():
+        budget_cfg = ContextBudgetConfig(model_context_limit=300, reserved_output_tokens=50)
+
+        # Inner engine captures the exact messages it actually receives.
+        captured_calls: list[list[dict]] = []
 
         class CapturingEngine:
             async def generate(self, messages, **kwargs):
                 captured_calls.append(list(messages))
                 return "Final answer from model."
 
-        engine = CapturingEngine()
+        engine = BudgetedEngine(CapturingEngine(), budget_cfg)
         agent = ReActAgent(engine=engine, max_iterations=2)
 
         # Create long history exceeding 250 tokens
@@ -332,13 +333,13 @@ def test_react_agent_budgets_messages_before_model_call(tmp_path):
 
         bus.subscribe(_catch, TaskEventType.CONTEXT_BUILT)
 
-        reply = await agent.run(
-            user_input="Continue building",
-            history=history,
-            task=task,
-            context_manager=cm,
-            event_bus=bus,
-        )
+        with model_call_scope(bus, task.task_id, "run_test"):
+            reply = await agent.run(
+                user_input="Continue building",
+                history=history,
+                task=task,
+                event_bus=bus,
+            )
 
         assert reply.role == Role.ASSISTANT
         assert len(captured_calls) >= 1
@@ -352,9 +353,11 @@ def test_react_agent_budgets_messages_before_model_call(tmp_path):
         assert called_messages[0]["role"] == "system"
         assert any("INITIAL_TASK" in m.get("content", "") for m in called_messages)
 
-        # Event was emitted
+        # A per-call budget event was emitted by the boundary
         assert len(events_caught) >= 1
         assert events_caught[0].event_type == TaskEventType.CONTEXT_BUILT
+        assert events_caught[0].payload.get("kind") == "model_call_budget"
+        assert events_caught[0].payload.get("caller") == "react_loop"
 
     asyncio.run(_test())
 

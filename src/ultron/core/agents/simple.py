@@ -1403,8 +1403,11 @@ async def plan_task(user_input: str, engine) -> list[dict] | None:
         f"User request: {user_input}"
     )
 
+    from ultron.core.context.invocation import model_caller
+
     try:
-        raw = await engine.generate([{"role": "user", "content": planning_prompt}])
+        with model_caller("simple_planning"):
+            raw = await engine.generate([{"role": "user", "content": planning_prompt}])
     except (httpx.HTTPError, OSError, ValueError):
         return None  # Engine error — fall back silently
 
@@ -1677,9 +1680,12 @@ async def handle_image(path: str, user_input: str, engine) -> ChatMessage:
         "act on the user's request (e.g. write code implementing what is "
         "shown, or explain what the data means). Be specific and concrete."
     )
+    from ultron.core.context.invocation import model_caller
+
     messages = [{"role": "user", "content": prompt, "images": [encoded]}]
     try:
-        content = await engine.generate(messages)
+        with model_caller("simple_image"):
+            content = await engine.generate(messages)
     except (httpx.HTTPError, OSError, ValueError) as exc:
         return ChatMessage(
             role=Role.ASSISTANT,
@@ -2632,8 +2638,11 @@ async def handle_llm_fallback(
     else:
         messages.insert(0, ChatMessage(role=Role.SYSTEM, content=tool_instruction))
 
+    from ultron.core.context.invocation import model_caller
+
     openai_messages = history_to_openai_format(messages)
-    response_content = await engine.generate(openai_messages)
+    with model_caller("simple_tool_loop"):
+        response_content = await engine.generate(openai_messages)
 
     # Attempt to extract JSON tool call block
     tool_call_match = re.search(r'```(?:json)?\s*(\{\s*"tool":.*?\})\s*```', response_content, re.DOTALL | re.IGNORECASE)
@@ -2797,8 +2806,11 @@ async def classify_intent(user_input: str, engine) -> str:
         "Respond with ONLY the single category word, nothing else. If none of these clearly apply, respond with 'none'."
     )
 
+    from ultron.core.context.invocation import model_caller
+
     try:
-        raw_response = await engine.generate([{"role": "user", "content": prompt}])
+        with model_caller("simple_classify"):
+            raw_response = await engine.generate([{"role": "user", "content": prompt}])
         category = raw_response.strip().lower()
         if category in valid_categories:
             return category

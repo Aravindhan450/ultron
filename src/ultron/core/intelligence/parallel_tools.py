@@ -475,8 +475,11 @@ async def plan_tool_batch(user_input: str, engine) -> list[dict] | None:
         "\n"
         f"User request: {user_input}"
     )
+    from ultron.core.context.invocation import model_caller
+
     try:
-        raw = await engine.generate([{"role": "user", "content": prompt}])
+        with model_caller("plan_tool_batch"):
+            raw = await engine.generate([{"role": "user", "content": prompt}])
     except (httpx.HTTPError, OSError, ValueError):
         return None
 

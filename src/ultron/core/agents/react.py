@@ -1182,19 +1182,12 @@ class ReActAgent(BaseAgent):
                     )
                 )
 
-            # Phase 2: Token Budgeting & Compaction before every model call
-            model_messages = messages
-            if context_manager is not None and hasattr(context_manager, "budget_messages"):
-                model_messages, budget_meta = context_manager.budget_messages(messages)
-                if event_bus is not None:
-                    event_bus.emit_sync(
-                        RuntimeEvent(
-                            event_type=RuntimeEventType.CONTEXT_BUILT,
-                            run_id=getattr(run_state, "run_id", "run_unknown"),
-                            task_id=getattr(task, "task_id", None) or getattr(run_state, "task_id", None),
-                            payload=budget_meta,
-                        )
-                    )
+            # Phase 2: token budgeting + compaction are owned by the
+            # authoritative model-call boundary (BudgetedEngine), which wraps
+            # this agent's engine. The loop must NOT budget inline — doing so
+            # would duplicate the invariant and drift from verification,
+            # planning and SimpleAgent calls.
+            model_messages = history_to_openai_format(messages)
 
             if event_bus is not None:
                 event_bus.emit_sync(
@@ -1206,7 +1199,10 @@ class ReActAgent(BaseAgent):
                     )
                 )
 
-            response = (await self.engine.generate(history_to_openai_format(model_messages))) or ""
+            from ultron.core.context.invocation import model_caller
+
+            with model_caller("react_loop"):
+                response = (await self.engine.generate(model_messages)) or ""
             logger.info("ReAct iteration %d model response: %r", active_budget.iterations_used, response[:250])
 
             if cancellation_token is not None:
@@ -1475,10 +1471,12 @@ class ReActAgent(BaseAgent):
 
         Returns ``(accepted, final_message)``.
         """
+        from ultron.core.context.invocation import model_caller
         from ultron.core.intelligence.structured_output import enforce_reply
 
         prompt = _build_verification_prompt(task, proposed_answer)
-        raw = (await self.engine.generate([{"role": "user", "content": prompt}])) or ""
+        with model_caller("verify_task"):
+            raw = (await self.engine.generate([{"role": "user", "content": prompt}])) or ""
         requirements = _parse_requirements_json(raw)
 
         if task.lifecycle_status in (
@@ -1609,10 +1607,12 @@ class ReActAgent(BaseAgent):
 
         Returns ``(accepted, final_message)``.
         """
+        from ultron.core.context.invocation import model_caller
         from ultron.core.intelligence.structured_output import enforce_reply
 
         prompt = _build_plan_verification_prompt(task, proposed_answer)
-        raw = (await self.engine.generate([{"role": "user", "content": prompt}])) or ""
+        with model_caller("verify_plan_task"):
+            raw = (await self.engine.generate([{"role": "user", "content": prompt}])) or ""
         data = _parse_plan_verification(raw)
 
         if task.lifecycle_status in (
