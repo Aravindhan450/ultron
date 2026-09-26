@@ -149,6 +149,13 @@ def _write_text(path: Path, content: str) -> None:
     if "requirements" in path.name.lower() or path.suffix in (".pip", ".in"):
         content = sanitize_requirements_txt(content)
     path.write_text(content, encoding="utf-8")
+    try:
+        from ultron.core.repository.cache import invalidate_file_cache
+
+        invalidate_file_cache(path)
+    except Exception:  # noqa: BLE001, S110
+        pass
+
 
 
 
@@ -235,6 +242,12 @@ def delete_file(file_path: str) -> str:
         return f"Error: {file_path} is a directory; delete_file only removes files."
     try:
         resolved.unlink()
+        try:
+            from ultron.core.repository.cache import invalidate_file_cache
+
+            invalidate_file_cache(resolved)
+        except Exception:  # noqa: BLE001, S110
+            pass
         return f"Deleted '{file_path}'."
     except (OSError, ValueError) as exc:
         return f"Error deleting file: {exc}"

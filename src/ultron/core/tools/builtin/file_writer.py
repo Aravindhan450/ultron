@@ -50,6 +50,9 @@ def write_file(file_path: str, content: str, overwrite: bool = False) -> str:
             content = sanitize_requirements_txt(content)
         with open(resolved_path, "w", encoding="utf-8") as f:
             f.write(content)
+        from ultron.core.repository.cache import invalidate_file_cache
+
+        invalidate_file_cache(resolved_path)
         return f"Successfully wrote {len(content)} characters to '{resolved_path}'."
     except (OSError, ValueError) as e:
         return f"Error writing to file: {e!s}"

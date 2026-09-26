@@ -163,31 +163,37 @@ class RepositoryRetriever:
 
         items: list[ContextItem] = []
         for d in defs[:5]:
-            desc = f"{d.kind.value} {d.name} in {d.rel_path}:{d.line}"
-            body = d.signature or d.docstring or desc
+            f_path = getattr(d.location, "file", "") if hasattr(d, "location") else getattr(d, "file_path", "")
+            f_line = getattr(d.location, "line", 1) if hasattr(d, "location") else getattr(d, "line", 1)
+            kind_val = d.kind.value if hasattr(d.kind, "value") else str(d.kind)
+            desc = f"{kind_val} {d.name} in {f_path}:{f_line}"
+            doc_str = getattr(d, "doc", "") or getattr(d, "docstring", "")
+            body = d.signature or doc_str or desc
             items.append(
                 ContextItem(
                     source_type=ContextSourceType.SYMBOL_DEFINITION,
                     priority=ContextPriority.SYMBOL,
-                    title=f"Definition: {d.name} ({d.rel_path})",
+                    title=f"Definition: {d.name} ({f_path})",
                     content=body,
                     target=d.name,
                     estimated_tokens=estimate_tokens(body),
-                    metadata={"rel_path": d.rel_path, "line": d.line, "kind": d.kind.value},
+                    metadata={"rel_path": f_path, "line": f_line, "kind": kind_val},
                 )
             )
 
         for r in refs[:5]:
-            ref_line = f"Reference in {r.rel_path}:{r.line}"
+            r_path = getattr(r.location, "file", "") if hasattr(r, "location") else getattr(r, "file_path", "")
+            r_line = getattr(r.location, "line", 1) if hasattr(r, "location") else getattr(r, "line", 1)
+            ref_line = f"Reference in {r_path}:{r_line}"
             items.append(
                 ContextItem(
                     source_type=ContextSourceType.SYMBOL_REFERENCE,
                     priority=ContextPriority.SYMBOL,
-                    title=f"Reference: {r.name} ({r.rel_path})",
+                    title=f"Reference: {r.name} ({r_path})",
                     content=ref_line,
                     target=r.name,
                     estimated_tokens=estimate_tokens(ref_line),
-                    metadata={"rel_path": r.rel_path, "line": r.line},
+                    metadata={"rel_path": r_path, "line": r_line},
                 )
             )
 
@@ -280,3 +286,85 @@ class RepositoryRetriever:
             source_type=ContextSourceType.GIT_STATE,
             items=[item],
         )
+
+    def retrieve_repo_map(
+        self, max_tokens: int = 1000, focus_query: str = ""
+    ) -> ContextRetrievalResult:
+        """
+        Retrieves a token-budgeted structural map of the repository.
+        """
+        try:
+            from ultron.core.repository.repo_map import RepoMapGenerator
+
+            generator = RepoMapGenerator(root=self.root)
+            repo_map = generator.generate(max_tokens=max_tokens, focus_query=focus_query)
+            item = ContextItem(
+                source_type=ContextSourceType.REPO_MAP,
+                priority=ContextPriority.REPO_MAP,
+                title=f"Repository Map ({len(repo_map.included_files)} files, {repo_map.token_count} tokens)",
+                content=repo_map.text,
+                target="repo_map",
+                estimated_tokens=repo_map.token_count,
+                metadata={
+                    "included_files": repo_map.included_files,
+                    "elided_files_count": repo_map.elided_files_count,
+                    "top_symbols": repo_map.top_symbols,
+                },
+            )
+            return ContextRetrievalResult(
+                target="repo_map",
+                status=ContextRetrievalStatus.FOUND,
+                source_type=ContextSourceType.REPO_MAP,
+                items=[item],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Failed to generate repo map: {exc}")
+            return ContextRetrievalResult(
+                target="repo_map",
+                status=ContextRetrievalStatus.ERROR,
+                source_type=ContextSourceType.REPO_MAP,
+                error_message=str(exc),
+            )
+
+    def retrieve_task_relevant(
+        self, task_goal: str, max_files: int = 5
+    ) -> ContextRetrievalResult:
+        """
+        Uses TaskAwareRetriever to identify top relevant files and symbols with provenance.
+        """
+        try:
+            from ultron.core.repository.retriever import TaskAwareRetriever
+
+            retriever = TaskAwareRetriever(root=self.root)
+            result = retriever.retrieve_relevant(task_query=task_goal, max_files=max_files)
+            items: list[ContextItem] = []
+            if result.items:
+                summary_block = result.to_context_block()
+                items.append(
+                    ContextItem(
+                        source_type=ContextSourceType.SEARCH_RESULT,
+                        priority=ContextPriority.SEARCH,
+                        title=f"Task-Relevant Repository Context ({len(result.top_files)} files)",
+                        content=summary_block,
+                        target="task_relevant",
+                        estimated_tokens=estimate_tokens(summary_block),
+                        metadata={
+                            "top_files": result.top_files,
+                            "top_symbols": result.top_symbols,
+                        },
+                    )
+                )
+            return ContextRetrievalResult(
+                target=task_goal,
+                status=ContextRetrievalStatus.FOUND if items else ContextRetrievalStatus.NOT_FOUND,
+                source_type=ContextSourceType.SEARCH_RESULT,
+                items=items,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Failed to retrieve task-relevant context: {exc}")
+            return ContextRetrievalResult(
+                target=task_goal,
+                status=ContextRetrievalStatus.ERROR,
+                source_type=ContextSourceType.SEARCH_RESULT,
+                error_message=str(exc),
+            )

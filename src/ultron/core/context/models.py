@@ -34,6 +34,7 @@ class ContextSourceType(str, Enum):
     SYMBOL_DEFINITION = "symbol_definition"
     SYMBOL_REFERENCE = "symbol_reference"
     SEARCH_RESULT = "search_result"
+    REPO_MAP = "repo_map"
     GIT_STATE = "git_state"
     CHANGES_AND_DIFF = "changes_and_diff"
     PROJECT_CONFIG = "project_config"
@@ -60,7 +61,7 @@ class ContextPriority(int, Enum):
     1. CURRENT TASK
     2. ACTIVE PLAN STEP
     3. LATEST FAILURE
-    4. RELEVANT REPOSITORY CONTEXT (direct files, symbols, diffs, search)
+    4. RELEVANT REPOSITORY CONTEXT (direct files, symbols, diffs, search, repo map)
     5. RECENT DIALOGUE / OBSERVATIONS
     6. OLDER HISTORY / ARTIFACTS / ENVIRONMENT CONFIG
     7. LONG-TERM MEMORY (project memory, session memory)
@@ -78,21 +79,22 @@ class ContextPriority(int, Enum):
     SYMBOL = 5
     CHANGES_AND_DIFF = 6
     SEARCH = 7
+    REPO_MAP = 8
 
     # Recent observations & dialogue
-    RECENT_OBSERVATIONS = 8
-    RECENT_DIALOGUE = 9
+    RECENT_OBSERVATIONS = 9
+    RECENT_DIALOGUE = 10
 
     # Older history & configuration
-    PROJECT_CONFIG = 10
-    OLDER_HISTORY = 11
-    ARTIFACTS = 12
-    GENERAL_REPO = 13
+    PROJECT_CONFIG = 11
+    OLDER_HISTORY = 12
+    ARTIFACTS = 13
+    GENERAL_REPO = 14
 
     # Long-term memory
-    PROJECT_MEMORY = 14
-    SESSION_MEMORY = 15
-    LONG_TERM_MEMORY = 16
+    PROJECT_MEMORY = 15
+    SESSION_MEMORY = 16
+    LONG_TERM_MEMORY = 17
 
 
 class ContextItem(BaseModel):

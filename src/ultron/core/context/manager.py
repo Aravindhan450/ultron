@@ -77,6 +77,8 @@ class RepositoryContextManager:
         project_memory: list[MemoryRecord] | None = None,
         long_term_memory: list[MemoryRecord] | None = None,
         task_terms: list[str] | None = None,
+        include_repo_map: bool = True,
+        max_repo_map_tokens: int | None = None,
     ) -> str:
         """
         Assembles prioritized, deduplicated, and budgeted context.
@@ -180,20 +182,44 @@ class RepositoryContextManager:
         if git_res.is_found:
             raw_items.extend(git_res.items)
 
-        # 5. Explicitly requested files
+        # 5. Explicitly requested & task-relevant files
         files_to_fetch = list(requested_files or [])
         if code_context and code_context.relevant_files:
             for f in code_context.relevant_files:
                 if f not in files_to_fetch:
                     files_to_fetch.append(f)
 
+        discovered_symbols = list(candidate_symbols or [])
+        focus_goal = user_request or (task.goal if task else "")
+
+        # If no explicit files requested, use TaskAwareRetriever
+        if not files_to_fetch and focus_goal:
+            task_rel_res = self.retriever.retrieve_task_relevant(focus_goal, max_files=4)
+            if task_rel_res.is_found:
+                raw_items.extend(task_rel_res.items)
+                if task_rel_res.items and task_rel_res.items[0].metadata:
+                    top_files = task_rel_res.items[0].metadata.get("top_files", [])
+                    for tf in top_files[:3]:
+                        if tf not in files_to_fetch:
+                            files_to_fetch.append(tf)
+                    for sym in task_rel_res.items[0].metadata.get("top_symbols", []):
+                        if sym not in discovered_symbols:
+                            discovered_symbols.append(sym)
+
         for file_path in files_to_fetch[:5]:
             file_res = self.retriever.retrieve_file(file_path)
             if file_res.is_found:
                 raw_items.extend(file_res.items)
 
+        # 5b. Repo Map under configurable budget
+        if include_repo_map:
+            rm_budget = max_repo_map_tokens or min(800, max(200, self.budget.max_total_tokens // 4))
+            repo_map_res = self.retriever.retrieve_repo_map(max_tokens=rm_budget, focus_query=focus_goal)
+            if repo_map_res.is_found:
+                raw_items.extend(repo_map_res.items)
+
         # 6. Candidate Symbols
-        for sym in (candidate_symbols or [])[:5]:
+        for sym in discovered_symbols[:5]:
             sym_res = self.retriever.retrieve_symbol(sym)
             if sym_res.is_found:
                 raw_items.extend(sym_res.items)
@@ -323,6 +349,8 @@ class RepositoryContextManager:
         project_memory: list[MemoryRecord] | None = None,
         long_term_memory: list[MemoryRecord] | None = None,
         task_terms: list[str] | None = None,
+        include_repo_map: bool = True,
+        max_repo_map_tokens: int | None = None,
     ) -> ContextSnapshot:
         """
         Assembles context and returns the structured ContextSnapshot directly.
@@ -339,6 +367,8 @@ class RepositoryContextManager:
             project_memory=project_memory,
             long_term_memory=long_term_memory,
             task_terms=task_terms,
+            include_repo_map=include_repo_map,
+            max_repo_map_tokens=max_repo_map_tokens,
         )
         return self._last_snapshot or ContextSnapshot()
 

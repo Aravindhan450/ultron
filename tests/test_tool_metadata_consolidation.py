@@ -49,8 +49,8 @@ from ultron.security.boundary import SecurityBoundary
 
 def test_every_registered_tool_has_canonical_metadata():
     assert set(TOOLS) == set(TOOL_DEFINITIONS)
-    assert len(TOOLS) == 58
-    assert len(TOOL_DEFINITIONS) == 58
+    assert len(TOOLS) == 59
+    assert len(TOOL_DEFINITIONS) == 59
 
 
 def test_canonical_definitions_are_complete():

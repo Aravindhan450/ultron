@@ -280,3 +280,24 @@ def report_symbol(name: str, path: str = ".") -> str:
         definition_block = format_definition_result(resolve_definition(ci, name.strip()))
         reference_block = format_reference_result(resolve_references(ci, name.strip()))
         return f"{definition_block}\n\n{reference_block}"
+
+
+def repo_map(focus: str = "", max_tokens: int = 1000, path: str = ".") -> str:
+    """Token-budgeted structural map of the repository layout and key symbols.
+
+    Optionally focus on specific files or search terms (e.g. 'runtime', 'TaskState').
+    Strictly stays within max_tokens.
+    """
+    resolved = _resolve_safe_path(path or ".")
+    if resolved is None:
+        return "Error: access denied, that directory is outside the allowed project folder."
+
+    from ultron.core.repository.repo_map import RepoMapGenerator
+
+    generator = RepoMapGenerator(root=resolved)
+    result = generator.generate(max_tokens=max_tokens, focus_query=focus)
+    return (
+        f"Repository Map ({len(result.included_files)} files, "
+        f"{result.token_count}/{result.max_tokens_budget} tokens):\n\n{result.text}"
+    )
+

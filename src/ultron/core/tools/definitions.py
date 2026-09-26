@@ -57,6 +57,7 @@ from ultron.core.coding.intelligence.tools import (
     find_symbol,
     get_dependents,
     get_imports,
+    repo_map,
     report_file,
     report_symbol,
     semantic_search,
@@ -440,6 +441,13 @@ _reg(
     read_only=True, risk=ToolRisk.LOW, domain=ToolDomain.CODE_INTELLIGENCE,
     target_arg="path", content_arg="name", target_default=".",
     action_label="Report symbol",
+)
+_reg(
+    "repo_map", repo_map,
+    capabilities=(ToolCapability.REPOSITORY_INSPECTION,),
+    read_only=True, risk=ToolRisk.LOW, domain=ToolDomain.CODE_INTELLIGENCE,
+    target_arg="path", content_arg="focus", target_default=".",
+    action_label="Generate repository map",
 )
 
 # --- Execution ------------------------------------------------------------
