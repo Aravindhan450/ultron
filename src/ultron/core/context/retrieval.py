@@ -34,6 +34,7 @@ from ultron.core.context.models import (
     ContextSourceType,
     estimate_tokens,
 )
+from ultron.security.scanners.secret import redact_secrets
 
 
 class RepositoryRetriever:
@@ -113,7 +114,7 @@ class RepositoryRetriever:
                 selected_lines = lines
                 title = f"{resolved.name} ({total_lines} lines)"
 
-        content = "\n".join(selected_lines)
+        content = redact_secrets("\n".join(selected_lines))
         item = ContextItem(
             source_type=ContextSourceType.FILE_CONTENT,
             priority=ContextPriority.DIRECT_FILE,
@@ -123,6 +124,7 @@ class RepositoryRetriever:
             estimated_tokens=estimate_tokens(content),
             metadata={"total_lines": total_lines, "path": str(resolved)},
         )
+
 
         return ContextRetrievalResult(
             target=target_path_str,
@@ -168,8 +170,10 @@ class RepositoryRetriever:
             kind_val = d.kind.value if hasattr(d.kind, "value") else str(d.kind)
             desc = f"{kind_val} {d.name} in {f_path}:{f_line}"
             doc_str = getattr(d, "doc", "") or getattr(d, "docstring", "")
-            body = d.signature or doc_str or desc
+            raw_body = d.signature or doc_str or desc
+            body = redact_secrets(raw_body)
             items.append(
+
                 ContextItem(
                     source_type=ContextSourceType.SYMBOL_DEFINITION,
                     priority=ContextPriority.SYMBOL,
@@ -226,14 +230,16 @@ class RepositoryRetriever:
                 error_message=f"No matches found for query '{q}'",
             )
 
+        sanitized_search = redact_secrets(raw_search)
         item = ContextItem(
             source_type=ContextSourceType.SEARCH_RESULT,
             priority=ContextPriority.SEARCH,
             title=f"Search matches for '{q}'",
-            content=raw_search,
+            content=sanitized_search,
             target=q,
-            estimated_tokens=estimate_tokens(raw_search),
+            estimated_tokens=estimate_tokens(sanitized_search),
         )
+
 
         return ContextRetrievalResult(
             target=q,
@@ -267,9 +273,11 @@ class RepositoryRetriever:
                 check=False,
             )
             if diff_proc.returncode == 0 and diff_proc.stdout.strip():
-                body += f"\nDiff Stat:\n{diff_proc.stdout.strip()[:400]}"
+                sanitized_stat = redact_secrets(diff_proc.stdout.strip()[:400])
+                body += f"\nDiff Stat:\n{sanitized_stat}"
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"Failed to read git diff: {exc}")
+
 
         item = ContextItem(
             source_type=ContextSourceType.GIT_STATE,
@@ -339,7 +347,7 @@ class RepositoryRetriever:
             result = retriever.retrieve_relevant(task_query=task_goal, max_files=max_files)
             items: list[ContextItem] = []
             if result.items:
-                summary_block = result.to_context_block()
+                summary_block = redact_secrets(result.to_context_block())
                 items.append(
                     ContextItem(
                         source_type=ContextSourceType.SEARCH_RESULT,
@@ -354,6 +362,7 @@ class RepositoryRetriever:
                         },
                     )
                 )
+
             return ContextRetrievalResult(
                 target=task_goal,
                 status=ContextRetrievalStatus.FOUND if items else ContextRetrievalStatus.NOT_FOUND,

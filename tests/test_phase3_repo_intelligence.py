@@ -372,3 +372,174 @@ def test_repo_map_tool_registered():
     tool_fn = TOOLS["repo_map"]
     res = tool_fn(focus="models", max_tokens=500)
     assert "Repository Map" in res
+
+
+# ---------------------------------------------------------------------------
+# 10. Embedded Secret Protection and False Positive Avoidance Tests
+# ---------------------------------------------------------------------------
+
+
+def test_embedded_secret_protection_and_false_positives(sandbox_repo: Path):
+    from ultron.core.coding.workspace import search_files
+    from ultron.core.context.retrieval import RepositoryRetriever
+
+    # Create config file with synthetic embedded secrets alongside normal code
+    config_file = sandbox_repo / "src" / "demo" / "config.py"
+    config_file.write_text(
+        '"""App configuration."""\n\n'
+        'import os\n\n'
+        '# Normal code patterns that must NOT be redacted:\n'
+        'def get_api_key():\n'
+        '    return os.environ.get("OPENAI_KEY")\n\n'
+        'token_count: int = 1500\n'
+        'is_production: bool = True\n\n'
+        '# Embedded secrets that MUST be redacted:\n'
+        'API_KEY = "sk-proj-99999999999999999999"\n'
+        'DATABASE_URL = "postgres://admin:supersecretpassword@db.internal:5432/main_db"\n'
+        'PRIVATE_SECRET_TOKEN = "tok_live_9876543210"\n',
+        encoding="utf-8",
+    )
+
+    index = RepositoryIndex(sandbox_repo)
+    index.refresh()
+
+    # 1. Test search_text in RepositoryIndex
+    results = index.search_text("DATABASE_URL")
+    assert len(results) > 0
+    _path, _line, content = results[0]
+    assert "[REDACTED_SECRET]" in content
+    assert "supersecretpassword" not in content
+
+    results_key = index.search_text("API_KEY")
+    assert len(results_key) > 0
+    key_content = " ".join(c for _, _, c in results_key)
+    assert "[REDACTED_SECRET]" in key_content
+    assert "sk-proj-99999999999999999999" not in key_content
+
+    # 2. Test search_files workspace tool
+    ws_search = search_files("DATABASE_URL")
+    assert "[REDACTED_SECRET]" in ws_search
+    assert "supersecretpassword" not in ws_search
+
+    # 3. Test RepositoryRetriever.retrieve_file
+    retriever = RepositoryRetriever()
+    file_res = retriever.retrieve_file("src/demo/config.py")
+    assert file_res.items
+    retrieved_content = file_res.items[0].content
+    assert "[REDACTED_SECRET]" in retrieved_content
+    assert "supersecretpassword" not in retrieved_content
+    assert "sk-proj-99999999999999999999" not in retrieved_content
+
+    # 4. Verify False-Positive Avoidance on normal code
+    assert "def get_api_key():" in retrieved_content
+    assert 'return os.environ.get("OPENAI_KEY")' in retrieved_content
+    assert "token_count: int = 1500" in retrieved_content
+    assert "is_production: bool = True" in retrieved_content
+
+    # 5. Test ContextManager.build_context defensive sanitization
+    mgr = RepositoryContextManager()
+    ctx = mgr.build_context(requested_files=["src/demo/config.py"])
+    assert "[REDACTED_SECRET]" in ctx
+    assert "supersecretpassword" not in ctx
+    assert "sk-proj-99999999999999999999" not in ctx
+
+
+# ---------------------------------------------------------------------------
+# 11. RepositoryCache Thread-Safety Tests
+# ---------------------------------------------------------------------------
+
+
+def test_repository_cache_thread_safety(sandbox_repo: Path):
+    import concurrent.futures
+
+    cache = RepositoryCache.get_instance()
+    cache.clear()
+
+    errors: list[Exception] = []
+
+    def worker(i: int) -> None:
+        try:
+            # Query and mutate root data concurrently
+            data = cache.get_root_data(sandbox_repo)
+            assert "files" in data
+            data["files"][f"file_{i}.py"] = {"index": i}
+
+            # Invalidate specific file
+            cache.invalidate_file(sandbox_repo / f"file_{i}.py")
+
+            # Query again
+            fresh_data = cache.get_root_data(sandbox_repo)
+            assert "files" in fresh_data
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(worker, i) for i in range(50)]
+        concurrent.futures.wait(futures)
+
+    assert not errors, f"Thread safety errors encountered: {errors}"
+
+
+# ---------------------------------------------------------------------------
+# 12. End-to-End Mutation Invalidation Tests
+# ---------------------------------------------------------------------------
+
+
+def test_end_to_end_mutation_invalidation(sandbox_repo: Path):
+    from ultron.core.coding.edits import (
+        append_to_file,
+        create_file,
+        delete_file,
+        rename_file,
+        replace_in_file,
+    )
+
+    index = RepositoryIndex(sandbox_repo)
+    index.refresh()
+
+    cache_data = RepositoryCache.get_instance().get_root_data(sandbox_repo)
+    assert len(cache_data["files"]) > 0
+
+    # 1. create_file invalidates cache
+    create_file("src/demo/service.py", "class Service:\n    pass\n")
+    # Repo maps and graph should be cleared in cache
+    assert cache_data["graph"] is None
+    assert cache_data["repo_maps"] == {}
+
+    index.refresh()
+    assert "src/demo/service.py" in cache_data["files"]
+
+    # 2. replace_in_file invalidates cache
+    replace_in_file("src/demo/service.py", "pass", "def execute(self): pass")
+    assert "src/demo/service.py" not in cache_data["files"]
+
+    index.refresh()
+    assert "src/demo/service.py" in cache_data["files"]
+    updated_syms = [s.name for s in cache_data["files"]["src/demo/service.py"].symbols]
+    assert "execute" in updated_syms
+
+    # 3. append_to_file invalidates cache
+    append_to_file("src/demo/service.py", "\ndef helper_func(): pass\n")
+    assert "src/demo/service.py" not in cache_data["files"]
+
+    index.refresh()
+    appended_syms = [s.name for s in cache_data["files"]["src/demo/service.py"].symbols]
+    assert "helper_func" in appended_syms
+
+    # 4. rename_file invalidates both paths in cache
+    rename_file("src/demo/service.py", "src/demo/renamed_service.py")
+    assert "src/demo/service.py" not in cache_data["files"]
+    assert "src/demo/renamed_service.py" not in cache_data["files"]
+
+    index.refresh()
+    assert "src/demo/renamed_service.py" in cache_data["files"]
+    assert "src/demo/service.py" not in cache_data["files"]
+
+    # 5. delete_file invalidates cache
+    delete_file("src/demo/renamed_service.py")
+    assert "src/demo/renamed_service.py" not in cache_data["files"]
+
+    index.refresh()
+    assert "src/demo/renamed_service.py" not in cache_data["files"]
+

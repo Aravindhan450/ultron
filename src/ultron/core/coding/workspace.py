@@ -27,6 +27,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from ultron.core.tools.paths import is_path_safe
+from ultron.security.scanners.secret import redact_secrets
 
 # ---------------------------------------------------------------------------
 # Project detection
@@ -498,8 +499,10 @@ def search_files(query: str, path: str = ".", max_results: int = 30) -> str:
                 continue
             for line_no, line in enumerate(content.splitlines(), start=1):
                 if needle in line.lower():
-                    results.append(f"{rel}:{line_no}: {line.strip()[:200]}")
+                    sanitized_line = redact_secrets(line.strip())[:200]
+                    results.append(f"{rel}:{line_no}: {sanitized_line}")
                     break  # one match line per file
+
 
     walk(resolved)
     if not results:

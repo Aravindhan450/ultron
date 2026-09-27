@@ -20,6 +20,7 @@ from ultron.core.coding.intelligence.parsers import (
 from ultron.core.coding.intelligence.parsers import (
     parse_source as _intelligence_parse_source,
 )
+from ultron.security.scanners.secret import redact_secrets
 
 
 class ParsedSymbol(BaseModel):
@@ -88,7 +89,7 @@ class _PythonASTCollector(ast.NodeVisitor):
         doc = ast.get_docstring(node)
         if doc:
             first_line = doc.strip().split("\n")[0].strip()
-            return first_line[:160]
+            return redact_secrets(first_line)[:160]
         return ""
 
     def _get_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
@@ -97,10 +98,11 @@ class _PythonASTCollector(ast.NodeVisitor):
             if 0 <= line_idx < len(self.source_lines):
                 line = self.source_lines[line_idx].strip()
                 line = line.removesuffix(":")
-                return line[:160]
+                return redact_secrets(line)[:160]
         except Exception:  # noqa: BLE001, S110
             pass
         return f"def {node.name}(...)"
+
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         bases = []
@@ -238,8 +240,9 @@ def parse_source_file(file_path: str | Path, rel_path: str, content: str) -> Fil
                     line=s.location.line,
                     end_line=s.location.end_line,
                     column=s.location.column,
-                    signature=s.signature,
-                    doc=s.doc,
+                    signature=redact_secrets(s.signature) if s.signature else "",
+                    doc=redact_secrets(s.doc) if s.doc else "",
+
                     parent=s.parent,
                     scope=s.scope,
                     bases=s.bases,

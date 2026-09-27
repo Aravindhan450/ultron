@@ -26,6 +26,7 @@ from ultron.core.repository.parser import (
     ParsedSymbol,
     parse_source_file,
 )
+from ultron.security.scanners.secret import redact_secrets
 
 
 class FileClassification(str, Enum):
@@ -435,9 +436,11 @@ class RepositoryIndex:
                 content = Path(finfo.abs_path).read_text(encoding="utf-8", errors="replace")
                 for idx, line in enumerate(content.splitlines(), start=1):
                     if q in line.lower():
-                        matches.append((finfo.rel_path, idx, line.strip()[:140]))
+                        sanitized_line = redact_secrets(line.strip())[:140]
+                        matches.append((finfo.rel_path, idx, sanitized_line))
                         if len(matches) >= max_results:
                             return matches
+
             except Exception:  # noqa: BLE001, S112
                 continue
         return matches

@@ -24,6 +24,7 @@ from ultron.core.context.models import (
 )
 from ultron.core.context.retrieval import RepositoryRetriever, estimate_tokens
 from ultron.core.types import ChatMessage, Role  # noqa: F401  (re-export / typing)
+from ultron.security.scanners.secret import redact_secrets
 
 if TYPE_CHECKING:
     from ultron.core.coding.context import CodeContext
@@ -324,9 +325,15 @@ class RepositoryContextManager:
                     )
                 )
 
+        # Defense-in-depth: ensure no raw credentials leak into model prompt
+        for item in raw_items:
+            if item.content:
+                item.content = redact_secrets(item.content)
+
         # Deduplicate and sort by priority
         deduped = self._deduplicate(raw_items)
         sorted_items = sorted(deduped, key=lambda x: x.priority.value)
+
 
         # Enforce budget & compaction
         accepted_items, snapshot = self._compact_and_budget(sorted_items)

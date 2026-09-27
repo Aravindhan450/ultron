@@ -84,6 +84,14 @@ _SECRET_RULES: list[tuple[str, re.Pattern[str], str, str]] = [
         "Authorization bearer token detected",
     ),
     (
+        "database_credential_uri",
+        re.compile(
+            r"(?i)\b(?:postgres|postgresql|mysql|mongodb|redis|amqp|mssql)://[^:\s]*:[^@\s]+@[^\s\"'>]+"
+        ),
+        "critical",
+        "Database connection string with credentials detected",
+    ),
+    (
         "generic_secret_assignment",
         re.compile(
             r"(?i)\b(?:password|passwd|secret|api[_-]?key|token)\s*[:=]\s*['\"]?[^\s'\"]{6,}"
@@ -92,6 +100,10 @@ _SECRET_RULES: list[tuple[str, re.Pattern[str], str, str]] = [
         "Possible credential assignment (e.g. password=...) detected",
     ),
 ]
+
+_QUOTED_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"""(?i)((?:^|[\s_"'(\[{])(?:password|passwd|secret|api[_-]?key|auth[_-]?token|private[_-]?key|token)["']?\s*(?::\s*[^=]+)?\s*[:=]\s*)(["'][^"'\n]{6,}["'])"""
+)
 
 
 def scan_secrets(text: str) -> list[GuardrailFinding]:
@@ -131,3 +143,26 @@ def mask_matches(text: str, findings: Sequence[GuardrailFinding]) -> str:
         if finding.snippet:
             masked = masked.replace(finding.snippet, "*" * len(finding.snippet))
     return masked
+
+
+def redact_secrets(text: str, replacement: str = "[REDACTED_SECRET]") -> str:
+    """
+    Redacts sensitive credential patterns from text.
+
+    Replaces matched API keys, tokens, private keys, database connection
+    strings with credentials, and quoted secret assignments with `replacement`,
+    without altering surrounding code syntax or triggering false-positives
+    on standard identifiers, environment lookups, or method calls.
+    """
+    if not text:
+        return text
+
+    redacted = text
+    for rule, pattern, _severity, _msg in _SECRET_RULES:
+        if rule == "generic_secret_assignment":
+            continue
+        redacted = pattern.sub(replacement, redacted)
+
+    redacted = _QUOTED_SECRET_ASSIGNMENT_PATTERN.sub(rf'\g<1>"{replacement}"', redacted)
+    return redacted
+

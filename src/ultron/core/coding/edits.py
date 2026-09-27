@@ -226,6 +226,12 @@ def append_to_file(file_path: str, content: str) -> str:
         resolved.parent.mkdir(parents=True, exist_ok=True)
         with open(resolved, "a", encoding="utf-8") as fh:
             fh.write(content)
+        try:
+            from ultron.core.repository.cache import invalidate_file_cache
+
+            invalidate_file_cache(resolved)
+        except Exception:  # noqa: BLE001, S110
+            pass
         return f"Appended {len(content)} characters to '{file_path}'."
     except (OSError, ValueError) as exc:
         return f"Error writing file: {exc}"
@@ -266,9 +272,17 @@ def rename_file(file_path: str, new_path: str) -> str:
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         resolved.rename(target)
+        try:
+            from ultron.core.repository.cache import invalidate_file_cache
+
+            invalidate_file_cache(resolved)
+            invalidate_file_cache(target)
+        except Exception:  # noqa: BLE001, S110
+            pass
         return f"Renamed '{file_path}' to '{new_path}'."
     except (OSError, ValueError) as exc:
         return f"Error renaming file: {exc}"
+
 
 
 # ---------------------------------------------------------------------------
