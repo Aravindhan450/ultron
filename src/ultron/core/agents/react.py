@@ -63,6 +63,8 @@ from ultron.core.intelligence.task_classification import TaskType
 from ultron.core.intelligence.verification_evidence import (
     _diagnosis_reported_in_transcript,
     _successful_investigations,
+    canonicalize_criterion,
+    criterion_is_satisfied,
     satisfy_diagnosis_criteria,
 )
 from ultron.core.logging import get_logger
@@ -239,16 +241,15 @@ def build_system_prompt() -> str:
         "language. Do NOT include a JSON block in your final answer.\n"
         "5. Never invent tool results — only use facts from the Observations "
         "you actually received.\n"
-        "6. State-modifying actions (commands, file writes, non-read-only "
-        "database queries, POST/PUT/DELETE HTTP requests) are routed to the "
-        "user for confirmation automatically — still emit the tool call "
-        "normally when one is needed.\n"
+        "6. Confirmation and Permission: State-modifying actions (commands, file writes, non-read-only database queries, POST/PUT/DELETE HTTP requests) are intercepted and presented to the user for interactive confirmation automatically by the system UI before execution. When a user asks for confirmation before a change, do NOT attempt to ask the user yourself using shell commands (e.g. `echo 'do you want to...'`); simply emit the tool call directly (`write_file`, `replace_in_file`, etc.) and the system will handle confirmation.\n"
         "7. Use the fewest tool calls needed to answer well.\n"
-        "8. When several independent read-only lookups are needed at once "
+        "8. For creating, writing, modifying, or editing files, always use the dedicated file tools (`write_file`, `replace_in_file`) rather than shell commands (`echo`, `tee`, `sudo`). Never use `echo` to ask questions or modify files. Never attempt to use `sudo`.\n"
+        "9. When several independent read-only lookups are needed at once "
         "(multiple files, sites, or searches), prefer a single "
         "`run_tool_batch` call whose `calls_json` argument is a JSON array "
         "of {\"tool\": ..., \"arguments\": {...}} — it executes them "
         "concurrently and synthesizes the results into one observation.\n"
+        "10. Repair & Bug Fixing: When tasked with fixing or repairing a bug in a specified file, always start by inspecting the affected file using `read_file` to understand the code and locate the defect before modifying files or executing tests.\n"
         "\n\nIMPORTANT: the RESPONSE STYLE guidance below applies ONLY to "
         "your FINAL natural-language answer, once the loop is complete. "
         "While the task is still in progress you MUST respond with the "
@@ -1466,7 +1467,7 @@ class ReActAgent(BaseAgent):
                         task.verify_acceptance_criterion(
                             "evidence_based_explanation",
                             f"Gathered code evidence via {tool_name} ({target})",
-                            EvidenceLevel.LEVEL_5_VERIFIED,
+                            EvidenceLevel.LEVEL_2_EXECUTED,
                         )
                 if task.plan is not None and not succeeded:
                     step = task.current_plan_step()
@@ -1641,7 +1642,9 @@ class ReActAgent(BaseAgent):
                 ("evidence_based_explanation", "Evidence-based explanation provided"),
                 ("proposed_fix_strategy", "Proposed fix strategy presented"),
             ):
-                task.verify_acceptance_criterion(crit_id, desc, EvidenceLevel.LEVEL_5_VERIFIED)
+                ok, lvl = criterion_is_satisfied(crit_id, task)
+                if ok:
+                    task.verify_acceptance_criterion(crit_id, desc, lvl)
 
         if not task.all_required_criteria_satisfied():
             unmet = task.remaining_acceptance_criteria()
@@ -1909,20 +1912,43 @@ class ReActAgent(BaseAgent):
                 task_state=task,
             )
 
-        step_criteria = [
-            item
-            for item in (data.get("step_criteria") or [])
-            if isinstance(item, dict) and str(item.get("description", "")).strip()
-        ]
         step_failed = bool(data.get("step_failed"))
-        # The CURRENT step advances only when ALL of ITS OWN completion
-        # criteria are marked satisfied — criteria from other steps are
-        # ignored, so the model can never skip ahead (A -> F).
-        satisfied_descriptions = {
+
+        # Step criteria evaluation:
+        # Criterion-specific evidence evaluation is authoritative (arch doc §11).
+        # A criterion requiring tool/investigation/test evidence can ONLY be satisfied
+        # by actual recorded evidence, never by model self-attestation.
+        model_satisfied = {
             str(item.get("description")).strip()
-            for item in step_criteria
-            if bool(item.get("satisfied"))
+            for item in (data.get("step_criteria") or [])
+            if isinstance(item, dict) and bool(item.get("satisfied"))
         }
+
+        satisfied_descriptions: set[str] = set()
+
+        for criterion in step.completion_criteria:
+            check_crit = (
+                "diagnosis_reported"
+                if (readonly_diagnosis and criterion == task.goal)
+                else criterion
+            )
+            ok, level = criterion_is_satisfied(check_crit, task)
+            canonical = canonicalize_criterion(check_crit)
+
+            if readonly_diagnosis:
+                # In read-only tasks, criterion-specific evidence evaluation is authoritative.
+                # A read-only step advances only when the evidence associated with THAT
+                # criterion is sufficient (arch doc §11, Violations A & B).
+                if ok:
+                    satisfied_descriptions.add(criterion)
+                    task.verify_acceptance_criterion(canonical, criterion, level)
+            else:
+                # In writable / execution tasks:
+                if criterion in model_satisfied:
+                    satisfied_descriptions.add(criterion)
+                    if ok:
+                        task.verify_acceptance_criterion(canonical, criterion, level)
+
         all_met = bool(step.completion_criteria) and all(
             criterion in satisfied_descriptions
             for criterion in step.completion_criteria
@@ -1961,17 +1987,6 @@ class ReActAgent(BaseAgent):
                 task, step, data, proposed_answer, _note, user_input
             )
 
-        if (
-            not all_met
-            and task.active_policy.is_read_only
-            and _has_readonly_investigation_evidence(task)
-        ):
-            # Read-only diagnosis is evidenced by the investigation itself;
-            # the verifier's per-criterion marking is advisory here, so
-            # recorded read-only work advances the step instead of stalling
-            # the plan on the model's (over-)conservative verdict.
-            all_met = True
-
         if not all_met:
             unmet = [
                 criterion
@@ -2007,6 +2022,26 @@ class ReActAgent(BaseAgent):
                 )
 
         next_step = task.plan.next_step()
+        while next_step is not None and readonly_diagnosis:
+            # Check if next_step's completion criteria are already satisfied by the recorded evidence
+            all_next_met = bool(next_step.completion_criteria) and all(
+                criterion_is_satisfied(
+                    "diagnosis_reported" if (readonly_diagnosis and c == task.goal) else c,
+                    task,
+                )[0]
+                for c in next_step.completion_criteria
+            )
+            if all_next_met:
+                task.plan.set_step_status(next_step.id, StepStatus.SUCCEEDED, result=proposed_answer[:300])
+                for c in next_step.completion_criteria:
+                    check_crit = "diagnosis_reported" if (readonly_diagnosis and c == task.goal) else c
+                    ok, lvl = criterion_is_satisfied(check_crit, task)
+                    if ok:
+                        task.verify_acceptance_criterion(canonicalize_criterion(check_crit), c, lvl)
+                next_step = task.plan.next_step()
+            else:
+                break
+
         if next_step is not None:
             next_step.status = StepStatus.RUNNING
             task.set_current_step(next_step.id)

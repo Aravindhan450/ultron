@@ -675,7 +675,7 @@ async def execute_pending_action(action: PendingAction) -> str:
 
     elif action.action_type == "registry_tool":
         # Runtime-policy confirmation for a registered tool with no dedicated
-        # branch: target = tool name, content = JSON-encoded arguments. The
+        # action branch: target = tool name, content = JSON-encoded arguments. The
         # arguments were already gated by the Runtime Policy Gate + security
         # boundary BEFORE the confirmation round-trip, so this executes the
         # exact approved action — never a re-derived one.
@@ -696,6 +696,35 @@ async def execute_pending_action(action: PendingAction) -> str:
                 tool_args = {}
             UI.render_tool_activity(tool_name, str(tool_args)[:80])
             result = str(func(**coerce_tool_arguments(func, tool_args)))
+
+    elif action.action_type == "run_tool_batch":
+        import json as _json
+        import os as _os
+
+        from ultron.core.intelligence.parallel_tools import _safe_run
+
+        try:
+            pending_calls = _json.loads(action.content or "[]")
+        except (_json.JSONDecodeError, ValueError):
+            pending_calls = []
+
+        if not isinstance(pending_calls, list):
+            pending_calls = []
+
+        batch_results = []
+        for call in pending_calls:
+            t_name = call.get("tool", "")
+            t_args = call.get("arguments") or {}
+            if t_name == "write_file" and "overwrite" not in t_args:
+                f_path = str(t_args.get("file_path") or t_args.get("filename") or t_args.get("path") or "")
+                from ultron.core.tools.paths import resolve_project_path
+                resolved = str(resolve_project_path(f_path)) if f_path else ""
+                if _os.path.exists(resolved) and not _os.path.isdir(resolved):
+                    t_args["overwrite"] = True
+            UI.render_tool_activity(t_name, str(t_args)[:80])
+            res = _safe_run(t_name, t_args)
+            batch_results.append(f"[{t_name}]: {res}")
+        result = "\n".join(batch_results) if batch_results else "Batch completed."
 
     else:
         result = f"Error: Unrecognised action type '{action.action_type}'."

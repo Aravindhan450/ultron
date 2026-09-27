@@ -168,9 +168,15 @@ def _classify_deterministic(text: str) -> TaskType | None:
         re.IGNORECASE,
     ):
         return TaskType.INFORMATIONAL
-    if _DEBUG_VERBS_RE.search(text) or (
-        _FIX_VERBS_RE.search(text) and _FAILURE_NOUNS_RE.search(text)
-    ) or (_FAILURE_NOUNS_RE.search(text) and _WHY_RE.search(text)):
+    debug_text = re.sub(r"[\"'\x60][^\"'\x60]*[\"'\x60]", " ", text)
+    debug_text = re.sub(r"\bdebug\s*(?:is\s+|to\s+|[=:]\s*)(?:true|false)\b", " ", debug_text, flags=re.IGNORECASE)
+    debug_text = re.sub(r"\bdebug\s+(?:flag|setting|mode|property|key)\b", " ", debug_text, flags=re.IGNORECASE)
+    if (
+        _DEBUG_VERBS_RE.search(debug_text)
+        or (_FIX_VERBS_RE.search(text) and _FAILURE_NOUNS_RE.search(text))
+        or (_FAILURE_NOUNS_RE.search(text) and (_WHY_RE.search(text) or re.search(r"\b(cause|mechanism|root)\b", text)))
+        or re.search(r"\broot[\s_-]cause\b", text)
+    ):
         return TaskType.DEBUGGING
     if _CODE_REVIEW_RE.search(text):
         return TaskType.CODE_REVIEW

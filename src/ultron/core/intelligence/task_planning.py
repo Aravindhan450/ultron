@@ -628,10 +628,10 @@ def build_debugging_plan(
     steps = [
         PlanStep(
             id=1,
-            description="Reproduce failure and inspect error state",
-            purpose="Run failing test or command to reproduce the defect and capture stack trace",
-            expected_outcome="Defect is reproduced and error signature is observed",
-            completion_criteria=["Failure reproduced or located"],
+            description="Inspect affected source files and identify defect",
+            purpose="Read affected source code with read_file to locate the defect and understand the failure",
+            expected_outcome="Affected code is inspected and defect is located",
+            completion_criteria=["Relevant code inspected"],
             failure_strategy=FailureStrategy.RETRY,
             retry_policy=2,
         ),

@@ -37,7 +37,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from ultron.core.logging import get_logger
-from ultron.core.types import ExecutionPolicy
+from ultron.core.types import ChatMessage, ExecutionPolicy
 
 logger = get_logger(__name__)
 
@@ -279,11 +279,12 @@ def _parse_calls(calls_json: str) -> list[dict] | None:
     return calls[:MAX_BATCH_CALLS] or None
 
 
-def run_tool_batch(calls_json: str, policy: ExecutionPolicy | None = None) -> str:
+def run_tool_batch(calls_json: str, policy: ExecutionPolicy | None = None) -> str | ChatMessage:
     """
     Runs several tool calls concurrently, each gated through the Runtime
     Policy Gate (when a policy is active) and the security boundary, and
-    returns a synthesized report.
+    returns a synthesized report or a ChatMessage with PendingAction if
+    confirmation is required.
 
     Arguments:
         calls_json: JSON array of {"tool": ..., "arguments": {...}}.
@@ -292,9 +293,9 @@ def run_tool_batch(calls_json: str, policy: ExecutionPolicy | None = None) -> st
             call — the wrapper never bypasses or weakens it.
 
     Safety: a call whose policy or boundary verdict is deny is never executed
-    and is reported as blocked; a confirmation verdict (from either gate) is
-    reported as needing approval instead of running silently. Only allowed
-    calls execute, all at the same time.
+    and is reported as blocked; a confirmation verdict (from either gate) routes
+    through the existing PendingAction confirmation lifecycle instead of
+    running silently. Only allowed calls execute concurrently.
     """
     calls = _parse_calls(calls_json)
     if calls is None:
@@ -314,6 +315,69 @@ def run_tool_batch(calls_json: str, policy: ExecutionPolicy | None = None) -> st
             seen.add(key)
             unique.append(call)
     gated, elapsed = execute_batch(unique, policy=policy)
+
+    confirm_calls = [c for c in gated if c["status"] == "confirm"]
+    if confirm_calls:
+        import os
+
+        from ultron.core.tools.paths import resolve_project_path
+        from ultron.core.types import ChatMessage, PendingAction, Role
+
+        report_text = format_batch_report(gated, elapsed=elapsed)
+
+        if len(confirm_calls) == 1 and len(unique) == 1:
+            single = confirm_calls[0]
+            t_name = single["tool"]
+            t_args = single["arguments"]
+            if t_name == "write_file":
+                file_path = str(
+                    t_args.get("file_path")
+                    or t_args.get("filename")
+                    or t_args.get("path")
+                    or ""
+                )
+                resolved = str(resolve_project_path(file_path)) if file_path else ""
+                action_type = (
+                    "overwrite_file"
+                    if os.path.exists(resolved) and not os.path.isdir(resolved)
+                    else "write_file"
+                )
+                return ChatMessage(
+                    role=Role.ASSISTANT,
+                    content=f"File write requested in batch: '{file_path}'\n\n{report_text}",
+                    pending_action=PendingAction(
+                        action_type=action_type,
+                        target=file_path,
+                        content=str(t_args.get("content", "")),
+                    ),
+                )
+            if t_name == "run_command":
+                from ultron.core.nlp.normalize import normalize_terminal_command
+
+                cmd = normalize_terminal_command(str(t_args.get("command", "")).strip())
+                return ChatMessage(
+                    role=Role.ASSISTANT,
+                    content=f"Command execution requested in batch: '{cmd}'\n\n{report_text}",
+                    pending_action=PendingAction(
+                        action_type="run_command",
+                        target=cmd,
+                    ),
+                )
+
+        tools_summary = ", ".join(c["tool"] for c in confirm_calls)
+        pending_payload = json.dumps(
+            [{"tool": c["tool"], "arguments": c["arguments"]} for c in confirm_calls]
+        )
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=f"Batch execution requires confirmation for: {tools_summary}\n\n{report_text}",
+            pending_action=PendingAction(
+                action_type="run_tool_batch",
+                target=tools_summary,
+                content=pending_payload,
+            ),
+        )
+
     return format_batch_report(gated, elapsed=elapsed)
 
 

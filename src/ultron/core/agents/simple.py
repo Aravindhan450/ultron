@@ -2354,6 +2354,8 @@ async def handle_parallel_tools(
     from ultron.core.intelligence.parallel_tools import run_tool_batch
 
     result = run_tool_batch(json.dumps(calls), policy=policy)
+    if isinstance(result, ChatMessage):
+        return result
     return ChatMessage(role=Role.ASSISTANT, content=str(result))
 
 
