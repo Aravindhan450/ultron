@@ -119,13 +119,15 @@ def run_session(session_name: str, turns: list[tuple[str, int]], log_file_name: 
     env["PYTHONPATH"] = f"{ROOT_DIR}/src"
     env.pop("ULTRON_NO_SERVER", None)
     env["ULTRON_VERBOSE"] = "1"
+    env["ULTRON_LLAMA_SERVER_PORT"] = "8085"
+    env["ULTRON_LLAMA_CPP_BASE_URL"] = "http://127.0.0.1:8085"
 
     python_exe = os.path.join(ROOT_DIR, ".venv", "bin", "python")
 
     # Clean existing server processes before starting
     try:
         from ultron.core.engine.server import LlamaServerManager
-        LlamaServerManager.terminate_running_servers(port=8080)
+        LlamaServerManager.terminate_running_servers(port=8085)
     except Exception:  # noqa: BLE001, S110
         pass
 

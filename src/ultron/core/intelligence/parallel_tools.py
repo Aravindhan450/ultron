@@ -36,6 +36,11 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from ultron.core.logging import get_logger
+from ultron.core.types import ExecutionPolicy
+
+logger = get_logger(__name__)
+
 # NOTE: check_action / _generic_target_content / get_tool are imported lazily
 # inside the functions that need them to avoid import cycles
 # (agents -> registry -> intelligence -> agents).
@@ -134,28 +139,39 @@ BATCH_READONLY_TOOLS = frozenset(
 
 def _safe_run(tool_name: str, arguments: dict) -> str:
     """Runs one tool call, capturing any exception as a message."""
-    from ultron.core.tools.registry import get_tool
+    from ultron.core.tools.registry import coerce_tool_arguments, get_tool
 
     func = get_tool(_registry_tool_name(tool_name))
     if func is None:
         return f"Error: unknown tool '{tool_name}'."
     try:
-        return str(func(**arguments))
+        # Same canonical argument coercion as direct tool execution so the
+        # batch path cannot diverge from the single-call path.
+        return str(func(**coerce_tool_arguments(func, arguments)))
     except Exception as exc:  # noqa: BLE001 — arbitrary tool surface
         return f"Error executing tool '{tool_name}': {exc}"
 
 
-def execute_batch(calls: list[dict]) -> tuple[list[dict], float]:
+def execute_batch(
+    calls: list[dict], policy: ExecutionPolicy | None = None
+) -> tuple[list[dict], float]:
     """
-    Gates each call through the security boundary, then executes the batch.
+    Gates each call through the Runtime Policy Gate (when a policy is active)
+    and the security boundary, then executes the batch.
+
+    Contract: ``run_tool_batch`` is NOT a policy boundary. Every inner call
+    passes through the SAME authoritative ExecutionPolicy as a direct tool
+    call — FORBIDDEN never executes, REQUIRES_CONFIRMATION is surfaced as
+    needing approval (never run silently), and only ALLOWED calls continue to
+    the security boundary. Calls are gated independently, so one denial never
+    authorizes another call in the batch.
 
     Concurrency rule: only read-only tools (``BATCH_READONLY_TOOLS``) run in
     parallel — state-writing LOW tools (e.g. add_memory) execute sequentially
     afterwards so SQLite writers never collide. Returns
     (gated_calls, elapsed_seconds) where each gated call has a ``status``:
     ``ok`` / ``error`` (executed) or ``blocked`` / ``confirm`` (never
-    executed). ``deny`` verdicts never execute; ``confirm`` verdicts are
-    surfaced as needing approval rather than running silently.
+    executed).
     """
     from ultron.core.agents.security import (
         blocked_message,
@@ -164,6 +180,7 @@ def execute_batch(calls: list[dict]) -> tuple[list[dict], float]:
         is_denied,
     )
     from ultron.core.agents.simple import _generic_target_content
+    from ultron.core.runtime.policy_gate import check_runtime_policy
     from ultron.core.tools.registry import get_tool
 
     gated: list[dict] = []
@@ -179,6 +196,37 @@ def execute_batch(calls: list[dict]) -> tuple[list[dict], float]:
             entry.update(status="error", result=f"Error: unknown tool '{tool_name}'.")
             gated.append(entry)
             continue
+
+        # Inner calls face the SAME policy as direct invocations — a wrapper
+        # must never provide a way around the invoking task's policy.
+        if policy is not None:
+            policy_verdict = check_runtime_policy(policy, tool_name, arguments)
+            if not policy_verdict.allowed:
+                logger.warning(
+                    "[POLICY_GATE_BATCH_DENIAL] tool=%s violation=%s",
+                    tool_name,
+                    policy_verdict.violation_type,
+                )
+                entry.update(
+                    status="blocked",
+                    result=(
+                        f"Policy violation: Tool '{tool_name}' cannot be executed. "
+                        f"{policy_verdict.reason}"
+                    ),
+                )
+                gated.append(entry)
+                continue
+            if policy_verdict.requires_confirmation:
+                logger.info("[POLICY_GATE_BATCH_CONFIRM] tool=%s", tool_name)
+                entry.update(
+                    status="confirm",
+                    result=(
+                        f"Needs approval: {tool_name} requires confirmation under "
+                        "the active execution policy."
+                    ),
+                )
+                gated.append(entry)
+                continue
 
         target, content = _generic_target_content(tool_name, arguments)
         verdict = check_action(tool_name, target, content)
@@ -231,18 +279,22 @@ def _parse_calls(calls_json: str) -> list[dict] | None:
     return calls[:MAX_BATCH_CALLS] or None
 
 
-def run_tool_batch(calls_json: str) -> str:
+def run_tool_batch(calls_json: str, policy: ExecutionPolicy | None = None) -> str:
     """
-    Runs several tool calls concurrently, each gated through the security
-    boundary, and returns a synthesized report.
+    Runs several tool calls concurrently, each gated through the Runtime
+    Policy Gate (when a policy is active) and the security boundary, and
+    returns a synthesized report.
 
     Arguments:
         calls_json: JSON array of {"tool": ..., "arguments": {...}}.
+        policy: the invoking task's authoritative ExecutionPolicy. Every
+            inner call is evaluated against it exactly like a direct tool
+            call — the wrapper never bypasses or weakens it.
 
-    Safety: a call whose boundary verdict is deny is never executed and is
-    reported as blocked; a confirm verdict is reported as needing approval
-    instead of running silently. Only auto-allowed calls execute, all at
-    the same time.
+    Safety: a call whose policy or boundary verdict is deny is never executed
+    and is reported as blocked; a confirmation verdict (from either gate) is
+    reported as needing approval instead of running silently. Only allowed
+    calls execute, all at the same time.
     """
     calls = _parse_calls(calls_json)
     if calls is None:
@@ -261,7 +313,7 @@ def run_tool_batch(calls_json: str) -> str:
         if key not in seen:
             seen.add(key)
             unique.append(call)
-    gated, elapsed = execute_batch(unique)
+    gated, elapsed = execute_batch(unique, policy=policy)
     return format_batch_report(gated, elapsed=elapsed)
 
 

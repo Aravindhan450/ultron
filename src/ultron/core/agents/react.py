@@ -32,6 +32,7 @@ Safety model (consistent with the rest of Ultron):
 """
 
 import json
+import os
 import re
 from typing import Any
 
@@ -59,6 +60,11 @@ from ultron.core.intelligence.prompt_assembly import (
 )
 from ultron.core.intelligence.synthesis import strip_internal_thought
 from ultron.core.intelligence.task_classification import TaskType
+from ultron.core.intelligence.verification_evidence import (
+    _diagnosis_reported_in_transcript,
+    _successful_investigations,
+    satisfy_diagnosis_criteria,
+)
 from ultron.core.logging import get_logger
 from ultron.core.memory.session_memory import SessionMemory
 from ultron.core.runtime.policy_gate import check_runtime_policy
@@ -1756,44 +1762,53 @@ class ReActAgent(BaseAgent):
             ExecutionIntent.INSPECT,
         ) or task.active_policy.is_read_only
 
-        def _satisfy_readonly_diagnosis() -> bool:
-            """Marks read-only diagnostic work complete from recorded evidence.
+        _DIAGNOSIS_CRITERIA: list[tuple[str, str]] = (
+            ("relevant_code_inspected", "Relevant code inspected"),
+            ("failure_mechanism_identified", "Failure mechanism identified and analyzed"),
+            ("diagnosis_reported", "Diagnosis reported in response"),
+            ("current_state_analyzed", "Current state analyzed"),
+            ("plan_presented", "Plan presented in response"),
+            ("system_architecture_inspected", "Architecture inspected"),
+            ("explanation_provided", "Explanation provided in response"),
+            ("repository_structure_inspected", "Repository structure inspected"),
+            ("findings_reported", "Findings reported in response"),
+            ("root_cause_diagnosis", "Root cause diagnosed"),
+            ("evidence_based_explanation", "Evidence-based explanation provided"),
+            ("proposed_fix_strategy", "Proposed fix strategy presented"),
+        )
 
-            A plan verifier (especially a small local model) tends to mark
-            diagnostic criteria unsatisfied no matter how much investigation
-            was performed, so the plan would stall forever. For a read-only
-            policy the recorded read-only investigation is the completion
-            evidence: satisfy the diagnostic acceptance criteria and the
-            plan's overall criteria so the task can complete.
+        def _satisfy_readonly_diagnosis() -> bool:
+            """Marks diagnostic criteria from CRITERION-SPECIFIC evidence.
+
+            Each acceptance criterion is judged against the evidence the
+            recorded execution history actually contains (see
+            ``verification_evidence``): inspecting a file proves
+            ``relevant_code_inspected``, but root-cause criteria need
+            correlated investigation (relationship + multiple actions) plus a
+            substantive recorded report. Evidence levels stay semantically
+            honest — LEVEL_5 only with an independent deterministic signal.
+            Criteria without sufficient evidence stay unverified.
             """
             if not (
                 readonly_diagnosis and _has_readonly_investigation_evidence(task)
             ):
                 return False
-            for crit_id, desc in (
-                ("relevant_code_inspected", "Relevant code inspected"),
-                ("failure_mechanism_identified", "Failure mechanism identified and analyzed"),
-                ("diagnosis_reported", "Diagnosis reported in response"),
-                ("current_state_analyzed", "Current state analyzed"),
-                ("plan_presented", "Plan presented in response"),
-                ("system_architecture_inspected", "Architecture inspected"),
-                ("explanation_provided", "Explanation provided in response"),
-                ("repository_structure_inspected", "Repository structure inspected"),
-                ("findings_reported", "Findings reported in response"),
-                ("root_cause_diagnosis", "Root cause diagnosed"),
-                ("evidence_based_explanation", "Evidence-based explanation provided"),
-                ("proposed_fix_strategy", "Proposed fix strategy presented"),
-            ):
-                task.verify_acceptance_criterion(
-                    crit_id, desc, EvidenceLevel.LEVEL_5_VERIFIED
-                )
-            for requirement in list(task.requirements):
-                if not requirement.completed:
-                    try:
-                        task.mark_requirement_complete(requirement.description)
-                    except ValueError:
-                        pass
-            return True
+            verified = satisfy_diagnosis_criteria(task, _DIAGNOSIS_CRITERIA)
+            # The plan's overall requirements are completed only when the
+            # diagnosis itself is grounded: enough correlated evidence exists
+            # AND a substantive report was recorded. Model prose alone never
+            # completes a requirement.
+            grounded = len(
+                _successful_investigations(task)
+            ) >= 1 and _diagnosis_reported_in_transcript(task)
+            if grounded:
+                for requirement in list(task.requirements):
+                    if not requirement.completed:
+                        try:
+                            task.mark_requirement_complete(requirement.description)
+                        except ValueError:
+                            pass
+            return bool(verified)
 
         if data is None:
             _note(
@@ -2156,6 +2171,47 @@ class ReActAgent(BaseAgent):
                     f"{policy_verdict.reason} "
                     "Do not attempt this operation under the active execution policy."
                 )
+        # --- Security Boundary Check (Hard Denials) ---
+        # Hard security guardrails (secret leak prevention, path traversal, forbidden commands)
+        # take precedence over interactive confirmation: a denied action must NEVER be offered
+        # for user approval; it must be blocked immediately as a failed tool observation.
+        if tool_name not in ("run_parallel", "run_tool_batch"):
+            target, content = _generic_target_content(tool_name, arguments)
+            if tool_name == "run_command":
+                from ultron.core.nlp.normalize import normalize_terminal_command
+
+                raw_cmd = str(arguments.get("command", "")).strip()
+                normalized = normalize_terminal_command(raw_cmd)
+                if not normalized:
+                    return (
+                        "Error: run_command requires a command-shaped argument; "
+                        "the supplied text is not a shell command."
+                    )
+                target = normalized
+            sec_verdict = check_action(tool_name, target, content)
+            if is_denied(sec_verdict):
+                return blocked_message(sec_verdict)
+
+        if (
+            policy is not None
+            and policy_verdict.requires_confirmation
+            and tool_name not in ("run_parallel", "run_tool_batch")
+        ):
+            # REQUIRES_CONFIRMATION is authoritative (arch doc §10): the
+            # action MUST NOT execute here — not even when the security
+            # boundary would auto-allow it. Route through the EXISTING
+            # PendingAction confirmation mechanism so the task stays
+            # resumable and the approved action executes exactly once
+            # after approval.
+            logger.info(
+                "[POLICY_GATE_CONFIRM] tool=%s target=%s reason=%s",
+                tool_name,
+                target,
+                policy_verdict.reason,
+            )
+            return self._pending_confirmation_action(
+                tool_name, arguments, target, content
+            )
 
         # --- State-modifying actions: gated by the boundary verdict ---
         if tool_name == "run_command":
@@ -2217,7 +2273,10 @@ class ReActAgent(BaseAgent):
                     "Error: run_tool_batch requires a 'calls_json' argument — "
                     "a JSON array of {\"tool\": ..., \"arguments\": {...}}."
                 )
-            return _run_batch(str(calls_json))
+            # The task's authoritative policy travels INTO the batch: every
+            # inner call is policy-gated exactly like a direct tool call, so
+            # the wrapper cannot bypass the invoking task's restrictions.
+            return _run_batch(str(calls_json), policy=policy)
 
         if tool_name == "write_file":
             # handle_file_write runs the same boundary gate: deny → blocked,
@@ -2330,6 +2389,93 @@ class ReActAgent(BaseAgent):
             return message
         return executor.gate_new_action_with_exhausted_budget(tool_name)
 
+
+    def _pending_confirmation_action(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        target: str,
+        content: str | None,
+    ) -> ChatMessage:
+        """
+        Builds the existing PendingAction payload for a policy-required
+        confirmation (REQUIRES_CONFIRMATION at the Runtime Policy Gate).
+
+        Dedicated action types keep their established PendingAction encoding
+        (run_command → command string, write_file → file path + content, …) so
+        main.py's existing confirmation cards and ``execute_pending_action``
+        branches work unchanged. Any other registered tool uses the generic
+        ``registry_tool`` encoding (target = tool name, content = JSON
+        arguments) so every policy-confirmed action can be executed exactly
+        once after approval without a second confirmation system.
+        """
+        if tool_name == "run_command":
+            from ultron.core.nlp.normalize import normalize_terminal_command
+
+            normalized = normalize_terminal_command(
+                str(arguments.get("command", "")).strip()
+            )
+            if not normalized:
+                return (
+                    "Error: run_command requires a command-shaped argument; "
+                    "the supplied text is not a shell command."
+                )
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=f"Command execution requested: '{normalized}'",
+                pending_action=PendingAction(action_type="run_command", target=normalized),
+            )
+        if tool_name == "write_file":
+            file_path = str(
+                arguments.get("file_path") or arguments.get("filename") or arguments.get("path") or ""
+            )
+            abs_path = file_path if os.path.isabs(file_path) else os.path.join(os.getcwd(), file_path)
+            if os.path.exists(abs_path) and not os.path.isdir(abs_path):
+                return ChatMessage(
+                    role=Role.ASSISTANT,
+                    content=f"File '{file_path}' already exists. Do you want to overwrite it?",
+                    pending_action=PendingAction(
+                        action_type="overwrite_file",
+                        target=file_path,
+                        content=str(arguments.get("content", "")),
+                    ),
+                )
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=f"File create requested: '{file_path}'",
+                pending_action=PendingAction(
+                    action_type="write_file",
+                    target=file_path,
+                    content=str(arguments.get("content", "")),
+                ),
+            )
+        if tool_name in {"create_file", "replace_file", "replace_in_file", "append_to_file", "delete_file", "rename_file"}:
+            return self._route_coding_file_op(tool_name, arguments)
+        if tool_name == "make_http_request":
+            method = str(arguments.get("method", "GET")).upper()
+            url = str(arguments.get("url", ""))
+            body = arguments.get("body")
+            if isinstance(body, (dict, list)):
+                body = json.dumps(body)
+            return handle_http(method, url, body)
+        if tool_name == "run_query":
+            sql = str(arguments.get("sql", arguments.get("query", "")))
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content=f"Database query execution requested: '{sql}'",
+                pending_action=PendingAction(action_type="db_query", target=sql),
+            )
+        # Generic registered tool: exact arguments travel as JSON so the
+        # approved action executes with the same arguments that were gated.
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content=f"Action requires confirmation: {tool_name} on '{target}'",
+            pending_action=PendingAction(
+                action_type="registry_tool",
+                target=tool_name,
+                content=json.dumps(arguments, default=str),
+            ),
+        )
 
     def _route_coding_file_op(
         self, tool_name: str, arguments: dict[str, Any]

@@ -673,6 +673,30 @@ async def execute_pending_action(action: PendingAction) -> str:
         results = await execute_plan(steps)
         result = "\n".join(results)
 
+    elif action.action_type == "registry_tool":
+        # Runtime-policy confirmation for a registered tool with no dedicated
+        # branch: target = tool name, content = JSON-encoded arguments. The
+        # arguments were already gated by the Runtime Policy Gate + security
+        # boundary BEFORE the confirmation round-trip, so this executes the
+        # exact approved action — never a re-derived one.
+        import json as _json
+
+        from ultron.core.tools.registry import coerce_tool_arguments
+
+        tool_name = action.target
+        func = get_tool(tool_name)
+        if func is None:
+            result = f"Error: Tool '{tool_name}' not found."
+        else:
+            try:
+                tool_args = _json.loads(action.content or "{}")
+            except (_json.JSONDecodeError, ValueError):
+                tool_args = {}
+            if not isinstance(tool_args, dict):
+                tool_args = {}
+            UI.render_tool_activity(tool_name, str(tool_args)[:80])
+            result = str(func(**coerce_tool_arguments(func, tool_args)))
+
     else:
         result = f"Error: Unrecognised action type '{action.action_type}'."
 

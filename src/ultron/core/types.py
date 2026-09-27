@@ -46,6 +46,9 @@ class PendingAction(BaseModel):
         "discover_workspace_summary",
         "list_directory",
         "search_files",
+        # Runtime-policy confirmation for a registered tool with no dedicated
+        # action branch: target = tool name, content = JSON-encoded arguments.
+        "registry_tool",
     ]
     target: str          # The command string OR the filename/query/URL to act upon
     content: str | None = None  # Content to write if action_type is "write_file" or "overwrite_file"

@@ -247,9 +247,10 @@ def test_run_tool_batch_routes_directly_without_outer_url_scan(monkeypatch):
     captured = {}
     real_execute = pt.execute_batch
 
-    def spy_execute(calls):
+    def spy_execute(calls, policy=None):
         captured["calls"] = calls
-        return real_execute(calls)
+        captured["policy"] = policy
+        return real_execute(calls, policy=policy)
 
     monkeypatch.setattr(pt, "execute_batch", spy_execute)
 

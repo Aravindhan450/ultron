@@ -933,6 +933,8 @@ async def generate_task_plan(
     workspace: WorkspaceKind | None = None,
     working_context: str | None = None,
     cwd: str | None = None,
+    intent: UserIntent | None = None,
+    policy: ExecutionPolicy | None = None,
 ) -> TaskPlan | None:
     """
     Generates a validated, outcome-oriented TaskPlan for a goal with bounded recovery.
@@ -942,6 +944,14 @@ async def generate_task_plan(
     - If the LLM returns invalid JSON or fails structural validation, an automated
       re-plan recovery turn is attempted with validation feedback.
     - If LLM planning fails completely, a validated deterministic fallback plan is used.
+
+    Contract (arch doc §9): the authoritative ExecutionPolicy derived from the
+    user's intent is bound to the plan BEFORE validation, so a plan whose
+    steps exceed the user's authority is rejected/re-planned — never executed.
+    Any ``execution_policy`` / ``execution_intent`` the LLM emits in its JSON
+    is untrusted model output and is ignored: ``parse_plan_json`` never reads
+    those fields, and the policy used here always comes from ``intent``/
+    ``policy`` (caller-derived), never from the model.
     """
     if task_type is TaskType.INFORMATIONAL:
         return None
@@ -961,6 +971,23 @@ async def generate_task_plan(
 
     from ultron.core.context.invocation import model_caller
 
+    def _validated_bound_plan(candidate: TaskPlan) -> TaskPlan | None:
+        """Binds the authoritative intent/policy, THEN validates against it."""
+        if intent is not None:
+            candidate.user_intent = intent
+        if policy is not None:
+            candidate.execution_policy = policy
+        elif intent is not None:
+            candidate.execution_policy = intent.policy
+        report = validate_plan(candidate, policy)
+        if report.valid:
+            return candidate
+        logger.warning(
+            "[PLAN_VALIDATION] valid=False issues: %s",
+            "; ".join(i.message for i in report.issues),
+        )
+        return None
+
     plan: TaskPlan | None = None
     if engine is not None:
         try:
@@ -969,35 +996,37 @@ async def generate_task_plan(
             logger.info("[PLAN_GENERATION] received %d chars from engine", len(raw or ""))
             plan = parse_plan_json(raw, goal, task_type, ws, context)
             if plan is not None:
-                report = validate_plan(plan)
-                if report.valid:
-                    logger.info("[PLAN_VALIDATION] valid=True (%d steps)", len(plan.steps))
+                # Policy is bound BEFORE validation (arch doc §2, §9): the
+                # plan is judged against the user-derived policy, not against
+                # whatever the model described.
+                bound = _validated_bound_plan(plan)
+                if bound is not None:
+                    logger.info("[PLAN_VALIDATION] valid=True (%d steps)", len(bound.steps))
                     logger.info("[PLAN_SELECTED] normal")
-                    _bind_user_intent_to_plan(plan, goal, cwd)
-                    return plan
+                    return bound
 
-                issue_msgs = [i.message for i in report.issues]
-                logger.warning(
-                    "[PLAN_VALIDATION] valid=False issues: %s",
-                    "; ".join(issue_msgs),
-                )
                 # Attempt 1 bounded re-plan recovery with validation feedback
                 recovery_prompt = (
                     f"{prompt}\n\n"
-                    f"IMPORTANT CORRECTION: Your previous plan was invalid ({'; '.join(issue_msgs[:3])}). "
-                    "Please correct the issues and output ONLY a valid JSON object matching the plan schema."
+                    "IMPORTANT CORRECTION: Your previous plan was invalid "
+                    "(it either violated the required structure or requested "
+                    "actions the user's execution policy does not authorize). "
+                    "Produce a plan whose every step stays within the "
+                    "authorized capabilities, and output ONLY a valid JSON "
+                    "object matching the plan schema."
                 )
                 with model_caller("plan_recovery"):
                     retry_raw = await engine.generate([{"role": "user", "content": recovery_prompt}])
                 retry_plan = parse_plan_json(retry_raw, goal, task_type, ws, context)
-                if retry_plan is not None and validate_plan(retry_plan).valid:
-                    logger.info(
-                        "[PLAN_RECOVERY] bounded recovery succeeded (%d steps)",
-                        len(retry_plan.steps),
-                    )
-                    logger.info("[PLAN_SELECTED] recovered")
-                    _bind_user_intent_to_plan(retry_plan, goal, cwd)
-                    return retry_plan
+                if retry_plan is not None:
+                    bound = _validated_bound_plan(retry_plan)
+                    if bound is not None:
+                        logger.info(
+                            "[PLAN_RECOVERY] bounded recovery succeeded (%d steps)",
+                            len(bound.steps),
+                        )
+                        logger.info("[PLAN_SELECTED] recovered")
+                        return bound
         except Exception as exc:  # noqa: BLE001
             logger.warning("[PLAN_GENERATION_FAILED] engine call failed: %s", exc)
 
@@ -1039,6 +1068,8 @@ async def prepare_task_for_execution(
         classification.task_type,
         engine,
         cwd=cwd,
+        intent=classification.user_intent,
+        policy=classification.user_intent.policy if classification.user_intent else None,
     )
     if plan is None:
         logger.info("[PLAN_RECOVERY] using deterministic fallback plan for task_type=%s", classification.task_type.value)
@@ -1053,7 +1084,9 @@ async def prepare_task_for_execution(
         plan.failure_recovery = (
             f"Initial LLM planner failed or was unavailable; recovered using deterministic {classification.task_type.value} execution plan."
         )
-        report = validate_plan(plan)
+        # Fallback plans already carry the user-derived policy; validate the
+        # same way the LLM path does — against the authoritative policy.
+        report = validate_plan(plan, classification.user_intent.policy if classification.user_intent else None)
         if report.valid:
             logger.info("[PLAN_SELECTED] deterministic_fallback (valid=True, %d steps)", len(plan.steps))
             _bind_user_intent_to_plan(plan, classification.goal, cwd)

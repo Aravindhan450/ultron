@@ -20,7 +20,13 @@ from ultron.core.intelligence.prompt_assembly import (
 from ultron.core.logging import get_logger
 from ultron.core.nlp.intent import route_request
 from ultron.core.nlp.normalize import detect_explicit_test_command
-from ultron.core.types import ChatMessage, PendingAction, Role, history_to_openai_format
+from ultron.core.types import (
+    ChatMessage,
+    ExecutionPolicy,
+    PendingAction,
+    Role,
+    history_to_openai_format,
+)
 
 logger = get_logger("ultron.agents.simple")
 
@@ -63,11 +69,18 @@ def _generic_target_content(tool_name: str, arguments: dict) -> tuple[str, str |
 
     definition = get_tool_definition(tool_name)
     if definition is not None and (definition.target_arg or definition.content_arg):
-        target = (
-            str(arguments.get(definition.target_arg, definition.target_default))
-            if definition.target_arg
-            else ""
-        )
+        target = ""
+        if definition.target_arg:
+            val = arguments.get(definition.target_arg)
+            if (val is None or val == "") and definition.target_arg in ("file_path", "filename", "path"):
+                val = (
+                    arguments.get("file_path")
+                    or arguments.get("filename")
+                    or arguments.get("path")
+                )
+            if val is None:
+                val = definition.target_default or ""
+            target = str(val)
         content = (
             str(arguments.get(definition.content_arg, ""))
             if definition.content_arg
@@ -90,6 +103,10 @@ def _generic_target_content(tool_name: str, arguments: dict) -> tuple[str, str |
             "",
         )
         return target, None
+    if tool_name == "make_http_request":
+        body = arguments.get("body")
+        body_str = json.dumps(body) if isinstance(body, (dict, list)) else (str(body) if body is not None else None)
+        return str(arguments.get("url", "")), body_str
     if tool_name == "retrieve":
         return str(arguments.get("url", "") or arguments.get("request", "")), None
     if tool_name == "explain_relation":
@@ -2307,6 +2324,7 @@ async def handle_parallel_tools(
     user_input: str,
     engine,
     calls: list[dict] | None = None,
+    policy: ExecutionPolicy | None = None,
 ) -> ChatMessage:
     """
     Runs several *different* tools concurrently and returns one synthesized
@@ -2314,9 +2332,10 @@ async def handle_parallel_tools(
 
     ``calls`` is the deterministically-extracted batch when the detector
     produced one; otherwise the LLM planner (``plan_tool_batch``) turns the
-    request into independent calls. Every call is gated through the security
-    boundary inside ``run_tool_batch`` — deny verdicts never execute, confirm
-    verdicts are surfaced as needing approval instead of running silently.
+    request into independent calls. Every call is gated through the Runtime
+    Policy Gate (when ``policy`` is active) and the security boundary inside
+    ``run_tool_batch`` — forbidden calls never execute, confirmation-required
+    calls are surfaced as needing approval instead of running silently.
     """
     if calls is None:
         from ultron.core.intelligence.parallel_tools import plan_tool_batch
@@ -2334,7 +2353,7 @@ async def handle_parallel_tools(
 
     from ultron.core.intelligence.parallel_tools import run_tool_batch
 
-    result = run_tool_batch(json.dumps(calls))
+    result = run_tool_batch(json.dumps(calls), policy=policy)
     return ChatMessage(role=Role.ASSISTANT, content=str(result))
 
 
