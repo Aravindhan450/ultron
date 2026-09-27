@@ -37,12 +37,12 @@ def execute_tool(tool_name: str, **kwargs) -> str:
     or a permissive mode). Returns an error string if the tool is missing or
     raises, so the failure surfaces as a message instead of a crash.
     """
-    from ultron.core.tools.registry import get_tool
+    from ultron.core.tools.registry import coerce_tool_arguments, get_tool
     func = get_tool(tool_name)
     if not func:
         return f"Error: Tool '{tool_name}' not found in registry."
     try:
-        return str(func(**kwargs))
+        return str(func(**coerce_tool_arguments(func, kwargs)))
     except Exception as exc:  # noqa: BLE001 — tools are arbitrary; a tool bug
         # must surface as a message, never crash the agent loop.
         return f"Error executing tool '{tool_name}': {exc}"

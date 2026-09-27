@@ -28,6 +28,11 @@ from ultron.core.runtime.events import (
     TaskEventType,
     sanitize_event_payload,
 )
+from ultron.core.runtime.policy_gate import (
+    PolicyVerdict,
+    check_runtime_policy,
+    classify_tool_capability,
+)
 from ultron.core.runtime.projection import project_task_state
 from ultron.core.runtime.result import RunResult
 from ultron.core.runtime.runtime import AgentRuntime
@@ -61,6 +66,7 @@ __all__ = [
     "InMemoryEventStore",
     "InvalidStateTransitionError",
     "JsonlEventStore",
+    "PolicyVerdict",
     "RunResult",
     "RunState",
     "RuntimeBudget",
@@ -74,6 +80,8 @@ __all__ = [
     "TaskState",
     "assert_runtime_transition",
     "assert_task_transition",
+    "check_runtime_policy",
+    "classify_tool_capability",
     "get_default_event_store",
     "project_task_state",
     "reset_default_event_store",

@@ -82,6 +82,46 @@ def test_schema_generation_consumes_canonical():
         assert entry["description"].strip()
 
 
+def test_schema_types_resolve_string_annotations():
+    # Tool modules use `from __future__ import annotations`, so parameter
+    # annotations are strings; the schema must still advertise the real JSON
+    # types (a model told an int is a "string" sends strings, and the tool
+    # raises `'<=' not supported between instances of 'int' and 'str'`).
+    props = {
+        entry["name"]: entry["parameters"]["properties"]
+        for entry in get_tools_schema()
+    }
+    for name, param, expected in (
+        ("repo_map", "max_tokens", "integer"),
+        ("code_search", "max_results", "integer"),
+        ("code_search", "regex", "boolean"),
+        ("code_search", "case_sensitive", "boolean"),
+        ("read_file", "max_bytes", "integer"),
+    ):
+        if param in props.get(name, {}):
+            assert props[name][param]["type"] == expected, (name, param)
+
+
+def test_coerce_tool_arguments_converts_string_scalars():
+    from ultron.core.tools.registry import coerce_tool_arguments
+
+    func = TOOLS["repo_map"]
+    coerced = coerce_tool_arguments(
+        func, {"focus": "login", "max_tokens": "1000", "path": "."}
+    )
+    assert coerced["max_tokens"] == 1000
+    assert coerced["focus"] == "login"
+
+    search = TOOLS["code_search"]
+    coerced = coerce_tool_arguments(
+        search, {"query": "x", "max_results": "5", "regex": "false"}
+    )
+    assert coerced["max_results"] == 5
+    assert coerced["regex"] is False
+    # An uncoercible value is left for the tool to report.
+    assert coerce_tool_arguments(search, {"max_results": "many"})["max_results"] == "many"
+
+
 # ---------------------------------------------------------------------------
 # Phase 7 — no independent authoritative tables remain
 # ---------------------------------------------------------------------------

@@ -257,7 +257,7 @@ def classify_task_deterministic(user_input: str) -> TaskClassification:
     text = _normalize(user_input)
     task_type = _classify_deterministic(text) or TaskType.INFORMATIONAL
     signal = _clarification_signal(text, task_type)
-    intent = understand_user_intent(user_input)
+    intent = understand_user_intent(user_input, task_type=task_type)
     return TaskClassification(
         task_type=task_type,
         goal=extract_goal(user_input, task_type),
@@ -359,9 +359,13 @@ async def classify_task(
     clarification_questions = [
         str(q) for q in payload.get("clarification_questions", []) if str(q).strip()
     ]
+    from ultron.core.intelligence.intent_understanding import understand_user_intent
+
+    intent = understand_user_intent(user_input, task_type=task_type)
     return TaskClassification(
         task_type=task_type,
         goal=str(payload["goal"]).strip(),
         clarification_required=bool(payload.get("clarification_required", False)),
         clarification_questions=clarification_questions,
+        user_intent=intent,
     )

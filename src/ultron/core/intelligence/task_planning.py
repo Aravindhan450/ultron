@@ -35,12 +35,15 @@ from ultron.core.types import (
     AcceptanceCriterion,
     AcceptanceCriterionStatus,
     EvidenceLevel,
+    ExecutionIntent,
+    ExecutionPolicy,
     FailureStrategy,
     PlanStep,
     TaskLifecycleStatus,
     TaskPlan,
     TaskState,
     TaskType,
+    UserIntent,
     WorkspaceKind,
 )
 
@@ -366,7 +369,7 @@ def build_software_engineering_plan(
         set_active_project_dir,
     )
 
-    intent = understand_user_intent(goal, cwd=cwd)
+    intent = understand_user_intent(goal, cwd=cwd, task_type=TaskType.SOFTWARE_ENGINEERING)
 
     resolved_project_dir: Path
     if project_dir is not None:
@@ -479,6 +482,8 @@ def build_software_engineering_plan(
         verification_requirements=[f"The user goal is satisfied: {goal}"],
         acceptance_criteria=acceptance_criteria,
         user_intent=intent,
+        execution_policy=intent.policy if intent else ExecutionPolicy.execute_with_confirmation(),
+        execution_intent=intent.execution_intent if intent else ExecutionIntent.IMPLEMENT,
         failure_recovery="Diagnose and classify failures; apply repair and retest; do not report completion without evidence.",
         project_dir=str(resolved_project_dir),
     )
@@ -491,11 +496,135 @@ build_artifact_plan = build_software_engineering_plan
 def build_debugging_plan(
     goal: str,
     workspace: WorkspaceKind = WorkspaceKind.UNKNOWN,
+    intent: UserIntent | None = None,
+    policy: ExecutionPolicy | None = None,
 ) -> TaskPlan:
-    """Deterministic executable plan for debugging and defect repair."""
+    """Deterministic executable plan for debugging, diagnosis, or defect repair."""
     from ultron.core.intelligence.intent_understanding import understand_user_intent
+    from ultron.core.types import ExecutionIntent, ExecutionPolicy
 
-    intent = understand_user_intent(goal)
+    if intent is None:
+        intent = understand_user_intent(goal, task_type=TaskType.DEBUGGING)
+    if policy is None:
+        policy = intent.policy if intent else ExecutionPolicy.read_only()
+
+    # If the user requested a read-only investigation / diagnosis:
+    if policy.is_read_only or intent.execution_intent in (
+        ExecutionIntent.DIAGNOSE,
+        ExecutionIntent.EXPLAIN,
+        ExecutionIntent.INSPECT,
+    ):
+        steps = [
+            PlanStep(
+                id=1,
+                description="Inspect repository and locate relevant components",
+                purpose="Inspect workspace structure and identify files/symbols handling the relevant flow",
+                expected_outcome="Relevant files and symbols identified",
+                completion_criteria=["Relevant files and symbols identified"],
+                failure_strategy=FailureStrategy.RETRY,
+                retry_policy=2,
+            ),
+            PlanStep(
+                id=2,
+                description="Trace execution path and state flow",
+                purpose="Trace control flow, data transformations, and state preservation across identified components",
+                expected_outcome="Execution flow and state transitions mapped",
+                dependencies=[1],
+                completion_criteria=["Execution path traced"],
+                failure_strategy=FailureStrategy.RETRY,
+                retry_policy=2,
+            ),
+            PlanStep(
+                id=3,
+                description="Isolate root cause and failure mechanism",
+                purpose="Identify the exact logic, configuration, or state breakdown causing the problem",
+                expected_outcome="Root cause diagnosed with code references",
+                dependencies=[1, 2],
+                completion_criteria=["Root cause identified"],
+                failure_strategy=FailureStrategy.RETRY,
+                retry_policy=2,
+            ),
+            PlanStep(
+                id=4,
+                description="Verify findings and synthesize evidence-backed diagnostic report",
+                purpose="Synthesize findings, explain component connections, and report diagnosis to user without modifying files",
+                expected_outcome="Clear diagnosis and architecture explanation delivered",
+                dependencies=[1, 2, 3],
+                completion_criteria=[goal],
+                failure_strategy=FailureStrategy.STOP,
+            ),
+        ]
+        return TaskPlan(
+            goal=goal,
+            task_type=TaskType.DEBUGGING,
+            workspace=workspace,
+            steps=steps,
+            completion_criteria=[goal, "Root cause diagnosed and explained with evidence"],
+            verification_requirements=[f"Diagnostic explanation provided for: {goal}"],
+            acceptance_criteria=list(intent.acceptance_criteria) if intent else [],
+            user_intent=intent,
+            execution_policy=policy,
+            execution_intent=intent.execution_intent,
+            failure_recovery="Inspect repository; trace flow; locate root cause; report findings.",
+        )
+
+    # If the user requested a plan or proposed fix (PLAN_ONLY):
+    if intent.execution_intent == ExecutionIntent.PLAN or policy == ExecutionPolicy.plan_only():
+        steps = [
+            PlanStep(
+                id=1,
+                description="Inspect repository and trace failure flow",
+                purpose="Locate relevant components and analyze the defect flow",
+                expected_outcome="Subsystem components and defect flow identified",
+                completion_criteria=["Subsystem analyzed"],
+                failure_strategy=FailureStrategy.RETRY,
+                retry_policy=2,
+            ),
+            PlanStep(
+                id=2,
+                description="Diagnose root cause in source code",
+                purpose="Identify the exact root cause causing the defect",
+                expected_outcome="Root cause identified with code references",
+                dependencies=[1],
+                completion_criteria=["Root cause identified"],
+                failure_strategy=FailureStrategy.RETRY,
+                retry_policy=2,
+            ),
+            PlanStep(
+                id=3,
+                description="Design targeted implementation and fix strategy",
+                purpose="Formulate architectural changes and step-by-step fix design",
+                expected_outcome="Fix strategy and required changes designed",
+                dependencies=[1, 2],
+                completion_criteria=["Fix strategy designed"],
+                failure_strategy=FailureStrategy.RETRY,
+                retry_policy=2,
+            ),
+            PlanStep(
+                id=4,
+                description="Present proposed fix plan and recommendations",
+                purpose="Deliver structured repair proposal to user without modifying files",
+                expected_outcome="Comprehensive fix plan presented",
+                dependencies=[1, 2, 3],
+                completion_criteria=[goal],
+                failure_strategy=FailureStrategy.STOP,
+            ),
+        ]
+        return TaskPlan(
+            goal=goal,
+            task_type=TaskType.DEBUGGING,
+            workspace=workspace,
+            steps=steps,
+            completion_criteria=[goal, "Fix plan formulated and presented"],
+            verification_requirements=[f"Fix proposal presented for: {goal}"],
+            acceptance_criteria=list(intent.acceptance_criteria) if intent else [],
+            user_intent=intent,
+            execution_policy=policy,
+            execution_intent=intent.execution_intent,
+            failure_recovery="Diagnose root cause; formulate fix; present proposal.",
+        )
+
+    # Otherwise, legitimate REPAIR workflow:
     steps = [
         PlanStep(
             id=1,
@@ -555,6 +684,8 @@ def build_debugging_plan(
         verification_requirements=[f"The user goal is satisfied: {goal}"],
         acceptance_criteria=list(intent.acceptance_criteria) if intent else [],
         user_intent=intent,
+        execution_policy=policy,
+        execution_intent=ExecutionIntent.REPAIR,
         failure_recovery="Diagnose root cause; apply targeted fix; re-test before completing.",
     )
 
@@ -625,19 +756,29 @@ def build_research_plan(
         verification_requirements=[f"The user goal is satisfied: {goal}"],
         acceptance_criteria=list(intent.acceptance_criteria) if intent else [],
         user_intent=intent,
+        execution_policy=intent.policy if intent else ExecutionPolicy.read_only(),
+        execution_intent=intent.execution_intent if intent else ExecutionIntent.EXPLAIN,
         failure_recovery="Gather multi-source evidence; cross-reference findings before completing.",
     )
 
 
 def build_system_operation_plan(
     goal: str,
-    task_type: TaskType = TaskType.SYSTEM_OPERATION,
+    task_type: TaskType | WorkspaceKind = TaskType.SYSTEM_OPERATION,
     workspace: WorkspaceKind = WorkspaceKind.UNKNOWN,
 ) -> TaskPlan:
     """Deterministic executable plan for system, configuration, and data operations."""
     from ultron.core.intelligence.intent_understanding import understand_user_intent
 
-    intent = understand_user_intent(goal)
+    real_task_type = TaskType.SYSTEM_OPERATION
+    real_workspace = workspace
+    if isinstance(task_type, WorkspaceKind):
+        real_workspace = task_type
+        real_task_type = TaskType.SYSTEM_OPERATION
+    elif isinstance(task_type, TaskType):
+        real_task_type = task_type
+
+    intent = understand_user_intent(goal, task_type=real_task_type)
     steps = [
         PlanStep(
             id=1,
@@ -680,13 +821,15 @@ def build_system_operation_plan(
     ]
     return TaskPlan(
         goal=goal,
-        task_type=TaskType.SYSTEM_OPERATION,
-        workspace=workspace,
+        task_type=real_task_type,
+        workspace=real_workspace,
         steps=steps,
         completion_criteria=[goal, "System operations applied and verified"],
         verification_requirements=[f"The user goal is satisfied: {goal}"],
         acceptance_criteria=list(intent.acceptance_criteria) if intent else [],
         user_intent=intent,
+        execution_policy=intent.policy if intent else ExecutionPolicy.execute_with_confirmation(),
+        execution_intent=intent.execution_intent if intent else ExecutionIntent.EXECUTE,
         failure_recovery="Inspect current state; apply changes safely; verify outcome.",
     )
 
@@ -698,7 +841,7 @@ def build_multi_step_plan(
     """Deterministic executable plan for general multi-step tasks without software scaffolding."""
     from ultron.core.intelligence.intent_understanding import understand_user_intent
 
-    intent = understand_user_intent(goal)
+    intent = understand_user_intent(goal, task_type=TaskType.MULTI_STEP)
     steps = [
         PlanStep(
             id=1,
@@ -738,6 +881,8 @@ def build_multi_step_plan(
         verification_requirements=[f"The user goal is satisfied: {goal}"],
         acceptance_criteria=list(intent.acceptance_criteria) if intent else [],
         user_intent=intent,
+        execution_policy=intent.policy if intent else ExecutionPolicy.execute(),
+        execution_intent=intent.execution_intent if intent else ExecutionIntent.EXECUTE,
         failure_recovery="Inspect state; execute actions safely; verify final outcome.",
     )
 
@@ -747,6 +892,8 @@ def fallback_plan(
     task_type: TaskType,
     workspace: WorkspaceKind = WorkspaceKind.UNKNOWN,
     cwd: str | None = None,
+    intent: UserIntent | None = None,
+    policy: ExecutionPolicy | None = None,
 ) -> TaskPlan:
     """
     Constructs a deterministic, structurally valid, and fully executable fallback plan
@@ -757,7 +904,7 @@ def fallback_plan(
     if task_type == TaskType.MULTI_STEP:
         return build_multi_step_plan(goal, workspace)
     if task_type == TaskType.DEBUGGING:
-        return build_debugging_plan(goal, workspace)
+        return build_debugging_plan(goal, workspace, intent=intent, policy=policy)
     if task_type in (TaskType.RESEARCH, TaskType.CODE_REVIEW):
         return build_research_plan(goal, workspace)
     if task_type in (TaskType.SYSTEM_OPERATION, TaskType.CONFIGURATION, TaskType.DATA_OPERATION):
@@ -766,13 +913,17 @@ def fallback_plan(
 
 
 def _bind_user_intent_to_plan(plan: TaskPlan, goal: str, cwd: str | None = None) -> None:
-    """Attaches UserIntent and acceptance criteria to a plan if not already bound."""
+    """Attaches UserIntent, execution policy, and acceptance criteria to a plan if not already bound."""
     from ultron.core.intelligence.intent_understanding import understand_user_intent
 
     if plan.user_intent is None:
-        plan.user_intent = understand_user_intent(goal, cwd=cwd)
+        plan.user_intent = understand_user_intent(goal, cwd=cwd, task_type=plan.task_type)
     if not plan.acceptance_criteria and plan.user_intent:
         plan.acceptance_criteria = list(plan.user_intent.acceptance_criteria)
+    if plan.execution_policy is None and plan.user_intent:
+        plan.execution_policy = plan.user_intent.policy
+    if plan.execution_intent is None and plan.user_intent:
+        plan.execution_intent = plan.user_intent.execution_intent
 
 
 async def generate_task_plan(
@@ -871,7 +1022,12 @@ async def prepare_task_for_execution(
     if classification.task_type not in COMPLEX_TASK_TYPES:
         return None
 
-    task = TaskState(goal=classification.goal, task_type=classification.task_type)
+    task = TaskState(
+        goal=classification.goal,
+        task_type=classification.task_type,
+        user_intent=classification.user_intent,
+        execution_policy=classification.user_intent.policy if classification.user_intent else None,
+    )
     if classification.clarification_required:
         task.require_clarification(classification.clarification_questions)
         return task
@@ -891,6 +1047,8 @@ async def prepare_task_for_execution(
             classification.task_type,
             ws,
             cwd=cwd,
+            intent=classification.user_intent,
+            policy=classification.user_intent.policy if classification.user_intent else None,
         )
         plan.failure_recovery = (
             f"Initial LLM planner failed or was unavailable; recovered using deterministic {classification.task_type.value} execution plan."

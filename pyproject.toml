@@ -35,6 +35,7 @@ packages = ["src/ultron"]
 target-version = "py311"
 exclude = [
     "expense_app",
+    "fastapi-backend",
 ]
 
 [tool.pytest.ini_options]

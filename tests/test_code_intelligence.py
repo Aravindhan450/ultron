@@ -259,6 +259,29 @@ def test_search_code_empty_query(sandbox):
     assert search_code("  ", str(sandbox)).startswith("Error:")
 
 
+def test_search_code_accepts_file_path(sandbox):
+    # A file path is a valid scope: search only that file, never error.
+    _write(sandbox, "src/auth.py", "needle_file = 1\n")
+    _write(sandbox, "src/other.py", "needle_file = 2\n")
+    out = search_code("needle_file", str(sandbox / "src" / "auth.py"))
+    assert not out.startswith("Error:")
+    assert "auth.py:1" in out
+    assert "other.py" not in out
+
+
+def test_search_code_string_booleans_from_model(sandbox):
+    # Models emit "false" for boolean args; that must not read as truthy
+    # (which would turn a literal query into a regex).
+    _write(sandbox, "app.py", "def login(user):\n    pass\n")
+    out = search_code("login(user)", str(sandbox), regex="false", case_sensitive="false")
+    assert not out.startswith("Error:")
+    assert "app.py:1" in out
+    # case_sensitive="false" is case-insensitive, so lowercase 'login' matches 'Login'.
+    _write(sandbox, "b.py", "class Login:\n    pass\n")
+    out2 = search_code("login", str(sandbox), case_sensitive="false")
+    assert "b.py:1" in out2
+
+
 # ---------------------------------------------------------------------------
 # Index: incremental updates + queries
 # ---------------------------------------------------------------------------

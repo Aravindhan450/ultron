@@ -1,3 +1,4 @@
+import inspect
 from collections.abc import Callable
 from typing import Any
 
@@ -21,6 +22,57 @@ def get_tool(name: str) -> Callable[..., Any] | None:
     return TOOLS.get(name)
 
 
+def _resolved_signature(func: Callable[..., Any]) -> inspect.Signature:
+    """
+    The function signature with string annotations evaluated.
+
+    Tool modules use ``from __future__ import annotations``, so
+    ``param.annotation`` is the *string* ``"int"`` rather than the ``int``
+    type. Schema generation and argument coercion need the real type, so
+    evaluate the annotations (falling back to the raw signature if any
+    annotation cannot be resolved).
+    """
+    try:
+        return inspect.signature(func, eval_str=True)
+    except (NameError, TypeError, ValueError):
+        return inspect.signature(func)
+
+
+def coerce_tool_arguments(
+    func: Callable[..., Any], arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Coerces string tool arguments to the function's annotated scalar types.
+
+    Models routinely emit JSON scalars as strings (``"1000"``, ``"false"``),
+    and a tool that annotated a parameter as ``int``/``float``/``bool`` then
+    raises deep inside (e.g. ``'<=' not supported between int and str``),
+    which the loop records as a failed call and retries. Coercing here keeps
+    the invocation faithful to the signature the model was shown without
+    changing any tool's semantics; uncoercible values are left untouched so
+    the tool can produce its own error.
+    """
+    sig = _resolved_signature(func)
+    coerced = dict(arguments)
+    for name, param in sig.parameters.items():
+        if name not in coerced:
+            continue
+        value = coerced[name]
+        if not isinstance(value, str):
+            continue
+        annotation = param.annotation
+        try:
+            if annotation is bool:
+                coerced[name] = value.strip().lower() in {"1", "true", "yes", "on"}
+            elif annotation is int:
+                coerced[name] = int(value)
+            elif annotation is float:
+                coerced[name] = float(value)
+        except (TypeError, ValueError):
+            pass
+    return coerced
+
+
 def get_tools_schema() -> list[dict[str, Any]]:
     """
     Dynamically generates a JSON Schema format list describing all registered tools,
@@ -30,23 +82,23 @@ def get_tools_schema() -> list[dict[str, Any]]:
     (``ultron.core.tools.definitions``); parameter schemas are derived from
     the bound function signatures.
     """
-    import inspect
-
     schemas = []
     for name, definition in TOOL_DEFINITIONS.items():
         func = definition.func
-        sig = inspect.signature(func)
+        sig = _resolved_signature(func)
         properties = {}
         required = []
 
         for param_name, param in sig.parameters.items():
-            param_type = "string"
-            if param.annotation == int:
-                param_type = "integer"
-            elif param.annotation == bool:
+            annotation = param.annotation
+            if annotation is bool:
                 param_type = "boolean"
-            elif param.annotation == float:
+            elif annotation is int:
+                param_type = "integer"
+            elif annotation is float:
                 param_type = "number"
+            else:
+                param_type = "string"
 
             properties[param_name] = {
                 "type": param_type,

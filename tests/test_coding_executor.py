@@ -30,6 +30,7 @@ from ultron.core.coding.executor import (
 from ultron.core.coding.workspace import discover_workspace
 from ultron.core.tools import paths as tools_paths
 from ultron.core.types import (
+    ExecutionPolicy,
     FailureStrategy,
     PlanStep,
     StepStatus,
@@ -114,9 +115,10 @@ def _make_task(
     verification: list[str],
     workspace: WorkspaceKind,
     cwd: str,
+    execution_policy: ExecutionPolicy | None = None,
 ) -> TaskState:
     """Hand-builds a planned TaskState with a CodeContext (no planner LLM)."""
-    task = TaskState(goal=goal, task_type=task_type)
+    task = TaskState(goal=goal, task_type=task_type, execution_policy=execution_policy)
     task.attach_plan(
         TaskPlan(
             goal=goal,
@@ -125,6 +127,7 @@ def _make_task(
             steps=steps,
             completion_criteria=plan_criteria,
             verification_requirements=verification,
+            execution_policy=execution_policy,
         )
     )
     task.code_context = CodeContext(workspace=discover_workspace(cwd))
@@ -1145,6 +1148,7 @@ def test_scenario16_dangerous_action_blocked_by_security(sandbox):
             _all_satisfied(["task done"], ["task done"]),
         ]
     )
+    policy = ExecutionPolicy.execute()
     task = _make_task(
         "Inspect the app",
         TaskType.MULTI_STEP,
@@ -1153,6 +1157,7 @@ def test_scenario16_dangerous_action_blocked_by_security(sandbox):
         ["task done"],
         WorkspaceKind.EXISTING_PROJECT,
         str(sandbox),
+        execution_policy=policy,
     )
     agent = ReActAgent(engine, max_iterations=6)
     msg = _run(agent.run(task.goal, [], task=task))

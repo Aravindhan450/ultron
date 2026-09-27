@@ -182,6 +182,21 @@ def _matches_file_pattern(filename: str, file_pattern: str | None) -> bool:
     )
 
 
+def _as_bool(value: object) -> bool:
+    """Coerces a tool argument to bool.
+
+    Models frequently emit JSON scalars as strings (``"false"``, ``"0"``).
+    A bare truthiness test would read ``"false"`` as ``True``, silently
+    flipping regex/case-sensitive search on. String spellings of false are
+    therefore recognized explicitly.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def search_code(
     query: str,
     path: str = ".",
@@ -193,6 +208,8 @@ def search_code(
     """
     Searches *path* for files whose name or content matches *query*.
 
+    - ``path`` may be a directory (the whole tree) or a single file (that
+      file only).
     - Plain queries are case-insensitive substring matches unless
       ``case_sensitive`` is set.
     - ``regex=True`` compiles *query* as a regular expression.
@@ -208,12 +225,29 @@ def search_code(
     query = (query or "").strip()
     if not query:
         return "Error: search_code requires a non-empty 'query'."
+    try:
+        max_results = int(max_results)
+    except (ValueError, TypeError):
+        max_results = 30
+    regex = _as_bool(regex)
+    case_sensitive = _as_bool(case_sensitive)
     resolved = _resolve_safe_path(path)
     if resolved is None:
         return "Error: access denied, that directory is outside the allowed project folder."
-    if not resolved.is_dir():
-        return f"Error: {path} is not a directory"
 
+    # A file path is a valid search scope, not an error: searching inside one
+    # named file is the natural reading of ``code_search(query, "auth.py")``.
+    # Treating it as a hard failure previously stranded the agent in a retry
+    # loop, so a file narrows the scan to exactly that file.
+    if resolved.is_file():
+        search_root = resolved.parent
+        file_pattern = resolved.name
+    elif resolved.is_dir():
+        search_root = resolved
+    else:
+        return f"Error: {path} is not a file or directory"
+
+    resolved = search_root
     ignore = GitIgnoreRules(resolved)
     if regex:
         try:

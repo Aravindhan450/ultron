@@ -225,6 +225,140 @@ class ProductType(str, Enum):
     GENERAL_SOFTWARE = "general_software"
 
 
+class ExecutionIntent(str, Enum):
+    """
+    Authoritative outcome requested by the user.
+
+    TaskType answers: What domain does this task belong to?
+    ExecutionIntent answers: What outcome does the user actually want?
+    """
+
+    EXPLAIN = "explain"  # explain existing behavior or architecture.
+    INSPECT = "inspect"  # inspect/read the repository and report findings.
+    DIAGNOSE = "diagnose"  # determine why a problem occurs without changing code.
+    PLAN = "plan"  # investigate and produce a proposed implementation plan.
+    REPAIR = "repair"  # diagnose and change the system to correct a problem.
+    IMPLEMENT = "implement"  # build a requested feature/change.
+    EXECUTE = "execute"  # perform an explicitly requested operational action.
+
+
+class Capability(str, Enum):
+    """Fine-grained tool/runtime capabilities governed by ExecutionPolicy."""
+
+    READ_FILES = "read_files"
+    SEARCH_REPOSITORY = "search_repository"
+    INSPECT_SYMBOLS = "inspect_symbols"
+    GIT_READ = "git_read"
+    WRITE_FILES = "write_files"
+    DELETE_FILES = "delete_files"
+    RUN_COMMANDS = "run_commands"
+    RUN_TESTS = "run_tests"
+    NETWORK = "network"
+    EXTERNAL_ACTIONS = "external_actions"
+
+
+class AuthorityLevel(str, Enum):
+    """Permission level granted for a category of operations."""
+
+    FORBIDDEN = "forbidden"
+    ALLOWED = "allowed"
+    REQUIRES_CONFIRMATION = "requires_confirmation"
+
+
+class ExecutionPolicy(BaseModel):
+    """
+    Authoritative capability contract derived from UserIntent.
+
+    The planner receives ExecutionPolicy as an input and cannot broaden it.
+    Runtime Policy Gate re-checks this contract immediately before every tool execution.
+    """
+
+    allowed_capabilities: set[Capability] = Field(default_factory=set)
+    mutation_authority: AuthorityLevel = AuthorityLevel.FORBIDDEN
+    execution_authority: AuthorityLevel = AuthorityLevel.FORBIDDEN
+    confirmation_requirements: list[str] = Field(default_factory=list)
+
+    @property
+    def is_read_only(self) -> bool:
+        """True if file mutation is strictly forbidden."""
+        return (
+            self.mutation_authority == AuthorityLevel.FORBIDDEN
+            and Capability.WRITE_FILES not in self.allowed_capabilities
+            and Capability.DELETE_FILES not in self.allowed_capabilities
+        )
+
+    @property
+    def can_mutate(self) -> bool:
+        """True if file mutation is permitted or can be confirmed."""
+        return (
+            self.mutation_authority in (AuthorityLevel.ALLOWED, AuthorityLevel.REQUIRES_CONFIRMATION)
+            and (
+                Capability.WRITE_FILES in self.allowed_capabilities
+                or Capability.DELETE_FILES in self.allowed_capabilities
+            )
+        )
+
+    @property
+    def can_execute(self) -> bool:
+        """True if process/command execution is permitted or can be confirmed."""
+        return (
+            self.execution_authority in (AuthorityLevel.ALLOWED, AuthorityLevel.REQUIRES_CONFIRMATION)
+            and (
+                Capability.RUN_COMMANDS in self.allowed_capabilities
+                or Capability.RUN_TESTS in self.allowed_capabilities
+            )
+        )
+
+    def allows_capability(self, cap: Capability) -> bool:
+        return cap in self.allowed_capabilities
+
+    @classmethod
+    def read_only(cls) -> ExecutionPolicy:
+        """Standard read-only policy for explanation, inspection, and non-mutating diagnosis."""
+        return cls(
+            allowed_capabilities={
+                Capability.READ_FILES,
+                Capability.SEARCH_REPOSITORY,
+                Capability.INSPECT_SYMBOLS,
+                Capability.GIT_READ,
+            },
+            mutation_authority=AuthorityLevel.FORBIDDEN,
+            execution_authority=AuthorityLevel.FORBIDDEN,
+        )
+
+    @classmethod
+    def plan_only(cls) -> ExecutionPolicy:
+        """Read-only research and design policy for plan generation without mutation."""
+        return cls(
+            allowed_capabilities={
+                Capability.READ_FILES,
+                Capability.SEARCH_REPOSITORY,
+                Capability.INSPECT_SYMBOLS,
+                Capability.GIT_READ,
+            },
+            mutation_authority=AuthorityLevel.FORBIDDEN,
+            execution_authority=AuthorityLevel.FORBIDDEN,
+        )
+
+    @classmethod
+    def execute_with_confirmation(cls) -> ExecutionPolicy:
+        """Interactive execution policy requiring confirmation for mutations and commands."""
+        return cls(
+            allowed_capabilities=set(Capability),
+            mutation_authority=AuthorityLevel.REQUIRES_CONFIRMATION,
+            execution_authority=AuthorityLevel.REQUIRES_CONFIRMATION,
+        )
+
+    @classmethod
+    def execute(cls) -> ExecutionPolicy:
+        """Full execution authority."""
+        return cls(
+            allowed_capabilities=set(Capability),
+            mutation_authority=AuthorityLevel.ALLOWED,
+            execution_authority=AuthorityLevel.ALLOWED,
+        )
+
+
 class UserIntent(BaseModel):
     """
     Deep intent representation: translating natural language requests into
@@ -233,6 +367,10 @@ class UserIntent(BaseModel):
 
     raw_prompt: str = ""
     goal: str = ""
+    objective: str = ""
+    task_type: TaskType = TaskType.INFORMATIONAL
+    execution_intent: ExecutionIntent = ExecutionIntent.EXPLAIN
+    policy: ExecutionPolicy = Field(default_factory=lambda: ExecutionPolicy.read_only())
     product_type: ProductType = ProductType.GENERAL_SOFTWARE
     explicit_requirements: list[str] = Field(default_factory=list)
     inferred_necessary_requirements: list[str] = Field(default_factory=list)
@@ -241,6 +379,13 @@ class UserIntent(BaseModel):
     constraints: list[str] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
     verification_strategy: str = ""
+
+    def model_post_init(self, __context: Any, /) -> None:
+        if not self.objective and self.goal:
+            self.objective = self.goal
+        elif not self.goal and self.objective:
+            self.goal = self.objective
+
 
 
 class TaskRequirement(BaseModel):
@@ -348,6 +493,8 @@ class TaskPlan(BaseModel):
     verification_requirements: list[str] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
     user_intent: UserIntent | None = None
+    execution_policy: ExecutionPolicy | None = None
+    execution_intent: ExecutionIntent | None = None
     failure_recovery: str = ""
     project_dir: str | None = None
     needs_clarification: bool = False
@@ -802,6 +949,30 @@ class CanonicalTaskState(BaseModel):
     clarification_questions: list[str] = Field(default_factory=list)
     plan_revisions: list[str] = Field(default_factory=list)
     user_intent: UserIntent | None = None
+    execution_policy: ExecutionPolicy | None = None
+
+    @property
+    def active_policy(self) -> ExecutionPolicy:
+        """The authoritative ExecutionPolicy governing tool executions for this task."""
+        if self.execution_policy is not None:
+            return self.execution_policy
+        if self.plan and self.plan.execution_policy is not None:
+            return self.plan.execution_policy
+        if self.user_intent and self.user_intent.policy is not None:
+            return self.user_intent.policy
+        if getattr(self, "goal", None):
+            try:
+                from ultron.core.intelligence.intent_understanding import (
+                    understand_user_intent,
+                )
+
+                target_tt = self.task_type or (self.plan.task_type if self.plan else None)
+                derived = understand_user_intent(self.goal, task_type=target_tt)
+                if derived and derived.policy:
+                    return derived.policy
+            except (ImportError, AttributeError, ValueError, TypeError):
+                pass
+        return ExecutionPolicy.read_only()
 
     # Execution tracking
     active_action_ids: list[str] = Field(default_factory=list)
@@ -1169,7 +1340,12 @@ class CanonicalTaskState(BaseModel):
         """
         self.plan = plan
         self.task_type = plan.task_type
-        self.user_intent = plan.user_intent
+        if plan.user_intent is not None:
+            self.user_intent = plan.user_intent
+        if plan.execution_policy is not None:
+            self.execution_policy = plan.execution_policy
+        elif self.user_intent and self.user_intent.policy is not None:
+            self.execution_policy = self.user_intent.policy
         self.set_total_steps(len(plan.steps))
         seen: set[str] = set()
         for description in [*plan.completion_criteria, *plan.verification_requirements]:
@@ -1281,10 +1457,10 @@ def history_to_openai_format(history: list[ChatMessage]) -> list[dict[str, Any]]
     return [msg.to_openai_format() for msg in history]
 
 
-# Late import: TaskState.code_context references the coding CodeContext, which
-# lives in the coding package. Importing it here (after all model classes are
-# defined) and rebuilding the model resolves the forward reference without a
-# circular import (coding modules never import ultron.core.types at runtime).
-from ultron.core.coding.context import CodeContext
+try:
+    from ultron.core.coding.context import CodeContext
 
-TaskState.model_rebuild()
+    TaskState.model_rebuild()
+except ImportError:
+    pass
+

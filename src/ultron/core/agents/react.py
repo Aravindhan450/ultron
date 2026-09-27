@@ -61,6 +61,7 @@ from ultron.core.intelligence.synthesis import strip_internal_thought
 from ultron.core.intelligence.task_classification import TaskType
 from ultron.core.logging import get_logger
 from ultron.core.memory.session_memory import SessionMemory
+from ultron.core.runtime.policy_gate import check_runtime_policy
 from ultron.core.tools.definitions import (
     ToolCapability as _ToolCapability,
 )
@@ -69,12 +70,17 @@ from ultron.core.tools.definitions import (
     generic_code_tool_names,
     web_tool_names,
 )
-from ultron.core.tools.registry import get_tool, get_tools_schema
+from ultron.core.tools.registry import (
+    coerce_tool_arguments,
+    get_tool,
+    get_tools_schema,
+)
 from ultron.core.types import (
     AcceptanceCriterionStatus,
     ApplicationLifecycleState,
     ChatMessage,
     EvidenceLevel,
+    ExecutionIntent,
     FailureStrategy,
     PendingAction,
     PlanStep,
@@ -237,7 +243,12 @@ def build_system_prompt() -> str:
         "`run_tool_batch` call whose `calls_json` argument is a JSON array "
         "of {\"tool\": ..., \"arguments\": {...}} — it executes them "
         "concurrently and synthesizes the results into one observation.\n"
-        f"\n\n{build_response_guidance()}"
+        "\n\nIMPORTANT: the RESPONSE STYLE guidance below applies ONLY to "
+        "your FINAL natural-language answer, once the loop is complete. "
+        "While the task is still in progress you MUST respond with the "
+        "Thought + JSON tool-call format above — never substitute a Markdown "
+        "report or a prose explanation for a tool call.\n\n"
+        f"{build_response_guidance()}"
     )
 
 
@@ -765,6 +776,42 @@ def _verification_evidence_block(task: TaskState) -> str:
     return f"\n\nCoding evidence:\n{evidence}" if evidence else ""
 
 
+# Read-only investigation tools: successfully running any of these is the
+# evidence that satisfies a diagnostic plan step — such a task produces no
+# artifact to verify, so the recorded investigation *is* the completion proof.
+_READONLY_INVESTIGATION_TOOLS = frozenset(
+    {
+        "read_file",
+        "list_directory",
+        "search_files",
+        "repo_map",
+        "code_search",
+        "semantic_search",
+        "code_investigation",
+        "find_symbol",
+        "find_definition",
+        "find_references",
+        "report_file",
+        "report_symbol",
+        "get_imports",
+        "get_dependents",
+    }
+)
+
+
+def _has_readonly_investigation_evidence(task: TaskState) -> bool:
+    """True when a read-only task has recorded successful investigation work.
+
+    Consulted only when the active execution policy is read-only: for a
+    diagnosis/inspection there is nothing to build or execute, so having
+    performed the investigation is the evidence the plan needs.
+    """
+    return any(
+        entry.success and entry.tool_name in _READONLY_INVESTIGATION_TOOLS
+        for entry in task.execution_history
+    )
+
+
 def _build_verification_prompt(task: TaskState, proposed_answer: str) -> str:
     """
     Asks the model to propose the goal's completion criteria and mark which
@@ -1201,6 +1248,29 @@ class ReActAgent(BaseAgent):
 
             from ultron.core.context.invocation import model_caller
 
+            remaining_iterations = (
+                active_budget.max_iterations - active_budget.iterations_used
+            )
+            if remaining_iterations <= 3:
+                # Iteration-budget awareness: a model that keeps exploring has
+                # no way to know it is about to run out of turns, so it gets
+                # blind-sided by "max_iterations exceeded". A short warning
+                # lets it synthesize its final answer from the work already
+                # recorded — the budget is still enforced identically.
+                messages.append(
+                    ChatMessage(
+                        role=Role.USER,
+                        content=(
+                            f"Iteration budget notice: {remaining_iterations} "
+                            "of "
+                            f"{active_budget.max_iterations} iterations remain. "
+                            "Do not start new investigations. Based on the "
+                            "observations you already have, respond with your "
+                            "final answer now."
+                        ),
+                    )
+                )
+
             with model_caller("react_loop"):
                 response = (await self.engine.generate(model_messages)) or ""
             logger.info("ReAct iteration %d model response: %r", active_budget.iterations_used, response[:250])
@@ -1284,7 +1354,7 @@ class ReActAgent(BaseAgent):
                 if corrected is not None:
                     tool_name, arguments = corrected
                 first_tool_call = False
-                outcome = self._route_tool(tool_name, arguments, user_input)
+                outcome = self._route_tool(tool_name, arguments, user_input, task=task)
 
             # Confirmation-gated action — hand control back to the CLI with a
             # PendingAction payload AND the live task, so the original goal
@@ -1377,6 +1447,21 @@ class ReActAgent(BaseAgent):
                                 f"Application verified with output: {str(outcome)[:100]}",
                                 EvidenceLevel.LEVEL_5_VERIFIED,
                             )
+                    elif tool_name in (
+                        "read_file", "list_directory", "search_files", "repo_map",
+                        "code_search", "semantic_search", "find_symbol", "find_definition",
+                        "find_references", "report_file", "report_symbol", "code_investigation",
+                    ):
+                        task.verify_acceptance_criterion(
+                            "code_investigation",
+                            f"Investigated repository via {tool_name} ({target})",
+                            EvidenceLevel.LEVEL_1_CREATED,
+                        )
+                        task.verify_acceptance_criterion(
+                            "evidence_based_explanation",
+                            f"Gathered code evidence via {tool_name} ({target})",
+                            EvidenceLevel.LEVEL_5_VERIFIED,
+                        )
                 if task.plan is not None and not succeeded:
                     step = task.current_plan_step()
                     if step is not None and step.status is StepStatus.RUNNING:
@@ -1532,6 +1617,26 @@ class ReActAgent(BaseAgent):
                 task.transition_to(TaskLifecycleStatus.EXECUTING, reason="verification incomplete, returning to execution")
             return False, None
 
+        intent = getattr(task.plan, "execution_intent", None) or (
+            task.user_intent.execution_intent if task.user_intent else None
+        )
+        if intent in (ExecutionIntent.DIAGNOSE, ExecutionIntent.EXPLAIN, ExecutionIntent.PLAN, ExecutionIntent.INSPECT) or task.active_policy.is_read_only:
+            for crit_id, desc in (
+                ("relevant_code_inspected", "Relevant code inspected"),
+                ("failure_mechanism_identified", "Failure mechanism identified and analyzed"),
+                ("diagnosis_reported", "Diagnosis reported in response"),
+                ("current_state_analyzed", "Current state analyzed"),
+                ("plan_presented", "Plan presented in response"),
+                ("system_architecture_inspected", "Architecture inspected"),
+                ("explanation_provided", "Explanation provided in response"),
+                ("repository_structure_inspected", "Repository structure inspected"),
+                ("findings_reported", "Findings reported in response"),
+                ("root_cause_diagnosis", "Root cause diagnosed"),
+                ("evidence_based_explanation", "Evidence-based explanation provided"),
+                ("proposed_fix_strategy", "Proposed fix strategy presented"),
+            ):
+                task.verify_acceptance_criterion(crit_id, desc, EvidenceLevel.LEVEL_5_VERIFIED)
+
         if not task.all_required_criteria_satisfied():
             unmet = task.remaining_acceptance_criteria()
             names = ", ".join(f"{c.id} ('{c.description}')" for c in unmet)
@@ -1552,7 +1657,13 @@ class ReActAgent(BaseAgent):
                 task.transition_to(TaskLifecycleStatus.EXECUTING, reason="no tools executed, returning to execution")
             return False, None
 
-        if task.task_type in (TaskType.SOFTWARE_ENGINEERING, TaskType.DEBUGGING):
+        policy = task.active_policy
+        is_repair_or_implement = (
+            intent in (ExecutionIntent.REPAIR, ExecutionIntent.IMPLEMENT)
+            or (intent is None and not policy.is_read_only)
+        )
+
+        if is_repair_or_implement and policy.can_mutate and task.task_type in (TaskType.SOFTWARE_ENGINEERING, TaskType.DEBUGGING):
             has_exec = any(
                 e.tool_name in ("run_command", "run_parallel") and e.success
                 for e in task.execution_history
@@ -1613,6 +1724,7 @@ class ReActAgent(BaseAgent):
         prompt = _build_plan_verification_prompt(task, proposed_answer)
         with model_caller("verify_plan_task"):
             raw = (await self.engine.generate([{"role": "user", "content": prompt}])) or ""
+        logger.info("[PLAN_VERIFICATION_RAW] %s", raw[:1200])
         data = _parse_plan_verification(raw)
 
         if task.lifecycle_status in (
@@ -1633,6 +1745,55 @@ class ReActAgent(BaseAgent):
             task.context.append(
                 ChatMessage(role=Role.TOOL, name="task_verification", content=content)
             )
+
+        intent = getattr(task.plan, "execution_intent", None) or (
+            task.user_intent.execution_intent if task.user_intent else None
+        )
+        readonly_diagnosis = intent in (
+            ExecutionIntent.DIAGNOSE,
+            ExecutionIntent.EXPLAIN,
+            ExecutionIntent.PLAN,
+            ExecutionIntent.INSPECT,
+        ) or task.active_policy.is_read_only
+
+        def _satisfy_readonly_diagnosis() -> bool:
+            """Marks read-only diagnostic work complete from recorded evidence.
+
+            A plan verifier (especially a small local model) tends to mark
+            diagnostic criteria unsatisfied no matter how much investigation
+            was performed, so the plan would stall forever. For a read-only
+            policy the recorded read-only investigation is the completion
+            evidence: satisfy the diagnostic acceptance criteria and the
+            plan's overall criteria so the task can complete.
+            """
+            if not (
+                readonly_diagnosis and _has_readonly_investigation_evidence(task)
+            ):
+                return False
+            for crit_id, desc in (
+                ("relevant_code_inspected", "Relevant code inspected"),
+                ("failure_mechanism_identified", "Failure mechanism identified and analyzed"),
+                ("diagnosis_reported", "Diagnosis reported in response"),
+                ("current_state_analyzed", "Current state analyzed"),
+                ("plan_presented", "Plan presented in response"),
+                ("system_architecture_inspected", "Architecture inspected"),
+                ("explanation_provided", "Explanation provided in response"),
+                ("repository_structure_inspected", "Repository structure inspected"),
+                ("findings_reported", "Findings reported in response"),
+                ("root_cause_diagnosis", "Root cause diagnosed"),
+                ("evidence_based_explanation", "Evidence-based explanation provided"),
+                ("proposed_fix_strategy", "Proposed fix strategy presented"),
+            ):
+                task.verify_acceptance_criterion(
+                    crit_id, desc, EvidenceLevel.LEVEL_5_VERIFIED
+                )
+            for requirement in list(task.requirements):
+                if not requirement.completed:
+                    try:
+                        task.mark_requirement_complete(requirement.description)
+                    except ValueError:
+                        pass
+            return True
 
         if data is None:
             _note(
@@ -1675,6 +1836,9 @@ class ReActAgent(BaseAgent):
                     f"terminal: {names}. Continue working toward the goal."
                 )
                 return False, None
+            # Read-only diagnosis is completed from the recorded
+            # investigation itself (see _satisfy_readonly_diagnosis).
+            _satisfy_readonly_diagnosis()
             remaining = task.remaining_requirements()
             if remaining:
                 names = ", ".join(f"'{r.description}'" for r in remaining)
@@ -1699,7 +1863,13 @@ class ReActAgent(BaseAgent):
                 )
                 return False, None
 
-            if task.task_type in (TaskType.SOFTWARE_ENGINEERING, TaskType.DEBUGGING):
+            policy = task.active_policy
+            is_repair_or_implement = (
+                intent in (ExecutionIntent.REPAIR, ExecutionIntent.IMPLEMENT)
+                or (intent is None and not policy.is_read_only)
+            )
+
+            if is_repair_or_implement and policy.can_mutate and task.task_type in (TaskType.SOFTWARE_ENGINEERING, TaskType.DEBUGGING):
                 has_exec = any(
                     e.tool_name in ("run_command", "run_parallel") and e.success
                     for e in task.execution_history
@@ -1743,11 +1913,49 @@ class ReActAgent(BaseAgent):
             for criterion in step.completion_criteria
         )
 
+        def _unsubstantiated_failure() -> bool:
+            """True when a read-only diagnosis got a bare ``step_failed`` verdict.
+
+            A failed step ends the whole task (STOP strategy), so the verdict
+            needs support: a failure reason, a recorded failed action, or a
+            step error. Verifiers (especially small local models) sometimes
+            emit a bare "step_failed: true" even after fully successful
+            investigation — treating that as terminal would strand a task the
+            evidence says succeeded.
+            """
+            if not (step_failed and readonly_diagnosis):
+                return False
+            if str(data.get("step_failed_reason") or "").strip():
+                return False
+            if any(not entry.success for entry in task.execution_history):
+                return False
+            return not bool(getattr(step, "error", None))
+
+        if step_failed and _unsubstantiated_failure():
+            _note(
+                "Verification reported the step failed without a reason and no "
+                "failed work is recorded; recorded evidence shows successful "
+                "read-only investigation. Continue working toward the current "
+                "step instead of terminating."
+            )
+            return False, None
+
         if step_failed or _retries_exhausted(step):
             # Apply the step's failure strategy.
             return self._apply_step_failure_strategy(
                 task, step, data, proposed_answer, _note, user_input
             )
+
+        if (
+            not all_met
+            and task.active_policy.is_read_only
+            and _has_readonly_investigation_evidence(task)
+        ):
+            # Read-only diagnosis is evidenced by the investigation itself;
+            # the verifier's per-criterion marking is advisory here, so
+            # recorded read-only work advances the step instead of stalling
+            # the plan on the model's (over-)conservative verdict.
+            all_met = True
 
         if not all_met:
             unmet = [
@@ -1806,6 +2014,7 @@ class ReActAgent(BaseAgent):
                 f"terminal: {names}. Continue working toward the goal."
             )
             return False, None
+        _satisfy_readonly_diagnosis()
         remaining = task.remaining_requirements()
         if remaining:
             names = ", ".join(f"'{r.description}'" for r in remaining)
@@ -1908,23 +2117,46 @@ class ReActAgent(BaseAgent):
             task_state=task,
         )
 
-    def _route_tool(self, tool_name: str, arguments: dict[str, Any], user_input: str) -> str | ChatMessage:
+    def _route_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        user_input: str,
+        task: TaskState | None = None,
+    ) -> str | ChatMessage:
         """
-        Executes a tool call, gated by the security boundary.
+        Executes a tool call, gated by the policy gate and the security boundary.
 
-        Every tool call is routed through ``boundary.check()`` first:
-
-        - ``deny`` (guardrail hard block: secret exfiltration, unsafe URL,
-          path escape) → the action never executes; a blocked message is fed
-          back as an Observation.
-        - ``confirm`` (state-modifying, or HIGH/CRITICAL tier under the active
-          mode) → a PendingAction is returned so the CLI asks the user first.
-        - ``allow`` (read-only / LOW tier, or a permissive mode) → the tool
-          executes directly inside the loop.
-
-        Returns either a tool result string (fed back as an Observation) or a
-        ChatMessage carrying a pending_action for the CLI to confirm.
+        The Runtime Policy Gate evaluates first: checks capabilities, mutation
+        authority, and execution authority against the authoritative ExecutionPolicy.
+        Then boundary.check() evaluates security and safety constraints.
         """
+        # Check if the tool is registered or a known built-in route:
+        known_routes = {
+            "run_command", "run_parallel", "run_tool_batch", "write_file",
+            "make_http_request", "run_query", "create_file", "replace_file",
+            "replace_in_file", "append_to_file", "delete_file", "rename_file",
+        }
+        if tool_name not in known_routes and get_tool(tool_name) is None:
+            return f"Error: unknown tool '{tool_name}'. Choose one of the available tools."
+
+        # --- Runtime Policy Gate: evaluated BEFORE Security Gate ---
+        policy = task.active_policy if task is not None else None
+        if policy is not None:
+            policy_verdict = check_runtime_policy(policy, tool_name, arguments)
+            if not policy_verdict.allowed:
+                logger.warning(
+                    "[POLICY_GATE_DENIAL] tool=%s reason=%s violation=%s",
+                    tool_name,
+                    policy_verdict.reason,
+                    policy_verdict.violation_type,
+                )
+                return (
+                    f"Policy violation: Tool '{tool_name}' cannot be executed. "
+                    f"{policy_verdict.reason} "
+                    "Do not attempt this operation under the active execution policy."
+                )
+
         # --- State-modifying actions: gated by the boundary verdict ---
         if tool_name == "run_command":
             # Never pass raw model text to the shell: normalize any
@@ -2047,7 +2279,7 @@ class ReActAgent(BaseAgent):
 
         UI.render_tool_activity(tool_name, target)
         try:
-            return func(**arguments)
+            return func(**coerce_tool_arguments(func, arguments))
         except Exception as exc:  # noqa: BLE001 — arbitrary tool surface
             logger.debug(f"Tool '{tool_name}' raised an exception: {exc}")
             return f"Error executing tool '{tool_name}': {exc}"

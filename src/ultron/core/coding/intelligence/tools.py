@@ -53,10 +53,17 @@ def code_search(
 ) -> str:
     """Lexical/regex search respecting .gitignore and ignored directories.
 
+    ``path`` may be a directory (searches the whole tree) or a single file
+    (searches only that file).
+
     Multi-word queries ("coding executor") that miss lexically are retried
     against their normalized identifier spellings ("CodingExecutor"), so a
     natural-language symbol phrase still finds the source.
     """
+    try:
+        max_results = int(max_results)
+    except (ValueError, TypeError):
+        max_results = 30
     ci = _intelligence(path)
     if ci is None:
         return "Error: access denied, that directory is outside the allowed project folder."

@@ -20,7 +20,10 @@ executed must never run half-correct.
 
 from __future__ import annotations
 
+import re
+
 from ultron.core.types import (
+    ExecutionPolicy,
     PlanValidationIssue,
     PlanValidationReport,
     TaskPlan,
@@ -87,7 +90,68 @@ def _unreachable_steps(steps: list) -> list[int]:
     return sorted(step.id for step in steps if step.id not in reached)
 
 
-def validate_plan(plan: TaskPlan) -> PlanValidationReport:
+_MUTATION_STEP_RE = re.compile(
+    r"\b(modify\s+(?:file|code|source)|edit\s+(?:file|code|source)|write\s+(?:file|code|source)|"
+    r"create\s+(?:file|source)|delete\s+(?:file|code)|overwrite\s+file|"
+    r"apply\s+(?:a\s+)?(?:targeted\s+)?(?:bug\s+)?fix|apply\s+patch|apply\s+changes|"
+    r"scaffold\s+(?:project|application)|code\s+modification|"
+    r"implement\s+(?:application|fix|code))\b",
+    re.IGNORECASE,
+)
+_EXECUTION_STEP_RE = re.compile(
+    r"\b(run\s+(?:regression\s+)?tests?|execute\s+command|launch\s+application|"
+    r"start\s+(?:process|server|service)|interact\s+with\s+application)\b",
+    re.IGNORECASE,
+)
+
+
+def validate_plan_policy(
+    plan: TaskPlan,
+    policy: ExecutionPolicy | None = None,
+) -> list[PlanValidationIssue]:
+    """
+    Validates that the steps of a TaskPlan comply with the authoritative ExecutionPolicy.
+    """
+    active_policy = policy or plan.execution_policy
+    if active_policy is None:
+        return []
+
+    issues: list[PlanValidationIssue] = []
+
+    for step in plan.steps:
+        text = f"{step.description} {step.purpose} {step.expected_outcome}"
+        # Check mutation violations
+        if not active_policy.can_mutate and _MUTATION_STEP_RE.search(text):
+            issues.append(
+                PlanValidationIssue(
+                    code="policy_violation_mutation",
+                    message=(
+                        f"Step {step.id} requires file mutation ('{step.description}') "
+                        f"which is forbidden by active policy: {active_policy.mutation_authority.value}"
+                    ),
+                    step_id=step.id,
+                )
+            )
+        # Check execution violations
+        if not active_policy.can_execute and _EXECUTION_STEP_RE.search(text):
+            issues.append(
+                PlanValidationIssue(
+                    code="policy_violation_execution",
+                    message=(
+                        f"Step {step.id} requires process execution ('{step.description}') "
+                        f"which is forbidden by active policy: {active_policy.execution_authority.value}"
+                    ),
+                    step_id=step.id,
+                )
+            )
+
+    return issues
+
+
+def validate_plan(
+    plan: TaskPlan,
+    policy: ExecutionPolicy | None = None,
+) -> PlanValidationReport:
     """Validates a TaskPlan; returns a report that must be ``valid`` to run."""
     issues: list[PlanValidationIssue] = []
 
@@ -203,6 +267,10 @@ def validate_plan(plan: TaskPlan) -> PlanValidationReport:
                 message=f"Plan for {plan.task_type.value} has no steps",
             )
         )
+
+    # 7. Policy compliance.
+    policy_issues = validate_plan_policy(plan, policy)
+    issues.extend(policy_issues)
 
     return PlanValidationReport(
         valid=not issues,
